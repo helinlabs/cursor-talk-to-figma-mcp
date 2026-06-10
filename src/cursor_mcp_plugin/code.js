@@ -586,7 +586,7 @@ async function scanDesignUsage(params) {
   const bump = (bucket, key, meta, nodeId) => {
     if (!key) key = "(no-key)";
     let e = bucket[key];
-    if (!e) { e = bucket[key] = { count: 0, samples: [], ...meta }; }
+    if (!e) { e = bucket[key] = Object.assign({ count: 0, samples: [] }, meta); }
     e.count++;
     if (e.samples.length < SAMPLE_CAP) e.samples.push(nodeId);
   };
