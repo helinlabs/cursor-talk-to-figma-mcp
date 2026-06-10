@@ -1487,8 +1487,10 @@ server.tool(
   "Scan all text nodes in the selected Figma node",
   {
     nodeId: z.string().describe("ID of the node to scan"),
+    chunkSize: z.number().int().positive().optional().describe("Nodes processed per chunk (default 50). Larger = fewer round-trips/progress updates."),
+    highlight: z.boolean().optional().describe("Visually flash each text node while scanning. Default false — enabling it is much slower (adds a fill write + delay per node)."),
   },
-  async ({ nodeId }: any) => {
+  async ({ nodeId, chunkSize, highlight }: any) => {
     try {
       // Initial response to indicate we're starting the process
       const initialStatus = {
@@ -1499,8 +1501,9 @@ server.tool(
       // Use the plugin's scan_text_nodes function with chunking flag
       const result = await sendCommandToFigma("scan_text_nodes", {
         nodeId,
-        useChunking: true,  // Enable chunking on the plugin side
-        chunkSize: 10       // Process 10 nodes at a time
+        useChunking: true,            // Enable chunking on the plugin side
+        chunkSize: chunkSize || 50,   // Process 50 nodes at a time by default
+        skipHighlight: !highlight,    // Skip cosmetic per-node highlighting unless asked
       });
 
       // If the result indicates chunking was used, format the response accordingly

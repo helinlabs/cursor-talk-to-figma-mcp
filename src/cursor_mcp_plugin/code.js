@@ -1799,6 +1799,9 @@ async function scanTextNodes(params) {
     nodeId,
     useChunking = true,
     chunkSize = 10,
+    // Visual highlighting is OFF by default — it is purely cosmetic and was
+    // the dominant cost (a fill write + 100ms delay per text node).
+    skipHighlight = true,
     commandId = generateCommandId(),
   } = params || {};
 
@@ -1957,7 +1960,8 @@ async function scanTextNodes(params) {
           const textNodeInfo = await processTextNode(
             nodeInfo.node,
             nodeInfo.parentPath,
-            nodeInfo.depth
+            nodeInfo.depth,
+            skipHighlight
           );
           if (textNodeInfo) {
             chunkTextNodes.push(textNodeInfo);
@@ -1967,9 +1971,8 @@ async function scanTextNodes(params) {
           // Continue with other nodes
         }
       }
-
-      // Brief delay to allow UI updates and prevent freezing
-      await delay(5);
+      // (No per-node delay: yielding once per chunk below is enough to keep
+      // the Figma UI responsive without paying a delay for every node.)
     }
 
     // Add results from this chunk
@@ -1995,9 +1998,10 @@ async function scanTextNodes(params) {
       }
     );
 
-    // Small delay between chunks to prevent UI freezing
+    // Yield between chunks to keep the Figma UI responsive. When highlighting
+    // we keep a longer pause so the flashes are visible; otherwise just yield.
     if (i + chunkSize < totalNodes) {
-      await delay(50);
+      await delay(skipHighlight ? 0 : 50);
     }
   }
 
@@ -2057,7 +2061,7 @@ async function collectNodesToProcess(
 }
 
 // Process a single text node
-async function processTextNode(node, parentPath, depth) {
+async function processTextNode(node, parentPath, depth, skipHighlight = true) {
   if (node.type !== "TEXT") return null;
 
   try {
@@ -2089,28 +2093,32 @@ async function processTextNode(node, parentPath, depth) {
       depth: depth,
     };
 
-    // Highlight the node briefly (optional visual feedback)
-    try {
-      const originalFills = JSON.parse(JSON.stringify(node.fills));
-      node.fills = [
-        {
-          type: "SOLID",
-          color: { r: 1, g: 0.5, b: 0 },
-          opacity: 0.3,
-        },
-      ];
-
-      // Brief delay for the highlight to be visible
-      await delay(100);
-
+    // Highlight the node briefly (optional visual feedback). This is OFF by
+    // default because the per-node fill write + delay dominates scan time
+    // (e.g. ~50s for 500 nodes); only do it when explicitly requested.
+    if (!skipHighlight) {
       try {
-        node.fills = originalFills;
-      } catch (err) {
-        console.error("Error resetting fills:", err);
+        const originalFills = JSON.parse(JSON.stringify(node.fills));
+        node.fills = [
+          {
+            type: "SOLID",
+            color: { r: 1, g: 0.5, b: 0 },
+            opacity: 0.3,
+          },
+        ];
+
+        // Brief delay for the highlight to be visible
+        await delay(100);
+
+        try {
+          node.fills = originalFills;
+        } catch (err) {
+          console.error("Error resetting fills:", err);
+        }
+      } catch (highlightErr) {
+        console.error("Error highlighting text node:", highlightErr);
+        // Continue anyway, highlighting is just visual feedback
       }
-    } catch (highlightErr) {
-      console.error("Error highlighting text node:", highlightErr);
-      // Continue anyway, highlighting is just visual feedback
     }
 
     return safeTextNode;

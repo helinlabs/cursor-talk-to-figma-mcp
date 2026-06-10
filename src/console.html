@@ -375,7 +375,8 @@
         { group: "Text", command: "scan_text_nodes", description: "Scan all text nodes in the selected node (chunked)", params: [
           { name: "nodeId", type: "string", required: true, description: "ID of the node to scan" },
           { name: "useChunking", type: "boolean", required: true, default: true, description: "Enable chunked processing" },
-          { name: "chunkSize", type: "number", required: true, default: 10, description: "Nodes per chunk" }
+          { name: "chunkSize", type: "number", required: false, default: 50, description: "Nodes per chunk" },
+          { name: "skipHighlight", type: "boolean", required: false, default: true, description: "Skip per-node visual highlight (much faster). Set false to flash each node." }
         ] },
 
         { group: "Components & Styles", command: "get_styles", description: "Get all styles from the current document", params: [] },
