@@ -3036,6 +3036,77 @@ function sendCommandToFigma(
   });
 }
 
+// ===========================================================================
+// Design-system usage analysis tools
+// ===========================================================================
+
+// Foundation catalog: components + styles + VARIABLES (each with a `key`).
+server.tool(
+  "get_design_system_info",
+  "Get the full design-system catalog of the current file: components & component sets, paint/text/effect/grid styles, and Variables (with collections, modes, and per-mode values). Every item includes its `key` — the identifier shared with consuming files for a published library asset. Run this on the Foundation/library file to build the catalog you match Product references against. Unlike get_styles, this includes Variables (color tokens).",
+  {
+    includeVariableValues: z.boolean().optional().describe("Include each variable's resolved value per mode (default true)."),
+    resolveNames: z.boolean().optional().describe("Include human-readable names (default true)."),
+  },
+  async ({ includeVariableValues, resolveNames }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_design_system_info", {
+        includeVariableValues: includeVariableValues !== false,
+        resolveNames: resolveNames !== false,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting design system info: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// Per-node design-system bindings for an explicit set of node IDs.
+server.tool(
+  "get_nodes_design_info",
+  "For specific node IDs, return what each node references in the design system: for INSTANCEs the main component (key, remote flag, component-set key), any fill/stroke/text/effect/grid STYLE references (key, remote), and any bound VARIABLES per property (key, resolvedType). Use the keys to match against get_design_system_info from the Foundation file. Missing/raw values are omitted (a node with no `component`/`styles`/`boundVariables` uses no tokens there).",
+  {
+    nodeIds: z.array(z.string()).describe("Node IDs to inspect"),
+    resolveNames: z.boolean().optional().describe("Include human-readable names (default true)."),
+  },
+  async ({ nodeIds, resolveNames }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_nodes_design_info", {
+        nodeIds,
+        resolveNames: resolveNames !== false,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting node design info: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// Bulk subtree scan -> aggregated design-system usage summary.
+server.tool(
+  "scan_design_usage",
+  "Scan a node subtree (chunked) and return an AGGREGATED design-system usage summary: instances grouped by main-component key (with remote/local/detached counts), style references grouped by style key per slot, variable bindings grouped by variable key, and a fill token-coverage signal (tokenizedOrStyled vs rawSolid). Built for large trees (~1000s of nodes) — returns counts + sample node IDs per key, not every node, unless includeNodes is set. Match the keys against get_design_system_info from the Foundation file to compute reuse rates.",
+  {
+    nodeId: z.string().describe("Root node ID of the subtree to scan (e.g. a page or top frame)"),
+    chunkSize: z.number().int().positive().optional().describe("Nodes per chunk (default 200)."),
+    includeNodes: z.boolean().optional().describe("Also return a per-node list of nodes that reference the design system (default false; can be large)."),
+    resolveNames: z.boolean().optional().describe("Include human-readable names (default true)."),
+  },
+  async ({ nodeId, chunkSize, includeNodes, resolveNames }: any) => {
+    try {
+      const result = await sendCommandToFigma("scan_design_usage", {
+        nodeId,
+        chunkSize: chunkSize || 200,
+        includeNodes: !!includeNodes,
+        resolveNames: resolveNames !== false,
+      }, 120000); // allow up to 2 min for large trees
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error scanning design usage: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
 // List channels known to the relay, with the Figma document each is on.
 // Use this to discover which channel to join when you don't already know it.
 server.tool(

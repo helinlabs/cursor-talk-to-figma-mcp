@@ -379,6 +379,21 @@
           { name: "skipHighlight", type: "boolean", required: false, default: true, description: "Skip per-node visual highlight (much faster). Set false to flash each node." }
         ] },
 
+        { group: "Design System", command: "get_design_system_info", description: "Foundation catalog: components, styles, and Variables (each with key + values). Run on the library file.", params: [
+          { name: "includeVariableValues", type: "boolean", required: false, default: true, description: "Include per-mode variable values" },
+          { name: "resolveNames", type: "boolean", required: false, default: true, description: "Include human-readable names" }
+        ] },
+        { group: "Design System", command: "get_nodes_design_info", description: "Per-node DS bindings (mainComponent key/remote, style keys, bound variable keys) for explicit node IDs", params: [
+          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs", example: '["1:2","1:3"]' },
+          { name: "resolveNames", type: "boolean", required: false, default: true, description: "Include human-readable names" }
+        ] },
+        { group: "Design System", command: "scan_design_usage", description: "Bulk subtree scan → aggregated DS usage summary (instances/styles/variables grouped by key)", params: [
+          { name: "nodeId", type: "string", required: true, description: "Root node ID of the subtree to scan" },
+          { name: "chunkSize", type: "number", required: false, default: 200, description: "Nodes per chunk" },
+          { name: "includeNodes", type: "boolean", required: false, default: false, description: "Also return per-node records (can be large)" },
+          { name: "resolveNames", type: "boolean", required: false, default: true, description: "Include human-readable names" }
+        ] },
+
         { group: "Components & Styles", command: "get_styles", description: "Get all styles from the current document", params: [] },
         { group: "Components & Styles", command: "get_local_components", description: "Get all local components", params: [] },
         { group: "Components & Styles", command: "create_component_instance", description: "Create an instance of a component", params: [

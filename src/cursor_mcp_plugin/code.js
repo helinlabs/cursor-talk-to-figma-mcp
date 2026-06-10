@@ -283,9 +283,373 @@ async function handleCommand(command, params) {
       return await setFocus(params);
     case "set_selections":
       return await setSelections(params);
+    case "get_design_system_info":
+      return await getDesignSystemInfo(params);
+    case "get_nodes_design_info":
+      return await getNodesDesignInfo(params);
+    case "scan_design_usage":
+      return await scanDesignUsage(params);
     default:
       throw new Error(`Unknown command: ${command}`);
   }
+}
+
+// ===========================================================================
+// Design-system usage analysis
+// ---------------------------------------------------------------------------
+// These handlers expose the *provenance* of rendered values — which library
+// component / variable token / style a node references — so an analysis
+// session can measure design-system reuse by matching shared `key`s between a
+// Foundation (library) file and a Product (consumer) file.
+//
+// Matching principle: a library-linked asset shares the SAME `key` in the
+// source and consuming files. Copy-pasted assets get a different key and so
+// are correctly counted as "not reused".
+// ===========================================================================
+
+// Resolve a Figma color/number/etc. variable value for a single mode.
+function formatVariableValue(raw, resolvedType) {
+  if (raw === undefined || raw === null) return null;
+  // Alias to another variable (e.g. semantic token -> primitive token)
+  if (typeof raw === "object" && raw.type === "VARIABLE_ALIAS") {
+    return { type: "alias", id: raw.id };
+  }
+  if (resolvedType === "COLOR" && typeof raw === "object" && "r" in raw) {
+    return { type: "color", hex: rgbaToHex(raw), rgba: raw };
+  }
+  return { type: (resolvedType || typeof raw).toLowerCase(), value: raw };
+}
+
+// A per-call resolver with caches so shared tokens/styles/components aren't
+// looked up repeatedly (critical when scanning ~1000+ nodes).
+function makeDsResolver(resolveNames) {
+  const varCache = new Map();
+  const styleCache = new Map();
+  const compCache = new Map();
+  return {
+    async variable(id) {
+      if (!id) return null;
+      if (varCache.has(id)) return varCache.get(id);
+      let out = null;
+      try {
+        const v = await figma.variables.getVariableByIdAsync(id);
+        if (v) {
+          out = { id: v.id, key: v.key, resolvedType: v.resolvedType };
+          if (resolveNames) out.name = v.name;
+        }
+      } catch (e) {}
+      varCache.set(id, out);
+      return out;
+    },
+    async style(id) {
+      if (!id || typeof id !== "string") return null; // skip figma.mixed (Symbol)
+      if (styleCache.has(id)) return styleCache.get(id);
+      let out = null;
+      try {
+        const s = await figma.getStyleByIdAsync(id);
+        if (s) {
+          out = { id: s.id, key: s.key, remote: !!s.remote, styleType: s.type };
+          if (resolveNames) out.name = s.name;
+        }
+      } catch (e) {}
+      styleCache.set(id, out);
+      return out;
+    },
+    async mainComponent(instanceNode) {
+      let mc = null;
+      try {
+        mc = await instanceNode.getMainComponentAsync();
+      } catch (e) {
+        return null;
+      }
+      if (!mc) return null; // detached / missing
+      if (compCache.has(mc.id)) return compCache.get(mc.id);
+      const out = { id: mc.id, key: mc.key || null, remote: !!mc.remote };
+      if (resolveNames) out.name = mc.name;
+      try {
+        const parent = mc.parent;
+        if (parent && parent.type === "COMPONENT_SET") {
+          out.componentSetId = parent.id;
+          out.componentSetKey = parent.key || null;
+          if (resolveNames) out.componentSetName = parent.name;
+        }
+      } catch (e) {}
+      compCache.set(mc.id, out);
+      return out;
+    },
+  };
+}
+
+// Extract variable bindings (property -> [{id,key,name?,resolvedType}])
+async function extractBoundVariables(node, resolver) {
+  const bv = node.boundVariables;
+  if (!bv || typeof bv !== "object") return null;
+  const out = {};
+  for (const prop of Object.keys(bv)) {
+    const val = bv[prop];
+    const aliases = Array.isArray(val) ? val : [val];
+    const resolved = [];
+    for (const a of aliases) {
+      if (a && a.id) {
+        const r = await resolver.variable(a.id);
+        if (r) resolved.push(r);
+      }
+    }
+    if (resolved.length) out[prop] = resolved;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Extract style references (fill/stroke/text/effect/grid -> {id,key,name?,remote})
+async function extractStyleRefs(node, resolver) {
+  const out = {};
+  const tryStyle = async (key, id) => {
+    const r = await resolver.style(id);
+    if (r) out[key] = r;
+  };
+  if ("fillStyleId" in node) await tryStyle("fill", node.fillStyleId);
+  if ("strokeStyleId" in node) await tryStyle("stroke", node.strokeStyleId);
+  if (node.type === "TEXT" && "textStyleId" in node) await tryStyle("text", node.textStyleId);
+  if ("effectStyleId" in node) await tryStyle("effect", node.effectStyleId);
+  if ("gridStyleId" in node) await tryStyle("grid", node.gridStyleId);
+  return Object.keys(out).length ? out : null;
+}
+
+// Does this node have a raw (untokenized, unstyled) SOLID fill? Used to tell
+// "uses a color token/style" apart from "hard-coded color".
+function hasRawSolidFill(node) {
+  try {
+    const fills = node.fills;
+    if (!Array.isArray(fills)) return false; // figma.mixed or none
+    const hasSolid = fills.some((p) => p && p.type === "SOLID" && p.visible !== false);
+    if (!hasSolid) return false;
+    const styled = "fillStyleId" in node && typeof node.fillStyleId === "string" && node.fillStyleId;
+    const bound = node.boundVariables && node.boundVariables.fills;
+    return !styled && !bound;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Build a design-system record for a single node (null sections omitted).
+async function nodeDesignInfo(node, resolver) {
+  const rec = { id: node.id, name: node.name, type: node.type };
+  if (node.type === "INSTANCE") {
+    rec.component = await resolver.mainComponent(node); // {key, remote, ...} or null (detached)
+  }
+  const styles = await extractStyleRefs(node, resolver);
+  if (styles) rec.styles = styles;
+  const bvs = await extractBoundVariables(node, resolver);
+  if (bvs) rec.boundVariables = bvs;
+  return rec;
+}
+
+// --- Foundation catalog: components + styles + variables (with keys) -------
+async function getDesignSystemInfo(params) {
+  const {
+    includeVariableValues = true,
+    resolveNames = true,
+    commandId = generateCommandId(),
+  } = params || {};
+
+  await sendProgressUpdate(commandId, "get_design_system_info", "started", 0, 4, 0, "Loading pages...", null);
+  await figma.loadAllPagesAsync(); // components can live on any page
+
+  // Components & component sets (with keys for cross-file matching)
+  const compNodes = figma.root.findAllWithCriteria({ types: ["COMPONENT", "COMPONENT_SET"] });
+  const components = compNodes.map((c) => {
+    const entry = { id: c.id, key: "key" in c ? c.key || null : null, name: c.name, type: c.type, remote: !!c.remote };
+    if (c.type === "COMPONENT" && c.parent && c.parent.type === "COMPONENT_SET") {
+      entry.componentSetId = c.parent.id;
+      entry.componentSetKey = c.parent.key || null;
+    }
+    return entry;
+  });
+  await sendProgressUpdate(commandId, "get_design_system_info", "in_progress", 35, 4, 1, `Found ${components.length} components/sets`, null);
+
+  // Styles (already key-bearing)
+  const mapStyle = (s) => ({ id: s.id, key: s.key, name: s.name, remote: !!s.remote });
+  const paintStyles = (await figma.getLocalPaintStylesAsync()).map(mapStyle);
+  const textStyles = (await figma.getLocalTextStylesAsync()).map(mapStyle);
+  const effectStyles = (await figma.getLocalEffectStylesAsync()).map(mapStyle);
+  const gridStyles = (await figma.getLocalGridStylesAsync()).map(mapStyle);
+  await sendProgressUpdate(commandId, "get_design_system_info", "in_progress", 60, 4, 2, "Collected styles", null);
+
+  // Variables + collections (the part get_styles is missing)
+  const collections = await figma.variables.getLocalVariableCollectionsAsync();
+  const collById = {};
+  const variableCollections = collections.map((c) => {
+    collById[c.id] = c;
+    return {
+      id: c.id,
+      key: c.key,
+      name: c.name,
+      defaultModeId: c.defaultModeId,
+      modes: c.modes.map((m) => ({ modeId: m.modeId, name: m.name })),
+      variableCount: c.variableIds.length,
+    };
+  });
+  const localVars = await figma.variables.getLocalVariablesAsync();
+  const variables = localVars.map((v) => {
+    const coll = collById[v.variableCollectionId];
+    const entry = {
+      id: v.id,
+      key: v.key,
+      name: v.name,
+      resolvedType: v.resolvedType,
+      collectionId: v.variableCollectionId,
+      collectionName: coll ? coll.name : null,
+    };
+    if (includeVariableValues && coll) {
+      entry.valuesByMode = {};
+      for (const m of coll.modes) {
+        entry.valuesByMode[m.name] = formatVariableValue(v.valuesByMode[m.modeId], v.resolvedType);
+      }
+    }
+    return entry;
+  });
+  await sendProgressUpdate(commandId, "get_design_system_info", "completed", 100, 4, 4, `Done: ${components.length} components, ${variables.length} variables`, null);
+
+  return {
+    components: { count: components.length, items: components },
+    styles: {
+      paint: paintStyles,
+      text: textStyles,
+      effect: effectStyles,
+      grid: gridStyles,
+    },
+    variableCollections,
+    variables: { count: variables.length, items: variables },
+    commandId,
+  };
+}
+
+// --- Per-node design-system bindings for an explicit set of nodes ----------
+async function getNodesDesignInfo(params) {
+  const { nodeIds, resolveNames = true } = params || {};
+  if (!nodeIds || !Array.isArray(nodeIds)) {
+    throw new Error("Missing or invalid nodeIds parameter (expected an array)");
+  }
+  const resolver = makeDsResolver(resolveNames);
+  const results = [];
+  for (const id of nodeIds) {
+    let node = null;
+    try {
+      node = await figma.getNodeByIdAsync(id);
+    } catch (e) {}
+    if (!node) {
+      results.push({ id, error: "not found" });
+      continue;
+    }
+    results.push(await nodeDesignInfo(node, resolver));
+  }
+  return { count: results.length, nodes: results };
+}
+
+// --- Bulk scan of a subtree: aggregated usage summary (+ optional per-node)-
+async function scanDesignUsage(params) {
+  const {
+    nodeId,
+    chunkSize = 200,
+    includeNodes = false,
+    resolveNames = true,
+    commandId = generateCommandId(),
+  } = params || {};
+
+  const root = await figma.getNodeByIdAsync(nodeId);
+  if (!root) {
+    await sendProgressUpdate(commandId, "scan_design_usage", "error", 0, 0, 0, `Node ${nodeId} not found`, { error: "not found" });
+    throw new Error(`Node with ID ${nodeId} not found`);
+  }
+
+  // Flatten the subtree (sync tree walk; nodes are already loaded in-page)
+  const all = [];
+  (function walk(n) {
+    all.push(n);
+    if ("children" in n && n.children) for (const c of n.children) walk(c);
+  })(root);
+  const total = all.length;
+  const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
+
+  const resolver = makeDsResolver(resolveNames);
+
+  // Aggregation buckets keyed by the matchable identifier (`key`)
+  const summary = {
+    instances: { total: 0, remote: 0, local: 0, detached: 0, byComponentKey: {} },
+    styles: { fill: {}, text: {}, effect: {}, stroke: {}, grid: {} },
+    variables: { totalBoundProps: 0, byVariableKey: {} },
+    fills: { tokenizedOrStyled: 0, rawSolid: 0 },
+  };
+  const nodes = [];
+  const SAMPLE_CAP = 8;
+
+  const bump = (bucket, key, meta, nodeId) => {
+    if (!key) key = "(no-key)";
+    let e = bucket[key];
+    if (!e) { e = bucket[key] = { count: 0, samples: [], ...meta }; }
+    e.count++;
+    if (e.samples.length < SAMPLE_CAP) e.samples.push(nodeId);
+  };
+
+  let processed = 0;
+  await sendProgressUpdate(commandId, "scan_design_usage", "started", 0, total, 0, `Scanning ${total} nodes...`, null);
+
+  for (let i = 0; i < total; i += chunkSize) {
+    const chunk = all.slice(i, Math.min(i + chunkSize, total));
+    for (const node of chunk) {
+      const rec = await nodeDesignInfo(node, resolver);
+
+      if (node.type === "INSTANCE") {
+        summary.instances.total++;
+        if (rec.component) {
+          if (rec.component.remote) summary.instances.remote++; else summary.instances.local++;
+          bump(summary.instances.byComponentKey, rec.component.key,
+            { remote: rec.component.remote, name: rec.component.name, componentSetKey: rec.component.componentSetKey }, node.id);
+        } else {
+          summary.instances.detached++;
+        }
+      }
+
+      if (rec.styles) {
+        for (const slot of Object.keys(rec.styles)) {
+          const s = rec.styles[slot];
+          if (summary.styles[slot]) bump(summary.styles[slot], s.key, { name: s.name, remote: s.remote }, node.id);
+        }
+      }
+
+      if (rec.boundVariables) {
+        for (const prop of Object.keys(rec.boundVariables)) {
+          for (const v of rec.boundVariables[prop]) {
+            summary.variables.totalBoundProps++;
+            bump(summary.variables.byVariableKey, v.key, { name: v.name, resolvedType: v.resolvedType }, node.id);
+          }
+        }
+      }
+
+      // Color-token coverage signal
+      const fillStyled = rec.styles && rec.styles.fill;
+      const fillBound = rec.boundVariables && rec.boundVariables.fills;
+      if (fillStyled || fillBound) summary.fills.tokenizedOrStyled++;
+      else if (hasRawSolidFill(node)) summary.fills.rawSolid++;
+
+      if (includeNodes && (rec.component || rec.styles || rec.boundVariables)) nodes.push(rec);
+      processed++;
+    }
+
+    const pct = Math.round((processed / total) * 100);
+    await sendProgressUpdate(commandId, "scan_design_usage", "in_progress", pct, total, processed,
+      `Processed ${processed}/${total} nodes (${Math.ceil((i + chunkSize) / chunkSize)}/${totalChunks} chunks)`, null);
+    await delay(0); // yield to keep Figma responsive
+  }
+
+  await sendProgressUpdate(commandId, "scan_design_usage", "completed", 100, total, processed, `Scan complete: ${total} nodes`, null);
+
+  return {
+    scannedNodes: total,
+    summary,
+    nodes: includeNodes ? nodes : undefined,
+    commandId,
+  };
 }
 
 // Command implementations
