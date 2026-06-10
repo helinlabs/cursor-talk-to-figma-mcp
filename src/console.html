@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Talk-to-Figma · Server Console</title>
+    <style>
+      :root {
+        --bg: #15171c;
+        --panel: #1e2127;
+        --panel2: #23272f;
+        --border: #2e333d;
+        --text: #d6dae0;
+        --muted: #8a92a0;
+        --blue: #4aa3ff;
+        --green: #4ade80;
+        --yellow: #fbbf24;
+        --red: #ff6b6b;
+        --purple: #b78bff;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+      }
+      #root { height: 100vh; display: flex; flex-direction: column; }
+      .topbar {
+        display: flex; align-items: center; gap: 12px;
+        padding: 10px 16px; border-bottom: 1px solid var(--border);
+        background: var(--panel);
+      }
+      .topbar h1 { font-size: 14px; margin: 0; font-weight: 600; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+      .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+      .dot.off { background: var(--red); }
+      .muted { color: var(--muted); }
+      .main { flex: 1; display: flex; min-height: 0; }
+      .sidebar {
+        width: 320px; min-width: 280px; border-right: 1px solid var(--border);
+        display: flex; flex-direction: column; background: var(--panel);
+        overflow-y: auto;
+      }
+      .logwrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+      .section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+      .section h2 {
+        font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+        color: var(--muted); margin: 0 0 10px; font-weight: 600;
+      }
+      .chan-card {
+        background: var(--panel2); border: 1px solid var(--border);
+        border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; cursor: pointer;
+      }
+      .chan-card:hover { border-color: var(--blue); }
+      .chan-card.dim { opacity: .6; }
+      .chan-card.dim .chan-name { color: var(--muted); }
+      .chan-card.warn { border-color: var(--red); }
+      .warn-banner {
+        margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+        background: #3a1717; color: #ffb3b3; font-size: 11px; line-height: 1.4;
+      }
+      .doc-info { margin-top: 6px; line-height: 1.4; }
+      .doc-name { color: var(--green); font-weight: 600; }
+      .doc-sub { color: var(--muted); font-size: 11px; margin-left: 4px; }
+      .empty-folder { margin-top: 10px; }
+      .folder-head {
+        display: flex; align-items: center; gap: 6px; cursor: pointer;
+        font-size: 12px; color: var(--muted); padding: 6px 4px;
+        border-top: 1px solid var(--border); user-select: none;
+      }
+      .folder-head:hover { color: var(--text); }
+      .caret { width: 10px; display: inline-block; }
+      .chan-head { display: flex; justify-content: space-between; align-items: center; }
+      .chan-name { font-family: ui-monospace, Menlo, monospace; font-weight: 600; color: var(--blue); }
+      .badge {
+        font-size: 10px; padding: 1px 6px; border-radius: 10px;
+        border: 1px solid var(--border); color: var(--muted);
+      }
+      .badge.controller { color: var(--blue); }
+      .badge.figma { color: var(--green); }
+      .badge.monitor { color: var(--muted); }
+      .badge.unknown { color: var(--yellow); }
+      .member { display: flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 12px; }
+      .member code { color: var(--muted); font-size: 11px; }
+      label { display: block; font-size: 11px; color: var(--muted); margin: 8px 0 3px; }
+      input, select, textarea, button {
+        font-family: inherit; font-size: 12px; color: var(--text);
+        background: var(--panel2); border: 1px solid var(--border);
+        border-radius: 6px; padding: 6px 8px; width: 100%;
+      }
+      textarea { font-family: ui-monospace, Menlo, monospace; resize: vertical; }
+      button {
+        width: auto; cursor: pointer; background: var(--blue); color: #06121f;
+        border: none; font-weight: 600; padding: 7px 14px;
+      }
+      button.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--border); font-weight: 500; }
+      button:disabled { opacity: .5; cursor: not-allowed; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .toolbar {
+        display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+        padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--panel);
+      }
+      .toolbar input[type="text"] { width: 220px; }
+      .chk { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+      .chk input { width: auto; }
+      .list-host { flex: 1; min-height: 0; position: relative; }
+      .logrow {
+        display: flex; gap: 10px; align-items: center; padding: 0 14px;
+        white-space: nowrap; overflow: hidden; cursor: pointer;
+        border-bottom: 1px solid #20242c; font-family: ui-monospace, Menlo, monospace;
+        font-size: 12px; line-height: 26px;
+      }
+      .logrow:hover { background: #20242c; }
+      .logrow.sel { background: #2a3140; }
+      .ts { color: var(--muted); flex: 0 0 92px; }
+      .kind { flex: 0 0 78px; font-weight: 600; }
+      .kind.command { color: var(--blue); }
+      .kind.result { color: var(--green); }
+      .kind.result.err { color: var(--red); }
+      .kind.join, .kind.connect { color: var(--purple); }
+      .kind.disconnect { color: var(--red); }
+      .kind.progress { color: var(--yellow); }
+      .kind.document { color: var(--green); }
+      .chan-col { flex: 0 0 90px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+      .summary { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+      .detail {
+        height: 240px; border-top: 1px solid var(--border); background: #11131a;
+        overflow: auto; padding: 10px 14px;
+      }
+      .detail pre { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+      .result-box {
+        margin-top: 8px; background: #11131a; border: 1px solid var(--border);
+        border-radius: 6px; padding: 8px; max-height: 200px; overflow: auto;
+      }
+      .result-box pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+      .ok { color: var(--green); }
+      .bad { color: var(--red); }
+      a { color: var(--blue); }
+    </style>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@18.3.1",
+          "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+          "react-window": "https://esm.sh/react-window@1.8.11?deps=react@18.3.1,react-dom@18.3.1"
+        }
+      }
+    </script>
+    <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+  </head>
+  <body>
+    <div id="root">Loading console… (needs internet for React CDN on first load)</div>
+
+    <script type="text/babel" data-type="module" data-presets="react">
+      import React, { useEffect, useRef, useState, useMemo, useCallback } from "react";
+      import { createRoot } from "react-dom/client";
+      import { FixedSizeList } from "react-window";
+
+      const WS_URL = `ws://${location.host}`;
+      const RING = 5000;          // browser-side ring buffer size
+      const FLUSH_MS = 150;       // batch incoming events to avoid render storms
+      const ROW_H = 26;
+
+      const COMMANDS = [
+        "get_document_info","get_selection","read_my_design","get_node_info","get_nodes_info",
+        "get_styles","get_local_components","get_annotations","scan_text_nodes","scan_nodes_by_types",
+        "create_rectangle","create_frame","create_text","set_fill_color","set_stroke_color",
+        "move_node","resize_node","delete_node","clone_node","set_text_content","export_node_as_image",
+        "set_corner_radius","set_layout_mode","set_padding","set_item_spacing","get_reactions"
+      ];
+
+      function genId() {
+        return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      }
+      function fmtTime(ts) {
+        const d = new Date(ts);
+        const p = (n, l = 2) => String(n).padStart(l, "0");
+        return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+      }
+
+      // Measure a DOM element's height (for react-window which needs a number)
+      function useSize(ref) {
+        const [size, setSize] = useState({ w: 0, h: 0 });
+        useEffect(() => {
+          if (!ref.current) return;
+          const ro = new ResizeObserver((entries) => {
+            const r = entries[0].contentRect;
+            setSize({ w: r.width, h: r.height });
+          });
+          ro.observe(ref.current);
+          return () => ro.disconnect();
+        }, [ref]);
+        return size;
+      }
+
+      function summarize(e) {
+        switch (e.kind) {
+          case "connect": return `client ${e.clientId} connected`;
+          case "disconnect": return `client ${e.clientId} left ${e.channel ? "#" + e.channel : ""}`;
+          case "join": return `${e.clientId} joined #${e.channel} (${e.clientCount} in channel)`;
+          case "command": return `${e.command}  ${e.commandId ? "· " + e.commandId.slice(0, 8) : ""}`;
+          case "result": return `${e.ok ? "ok" : "ERROR: " + (e.error || "")}  ${e.commandId ? "· " + e.commandId.slice(0, 8) : ""}`;
+          case "progress": return `${e.commandType || ""} ${e.progress ?? ""}% ${e.status || ""} ${e.message || ""}`;
+          case "document": return `${e.document?.documentName || "(untitled)"} · ${e.document?.page || ""}`;
+          default: return JSON.stringify(e);
+        }
+      }
+
+      // ----- Channels sidebar ------------------------------------------------
+      function ChannelCard({ c, onPick, active }) {
+        const when = c.emptiedAt
+          ? `empty since ${fmtTime(c.emptiedAt)}`
+          : null;
+        const figmaCount = c.clients.filter((cl) => cl.role === "figma").length;
+        const dupFigma = figmaCount > 1;
+        return (
+          <div
+            className={"chan-card" + (active ? "" : " dim") + (dupFigma ? " warn" : "")}
+            onClick={() => onPick(c.channel)}
+            title="Click to filter the log by this channel"
+          >
+            <div className="chan-head">
+              <span className="chan-name">#{c.channel}</span>
+              <span className="badge">
+                {active ? `${c.count} client${c.count === 1 ? "" : "s"}` : "empty"}
+              </span>
+            </div>
+            {c.document && (
+              <div className="doc-info">
+                <span className="doc-name">📄 {c.document.documentName || "(untitled)"}</span>
+                <span className="doc-sub">
+                  {c.document.page ? `· ${c.document.page}` : ""}
+                  {typeof c.document.nodeCount === "number" ? ` · ${c.document.nodeCount} nodes` : ""}
+                  {c.document.pageCount > 1 ? ` · ${c.document.pageCount} pages` : ""}
+                </span>
+              </div>
+            )}
+            {dupFigma && (
+              <div className="warn-banner">
+                ⚠ {figmaCount} Figma plugins on one channel — commands will run on
+                all of them and responses are nondeterministic. Use one document per channel.
+              </div>
+            )}
+            {c.clients.map((cl) => (
+              <div className="member" key={cl.id}>
+                <span className={"badge " + cl.role}>{cl.role}</span>
+                <code>{cl.id}</code>
+              </div>
+            ))}
+            {when && <div className="member"><code>{when}</code></div>}
+          </div>
+        );
+      }
+
+      function Channels({ channels, onPick, onClearEmpty }) {
+        const [showEmpty, setShowEmpty] = useState(false);
+        const active = channels.filter((c) => c.count > 0);
+        const empty = channels
+          .filter((c) => c.count === 0)
+          .sort((a, b) => (b.emptiedAt || 0) - (a.emptiedAt || 0));
+
+        return (
+          <div className="section">
+            <h2>Channels &amp; Clients</h2>
+            {active.length === 0 && (
+              <div className="muted">No active channels. Open the Figma plugin and connect.</div>
+            )}
+            {active.map((c) => (
+              <ChannelCard key={c.channel} c={c} onPick={onPick} active />
+            ))}
+
+            {empty.length > 0 && (
+              <div className="empty-folder">
+                <div className="folder-head">
+                  <span onClick={() => setShowEmpty((s) => !s)} style={{ cursor: "pointer", flex: 1 }}>
+                    <span className="caret">{showEmpty ? "▾" : "▸"}</span>
+                    Empty channels ({empty.length})
+                  </span>
+                  <button
+                    className="ghost"
+                    style={{ padding: "2px 8px", fontSize: 11 }}
+                    onClick={(e) => { e.stopPropagation(); onClearEmpty(); }}
+                  >
+                    Clear
+                  </button>
+                </div>
+                {showEmpty &&
+                  empty.map((c) => (
+                    <ChannelCard key={c.channel} c={c} onPick={onPick} active={false} />
+                  ))}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      // ----- Test call panel (uses its own peer WebSocket) -------------------
+      function TestCall({ channels }) {
+        const [channel, setChannel] = useState("");
+        const [command, setCommand] = useState("get_document_info");
+        const [paramsText, setParamsText] = useState("{}");
+        const [busy, setBusy] = useState(false);
+        const [result, setResult] = useState(null);
+        const wsRef = useRef(null);
+        const stateRef = useRef({ channel: null, joined: false, pending: new Map() });
+
+        // default channel = first one that has a figma client
+        useEffect(() => {
+          if (!channel && channels.length) {
+            const figma = channels.find((c) => c.clients.some((cl) => cl.role === "figma"));
+            setChannel((figma || channels[0]).channel);
+          }
+        }, [channels, channel]);
+
+        function ensureSocket(target) {
+          const st = stateRef.current;
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && st.channel === target && st.joined) {
+            return Promise.resolve();
+          }
+          if (wsRef.current) { try { wsRef.current.close(); } catch {} }
+          return new Promise((resolve, reject) => {
+            const ws = new WebSocket(WS_URL);
+            wsRef.current = ws;
+            st.channel = target; st.joined = false; st.pending = new Map();
+            const to = setTimeout(() => reject(new Error("connect/join timeout")), 8000);
+            // join as a controller (so the server labels us controller, not figma)
+            ws.onopen = () => ws.send(JSON.stringify({ type: "join", channel: target, id: genId(), message: { command: "join" } }));
+            ws.onerror = () => { clearTimeout(to); reject(new Error("socket error")); };
+            ws.onmessage = (ev) => {
+              let d; try { d = JSON.parse(ev.data); } catch { return; }
+              // join confirmation carries message.result
+              if (!st.joined && d.type === "system" && d.message && d.message.result) {
+                st.joined = true; clearTimeout(to); resolve(); return;
+              }
+              const m = d.message;
+              if (m && m.id && st.pending.has(m.id)) {
+                const cb = st.pending.get(m.id); st.pending.delete(m.id); cb(m);
+              }
+            };
+          });
+        }
+
+        async function send() {
+          setBusy(true); setResult(null);
+          let params;
+          try { params = paramsText.trim() ? JSON.parse(paramsText) : {}; }
+          catch (e) { setResult({ error: "Invalid JSON params: " + e.message }); setBusy(false); return; }
+          try {
+            await ensureSocket(channel);
+            const id = genId();
+            const st = stateRef.current;
+            const done = new Promise((resolve) => {
+              const timer = setTimeout(() => { st.pending.delete(id); resolve({ error: "Timed out after 30s" }); }, 30000);
+              st.pending.set(id, (m) => { clearTimeout(timer); resolve(m); });
+            });
+            wsRef.current.send(JSON.stringify({
+              id, type: "message", channel,
+              message: { id, command, params: { ...params, commandId: id } },
+            }));
+            const m = await done;
+            setResult(m.error ? { error: m.error } : { result: m.result });
+          } catch (e) {
+            setResult({ error: e.message });
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        return (
+          <div className="section">
+            <h2>Test Call</h2>
+            <label>Channel</label>
+            <select value={channel} onChange={(e) => setChannel(e.target.value)}>
+              {channels.length === 0 && <option value="">(no channels)</option>}
+              {channels.map((c) => <option key={c.channel} value={c.channel}>#{c.channel} ({c.count})</option>)}
+            </select>
+            <label>Command</label>
+            <input list="cmds" value={command} onChange={(e) => setCommand(e.target.value)} />
+            <datalist id="cmds">{COMMANDS.map((c) => <option key={c} value={c} />)}</datalist>
+            <label>Params (JSON)</label>
+            <textarea rows={4} value={paramsText} onChange={(e) => setParamsText(e.target.value)} spellCheck={false} />
+            <div className="row" style={{ marginTop: 8 }}>
+              <button onClick={send} disabled={busy || !channel}>{busy ? "Calling…" : "Send"}</button>
+              {result && <button className="ghost" onClick={() => setResult(null)}>Clear</button>}
+            </div>
+            {result && (
+              <div className="result-box">
+                <div className={result.error ? "bad" : "ok"}>{result.error ? "✗ error" : "✓ result"}</div>
+                <pre>{JSON.stringify(result.error ?? result.result, null, 2)}</pre>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      // ----- Virtualized log list -------------------------------------------
+      const KINDS = ["command", "result", "join", "connect", "disconnect", "progress", "document"];
+
+      function LogPanel({ getEvents, version, filter, setFilter }) {
+        const [enabled, setEnabled] = useState(() => new Set(KINDS));
+        const [autoscroll, setAutoscroll] = useState(true);
+        const [selected, setSelected] = useState(null);
+        const hostRef = useRef(null);
+        const listRef = useRef(null);
+        const { h } = useSize(hostRef);
+
+        const filtered = useMemo(() => {
+          const all = getEvents();
+          const f = filter.trim().toLowerCase();
+          return all.filter((e) => {
+            if (!enabled.has(e.kind)) return false;
+            if (!f) return true;
+            return (e.command || "").toLowerCase().includes(f)
+              || (e.channel || "").toLowerCase().includes(f)
+              || (e.commandId || "").toLowerCase().includes(f)
+              || summarize(e).toLowerCase().includes(f);
+          });
+        // eslint-disable-next-line
+        }, [version, filter, enabled]);
+
+        useEffect(() => {
+          if (autoscroll && listRef.current && filtered.length) {
+            listRef.current.scrollToItem(filtered.length - 1, "end");
+          }
+        }, [filtered.length, autoscroll]);
+
+        const toggleKind = (k) => setEnabled((prev) => {
+          const n = new Set(prev); n.has(k) ? n.delete(k) : n.add(k); return n;
+        });
+
+        const Row = useCallback(({ index, style }) => {
+          const e = filtered[index];
+          const errCls = e.kind === "result" && !e.ok ? " err" : "";
+          return (
+            <div
+              className={"logrow" + (selected && selected._i === e._i ? " sel" : "")}
+              style={style}
+              onClick={() => setSelected(e)}
+            >
+              <span className="ts">{fmtTime(e.ts)}</span>
+              <span className={"kind " + e.kind + errCls}>{e.kind}</span>
+              <span className="chan-col">{e.channel ? "#" + e.channel : ""}</span>
+              <span className="summary">{summarize(e)}</span>
+            </div>
+          );
+        }, [filtered, selected]);
+
+        return (
+          <>
+            <div className="toolbar">
+              <input type="text" placeholder="filter… (or click a channel)" value={filter} onChange={(e) => setFilter(e.target.value)} />
+              {filter && <button className="ghost" style={{ padding: "4px 8px" }} onClick={() => setFilter("")}>clear</button>}
+              {KINDS.map((k) => (
+                <label className="chk" key={k}>
+                  <input type="checkbox" checked={enabled.has(k)} onChange={() => toggleKind(k)} /> {k}
+                </label>
+              ))}
+              <label className="chk">
+                <input type="checkbox" checked={autoscroll} onChange={(e) => setAutoscroll(e.target.checked)} /> autoscroll
+              </label>
+              <span className="muted" style={{ marginLeft: "auto" }}>{filtered.length} shown</span>
+            </div>
+            <div className="list-host" ref={hostRef}>
+              {h > 0 && (
+                <FixedSizeList
+                  height={h}
+                  width="100%"
+                  itemCount={filtered.length}
+                  itemSize={ROW_H}
+                  ref={listRef}
+                >
+                  {Row}
+                </FixedSizeList>
+              )}
+            </div>
+            {selected && (
+              <div className="detail">
+                <pre>{JSON.stringify(selected, null, 2)}</pre>
+              </div>
+            )}
+          </>
+        );
+      }
+
+      // ----- Root app --------------------------------------------------------
+      function App() {
+        const [connected, setConnected] = useState(false);
+        const [channels, setChannels] = useState([]);
+        const bufRef = useRef([]);       // ring buffer of events
+        const queueRef = useRef([]);     // pending events between flushes
+        const pausedRef = useRef(false);
+        const [paused, setPaused] = useState(false);
+        const [version, setVersion] = useState(0); // bumped on flush to trigger renders
+        const [filter, setFilter] = useState("");  // shared: channel click sets this
+        const seqRef = useRef(0);
+        const monitorRef = useRef(null); // live monitor socket, for sending actions
+
+        pausedRef.current = paused;
+
+        const getEvents = useCallback(() => bufRef.current, []);
+
+        useEffect(() => {
+          let ws, alive = true, retry;
+          const connect = () => {
+            ws = new WebSocket(WS_URL);
+            monitorRef.current = ws;
+            ws.onopen = () => { setConnected(true); ws.send(JSON.stringify({ type: "monitor" })); };
+            ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 1500); };
+            ws.onerror = () => { try { ws.close(); } catch {} };
+            ws.onmessage = (ev) => {
+              let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+              if (msg.kind === "snapshot") {
+                setChannels(msg.channels || []);
+                (msg.log || []).forEach((e) => { e._i = ++seqRef.current; });
+                bufRef.current = (msg.log || []).slice(-RING);
+                setVersion((v) => v + 1);
+              } else if (msg.kind === "channels") {
+                setChannels(msg.channels || []);
+              } else if (msg.kind === "event") {
+                if (!pausedRef.current) queueRef.current.push(msg.event);
+              }
+            };
+          };
+          connect();
+
+          const flush = setInterval(() => {
+            if (!queueRef.current.length) return;
+            const incoming = queueRef.current;
+            queueRef.current = [];
+            for (const e of incoming) { e._i = ++seqRef.current; bufRef.current.push(e); }
+            if (bufRef.current.length > RING) bufRef.current.splice(0, bufRef.current.length - RING);
+            setVersion((v) => v + 1);
+          }, FLUSH_MS);
+
+          return () => { alive = false; clearTimeout(retry); clearInterval(flush); try { ws.close(); } catch {} };
+        }, []);
+
+        const clear = () => { bufRef.current = []; queueRef.current = []; setVersion((v) => v + 1); };
+        const clearEmpty = useCallback(() => {
+          const ws = monitorRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "clear_empty" }));
+        }, []);
+
+        return (
+          <>
+            <div className="topbar">
+              <span className={"dot " + (connected ? "on" : "off")}></span>
+              <h1>Talk-to-Figma · Server Console</h1>
+              <span className="muted">{WS_URL}</span>
+              <span style={{ marginLeft: "auto" }} className="row">
+                <button className="ghost" onClick={() => setPaused((p) => !p)}>{paused ? "Resume" : "Pause"}</button>
+                <button className="ghost" onClick={clear}>Clear log</button>
+              </span>
+            </div>
+            <div className="main">
+              <div className="sidebar">
+                <Channels channels={channels} onPick={setFilter} onClearEmpty={clearEmpty} />
+                <TestCall channels={channels} />
+              </div>
+              <div className="logwrap">
+                <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
+              </div>
+            </div>
+          </>
+        );
+      }
+
+      createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>

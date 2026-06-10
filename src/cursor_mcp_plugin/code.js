@@ -104,8 +104,37 @@ figma.ui.onmessage = async (msg) => {
         });
       }
       break;
+    case "request-doc-meta":
+      // UI wants the document identity to announce it to the relay server
+      try {
+        figma.ui.postMessage({ type: "doc-meta", meta: getDocMeta() });
+      } catch (e) {}
+      break;
   }
 };
+
+// Lightweight document identity so the relay/console can tell channels apart
+function getDocMeta() {
+  let pageCount = 1;
+  try {
+    pageCount = figma.root.children.length;
+  } catch (e) {}
+  return {
+    documentName: figma.root.name,
+    fileKey: figma.fileKey || null,
+    page: figma.currentPage.name,
+    pageId: figma.currentPage.id,
+    nodeCount: figma.currentPage.children.length,
+    pageCount,
+  };
+}
+
+// Re-announce when the user switches pages so the console stays accurate
+figma.on("currentpagechange", () => {
+  try {
+    figma.ui.postMessage({ type: "doc-meta", meta: getDocMeta() });
+  } catch (e) {}
+});
 
 // Listen for plugin commands from menu
 figma.on("run", ({ command }) => {

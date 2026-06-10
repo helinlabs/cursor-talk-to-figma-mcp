@@ -3033,6 +3033,59 @@ function sendCommandToFigma(
   });
 }
 
+// List channels known to the relay, with the Figma document each is on.
+// Use this to discover which channel to join when you don't already know it.
+server.tool(
+  "list_figma_channels",
+  "List the channels on the Talk-to-Figma relay server and which Figma document each is connected to. Use this BEFORE join_channel when you don't already know the channel name: find the channel whose document matches what the user wants, then call join_channel with it. Channels where hasFigma is true have a live Figma plugin and are joinable; empty channels are kept for history and show which document they were. Returns the currently joined channel as `current`.",
+  {},
+  async () => {
+    try {
+      const httpUrl =
+        serverUrl === "localhost"
+          ? "http://localhost:3055/channels"
+          : `https://${serverUrl}/channels`;
+      const res = await fetch(httpUrl);
+      if (!res.ok) throw new Error(`relay returned HTTP ${res.status}`);
+      const data: any = await res.json();
+      const channels = (data.channels || []).map((c: any) => ({
+        channel: c.channel,
+        active: !c.empty,
+        hasFigma: (c.clients || []).some((cl: any) => cl.role === "figma"),
+        clientRoles: (c.clients || []).map((cl: any) => cl.role),
+        document: c.document
+          ? {
+              name: c.document.documentName,
+              page: c.document.page,
+              nodeCount: c.document.nodeCount,
+              pageCount: c.document.pageCount,
+              fileKey: c.document.fileKey,
+            }
+          : null,
+        emptiedAt: c.emptiedAt,
+      }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ current: currentChannel, channels }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error listing channels: ${error instanceof Error ? error.message : String(error)
+              }. Is the WebSocket relay running (bun socket) on port 3055?`,
+          },
+        ],
+      };
+    }
+  }
+);
+
 // Update the join_channel tool
 server.tool(
   "join_channel",

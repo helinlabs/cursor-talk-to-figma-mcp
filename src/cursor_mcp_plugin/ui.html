@@ -250,6 +250,102 @@
       .operation-error {
         color: #ff9999;
       }
+
+      /* Request/response log panel */
+      .log-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .log-toolbar .log-count {
+        margin-left: auto;
+        font-size: 11px;
+        color: #888;
+      }
+      .log-list {
+        border: 1px solid #444444;
+        border-radius: 6px;
+        overflow-y: auto;
+        max-height: 360px;
+        background: #181818;
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 12px;
+      }
+      .log-empty {
+        padding: 16px;
+        color: #777;
+        text-align: center;
+      }
+      .log-entry {
+        border-bottom: 1px solid #262626;
+      }
+      .log-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+      .log-head:hover {
+        background: #232323;
+      }
+      .log-time {
+        color: #888;
+        flex: 0 0 86px;
+      }
+      .log-cmd {
+        font-weight: 600;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .log-dur {
+        color: #888;
+        font-size: 11px;
+      }
+      .log-status {
+        flex: 0 0 auto;
+        font-size: 11px;
+        padding: 1px 7px;
+        border-radius: 10px;
+      }
+      .log-status.running {
+        background: #2a2a17;
+        color: #fbbf24;
+      }
+      .log-status.success {
+        background: #15301f;
+        color: #4ade80;
+      }
+      .log-status.error {
+        background: #3a1717;
+        color: #ff9999;
+      }
+      .log-body {
+        display: none;
+        padding: 8px 10px;
+        background: #111111;
+        border-top: 1px solid #262626;
+      }
+      .log-entry.open .log-body {
+        display: block;
+      }
+      .log-body h4 {
+        margin: 0 0 4px;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #888;
+        font-family: -apple-system, sans-serif;
+      }
+      .log-body pre {
+        margin: 0 0 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: #cfcfcf;
+      }
     </style>
   </head>
 
@@ -264,6 +360,7 @@
 
       <div class="tabs">
         <div id="tab-connection" class="tab active">Connection</div>
+        <div id="tab-logs" class="tab">Logs</div>
         <div id="tab-about" class="tab">About</div>
       </div>
 
@@ -349,6 +446,23 @@
           >
             <div id="progress-status">Not started</div>
             <div id="progress-percentage">0%</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="content-logs" class="tab-content">
+        <div class="section">
+          <div class="log-toolbar">
+            <h2 style="margin: 0">Request Log</h2>
+            <button id="btn-clear-logs" class="secondary" style="margin: 0; padding: 4px 10px">Clear</button>
+            <span class="log-count" id="log-count">0 / 200</span>
+          </div>
+          <p style="font-size: 11px; color: #888; margin: 0 0 8px">
+            Commands received from the MCP server and their responses. Newest first.
+            Click an entry to see params/result. Capped at 200 (oldest dropped).
+          </p>
+          <div class="log-list" id="log-list">
+            <div class="log-empty">No requests yet.</div>
           </div>
         </div>
       </div>
@@ -463,6 +577,120 @@
       })();
       analytics.track("plugin_open");
 
+      // --- Request/response log (ring buffer, newest-first rendering) ---
+      const reqLog = (() => {
+        const MAX = 200;
+        const entries = []; // oldest at index 0; rendered newest-first
+        const byId = new Map();
+        let listEl, countEl;
+
+        function els() {
+          if (!listEl) listEl = document.getElementById("log-list");
+          if (!countEl) countEl = document.getElementById("log-count");
+        }
+        function fmt(ts) {
+          const d = new Date(ts);
+          const p = (n, l = 2) => String(n).padStart(l, "0");
+          return `${p(d.getHours())}:${p(d.getMinutes())}:${p(
+            d.getSeconds()
+          )}.${p(d.getMilliseconds(), 3)}`;
+        }
+        function esc(s) {
+          return String(s).replace(
+            /[&<>]/g,
+            (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])
+          );
+        }
+        function safeJson(v) {
+          try {
+            return JSON.stringify(v, null, 2);
+          } catch {
+            return String(v);
+          }
+        }
+        function render() {
+          els();
+          if (!listEl) return;
+          countEl.textContent = `${entries.length} / ${MAX}`;
+          if (!entries.length) {
+            listEl.innerHTML = '<div class="log-empty">No requests yet.</div>';
+            return;
+          }
+          const html = [];
+          for (let i = entries.length - 1; i >= 0; i--) {
+            const e = entries[i];
+            const dur = e.endedAt ? `${e.endedAt - e.startedAt}ms` : "";
+            const label =
+              e.status === "running"
+                ? "running"
+                : e.status === "success"
+                ? "ok"
+                : "error";
+            const body = [];
+            body.push(`<h4>params</h4><pre>${esc(safeJson(e.params))}</pre>`);
+            if (e.status === "success")
+              body.push(`<h4>result</h4><pre>${esc(safeJson(e.result))}</pre>`);
+            if (e.status === "error")
+              body.push(`<h4>error</h4><pre>${esc(e.error)}</pre>`);
+            html.push(
+              `<div class="log-entry${e.open ? " open" : ""}" data-id="${esc(
+                e.id
+              )}">` +
+                `<div class="log-head">` +
+                `<span class="log-time">${fmt(e.startedAt)}</span>` +
+                `<span class="log-cmd">${esc(e.command)}</span>` +
+                `<span class="log-dur">${dur}</span>` +
+                `<span class="log-status ${e.status}">${label}</span>` +
+                `</div>` +
+                `<div class="log-body">${body.join("")}</div>` +
+                `</div>`
+            );
+          }
+          listEl.innerHTML = html.join("");
+        }
+
+        return {
+          add(id, command, params) {
+            const e = {
+              id,
+              command,
+              params,
+              status: "running",
+              startedAt: Date.now(),
+              open: false,
+            };
+            entries.push(e);
+            byId.set(id, e);
+            while (entries.length > MAX) {
+              const removed = entries.shift();
+              byId.delete(removed.id);
+            }
+            render();
+          },
+          finish(id, status, payload) {
+            const e = byId.get(id);
+            if (!e) return;
+            e.status = status;
+            e.endedAt = Date.now();
+            if (status === "success") e.result = payload;
+            else e.error = payload;
+            render();
+          },
+          toggle(id) {
+            const e = byId.get(id);
+            if (e) {
+              e.open = !e.open;
+              render();
+            }
+          },
+          clear() {
+            entries.length = 0;
+            byId.clear();
+            render();
+          },
+        };
+      })();
+
       // UI Elements
       const portInput = document.getElementById("port");
       const connectButton = document.getElementById("btn-connect");
@@ -540,6 +768,12 @@
                 channel: channelName.trim(),
               })
             );
+
+            // Ask the plugin code for document identity so we can announce it
+            parent.postMessage(
+              { pluginMessage: { type: "request-doc-meta" } },
+              "*"
+            );
           };
 
           state.socket.onmessage = (event) => {
@@ -560,6 +794,9 @@
                     port: state.serverPort,
                     channel: channelName,
                   });
+
+                  // Announce document identity now that the channel is joined
+                  announceDocMeta();
 
                   // Notify the plugin code
                   parent.postMessage(
@@ -641,6 +878,7 @@
               command: data.command,
               startedAt: Date.now(),
             });
+            reqLog.add(data.id, data.command, data.params);
 
             // Send the command to the plugin code
             parent.postMessage(
@@ -889,11 +1127,13 @@
             // Forward the result from plugin code back to WebSocket
             sendSuccessResponse(message.id, message.result);
             trackCommandResult(message.id, true);
+            reqLog.finish(message.id, "success", message.result);
             break;
           case "command-error":
             // Forward the error from plugin code back to WebSocket
             sendErrorResponse(message.id, message.error);
             trackCommandResult(message.id, false, message.error);
+            reqLog.finish(message.id, "error", message.error);
             break;
           case "command_progress":
             // Update UI with progress information
@@ -904,8 +1144,32 @@
           case "analytics-client-id":
             analytics.setClientId(message.clientId);
             break;
+          case "doc-meta":
+            state.docMeta = message.meta;
+            announceDocMeta();
+            break;
         }
       };
+
+      // Send the document identity to the relay so the console/controllers can
+      // tell which document this channel belongs to.
+      function announceDocMeta() {
+        if (
+          !state.connected ||
+          !state.socket ||
+          !state.docMeta ||
+          !state.channel
+        ) {
+          return;
+        }
+        state.socket.send(
+          JSON.stringify({
+            type: "announce",
+            channel: state.channel,
+            document: state.docMeta,
+          })
+        );
+      }
 
       // Add this to the script section, after all the other event listeners
       document.getElementById("btn-copy").addEventListener("click", () => {
@@ -917,6 +1181,15 @@
         setTimeout(() => {
           button.textContent = "Copy to Clipboard";
         }, 2000);
+      });
+
+      // Request log: clear button + click-to-expand (event delegation)
+      document
+        .getElementById("btn-clear-logs")
+        .addEventListener("click", () => reqLog.clear());
+      document.getElementById("log-list").addEventListener("click", (e) => {
+        const entry = e.target.closest(".log-entry");
+        if (entry && entry.dataset.id) reqLog.toggle(entry.dataset.id);
       });
 
       // Add this function to the script section
