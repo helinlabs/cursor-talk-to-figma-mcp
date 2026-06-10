@@ -130,6 +130,44 @@
         overflow: auto; padding: 10px 14px;
       }
       .detail pre { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+      /* View tabs in the top bar */
+      .view-tabs { display: inline-flex; gap: 4px; margin-left: 16px; }
+      .vtab {
+        background: transparent; border: 1px solid var(--border); color: var(--muted);
+        padding: 5px 12px; border-radius: 6px; font-weight: 500; cursor: pointer; width: auto;
+      }
+      .vtab.active { background: var(--blue); color: #06121f; border-color: var(--blue); font-weight: 600; }
+
+      /* Request explorer (Swagger-style) */
+      .explorer { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+      .exp-top { display: flex; gap: 12px; padding: 12px 16px 0; }
+      .exp-field { flex: 1; min-width: 0; }
+      .exp-desc { padding: 8px 16px; color: var(--muted); }
+      .exp-body { flex: 1; display: flex; min-height: 0; gap: 0; }
+      .exp-form { flex: 1; overflow-y: auto; padding: 8px 16px 24px; border-right: 1px solid var(--border); }
+      .exp-form h4, .exp-side h4 {
+        margin: 4px 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+      }
+      .exp-side { width: 42%; min-width: 320px; display: flex; flex-direction: column; padding: 8px 16px 16px; overflow-y: auto; }
+      .exp-preview {
+        background: #11131a; border: 1px solid var(--border); border-radius: 6px;
+        padding: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+        white-space: pre-wrap; word-break: break-word; margin: 0 0 10px; max-height: 220px; overflow: auto;
+      }
+      .field { margin-bottom: 12px; }
+      .field-inline { display: flex; align-items: center; gap: 8px; }
+      .field-inline label { margin: 0; order: 2; }
+      .field-inline input { width: auto; }
+      .field label { display: block; margin-bottom: 3px; }
+      .field .req { color: var(--red); margin-left: 2px; }
+      .field .ptype { color: var(--muted); font-size: 10px; font-weight: 400; margin-left: 4px; }
+      .phint { color: var(--muted); font-size: 11px; margin-top: 2px; }
+      .obj-field { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; }
+      .obj-head { font-weight: 600; margin-bottom: 8px; }
+      .obj-head .req { color: var(--red); }
+      .obj-body { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .obj-body .field { margin-bottom: 0; }
+
       .result-box {
         margin-top: 8px; background: #11131a; border: 1px solid var(--border);
         border-radius: 6px; padding: 8px; max-height: 200px; overflow: auto;
@@ -163,14 +201,6 @@
       const RING = 5000;          // browser-side ring buffer size
       const FLUSH_MS = 150;       // batch incoming events to avoid render storms
       const ROW_H = 26;
-
-      const COMMANDS = [
-        "get_document_info","get_selection","read_my_design","get_node_info","get_nodes_info",
-        "get_styles","get_local_components","get_annotations","scan_text_nodes","scan_nodes_by_types",
-        "create_rectangle","create_frame","create_text","set_fill_color","set_stroke_color",
-        "move_node","resize_node","delete_node","clone_node","set_text_content","export_node_as_image",
-        "set_corner_radius","set_layout_mode","set_padding","set_item_spacing","get_reactions"
-      ];
 
       function genId() {
         return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -207,6 +237,269 @@
           case "document": return `${e.document?.documentName || "(untitled)"} · ${e.document?.page || ""}`;
           default: return JSON.stringify(e);
         }
+      }
+
+      // ----- Command catalog (wire format sent to the Figma plugin) ---------
+      const COMMAND_CATALOG = [
+        { group: "Document & Selection", command: "get_document_info", description: "Get detailed information about the current Figma document", params: [] },
+        { group: "Document & Selection", command: "get_selection", description: "Get information about the current selection in Figma", params: [] },
+        { group: "Document & Selection", command: "read_my_design", description: "Get detailed information about the current selection, including all node details", params: [] },
+        { group: "Document & Selection", command: "get_node_info", description: "Get detailed information about a specific node", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to get information about" }
+        ] },
+        { group: "Document & Selection", command: "get_nodes_info", description: "Get detailed info about multiple nodes (plugin supports a nodeIds array directly)", params: [
+          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs", example: '["123:1","123:2"]' }
+        ] },
+        { group: "Document & Selection", command: "set_focus", description: "Set focus on a node by selecting it and scrolling the viewport to it", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to focus on" }
+        ] },
+        { group: "Document & Selection", command: "set_selections", description: "Set selection to multiple nodes and scroll the viewport to show them", params: [
+          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs to select", example: '["123:1","123:2"]' }
+        ] },
+
+        { group: "Creating Elements", command: "create_rectangle", description: "Create a new rectangle in Figma", params: [
+          { name: "x", type: "number", required: true, description: "X position" },
+          { name: "y", type: "number", required: true, description: "Y position" },
+          { name: "width", type: "number", required: true, description: "Width of the rectangle" },
+          { name: "height", type: "number", required: true, description: "Height of the rectangle" },
+          { name: "name", type: "string", required: false, default: "Rectangle", description: "Optional name for the rectangle" },
+          { name: "parentId", type: "string", required: false, description: "Optional parent node ID to append the rectangle to" }
+        ] },
+        { group: "Creating Elements", command: "create_frame", description: "Create a new frame in Figma", params: [
+          { name: "x", type: "number", required: true, description: "X position" },
+          { name: "y", type: "number", required: true, description: "Y position" },
+          { name: "width", type: "number", required: true, description: "Width of the frame" },
+          { name: "height", type: "number", required: true, description: "Height of the frame" },
+          { name: "name", type: "string", required: false, default: "Frame", description: "Optional name for the frame" },
+          { name: "parentId", type: "string", required: false, description: "Optional parent node ID to append the frame to" },
+          { name: "fillColor", type: "object", required: false, description: "Fill color in RGBA format", fields: [
+            { name: "r", type: "number", required: true, min: 0, max: 1, description: "Red (0-1)" },
+            { name: "g", type: "number", required: true, min: 0, max: 1, description: "Green (0-1)" },
+            { name: "b", type: "number", required: true, min: 0, max: 1, description: "Blue (0-1)" },
+            { name: "a", type: "number", required: false, min: 0, max: 1, description: "Alpha (0-1)" }
+          ] },
+          { name: "strokeColor", type: "object", required: false, description: "Stroke color in RGBA format", fields: [
+            { name: "r", type: "number", required: true, min: 0, max: 1, description: "Red (0-1)" },
+            { name: "g", type: "number", required: true, min: 0, max: 1, description: "Green (0-1)" },
+            { name: "b", type: "number", required: true, min: 0, max: 1, description: "Blue (0-1)" },
+            { name: "a", type: "number", required: false, min: 0, max: 1, description: "Alpha (0-1)" }
+          ] },
+          { name: "strokeWeight", type: "number", required: false, description: "Stroke weight (positive)" },
+          { name: "layoutMode", type: "enum", required: false, values: ["NONE", "HORIZONTAL", "VERTICAL"], description: "Auto-layout mode" },
+          { name: "layoutWrap", type: "enum", required: false, values: ["NO_WRAP", "WRAP"], description: "Whether the auto-layout frame wraps children" },
+          { name: "paddingTop", type: "number", required: false, description: "Top padding" },
+          { name: "paddingRight", type: "number", required: false, description: "Right padding" },
+          { name: "paddingBottom", type: "number", required: false, description: "Bottom padding" },
+          { name: "paddingLeft", type: "number", required: false, description: "Left padding" },
+          { name: "primaryAxisAlignItems", type: "enum", required: false, values: ["MIN", "MAX", "CENTER", "SPACE_BETWEEN"], description: "Primary axis alignment (SPACE_BETWEEN ignores itemSpacing)" },
+          { name: "counterAxisAlignItems", type: "enum", required: false, values: ["MIN", "MAX", "CENTER", "BASELINE"], description: "Counter axis alignment" },
+          { name: "layoutSizingHorizontal", type: "enum", required: false, values: ["FIXED", "HUG", "FILL"], description: "Horizontal sizing mode" },
+          { name: "layoutSizingVertical", type: "enum", required: false, values: ["FIXED", "HUG", "FILL"], description: "Vertical sizing mode" },
+          { name: "itemSpacing", type: "number", required: false, description: "Distance between children (ignored if SPACE_BETWEEN)" }
+        ] },
+        { group: "Creating Elements", command: "create_text", description: "Create a new text element in Figma", params: [
+          { name: "x", type: "number", required: true, description: "X position" },
+          { name: "y", type: "number", required: true, description: "Y position" },
+          { name: "text", type: "string", required: true, description: "Text content" },
+          { name: "fontSize", type: "number", required: false, default: 14, description: "Font size" },
+          { name: "fontWeight", type: "number", required: false, default: 400, description: "Font weight (400 Regular, 700 Bold)" },
+          { name: "fontColor", type: "object", required: false, description: "Font color in RGBA format", fields: [
+            { name: "r", type: "number", required: true, min: 0, max: 1, description: "Red (0-1)" },
+            { name: "g", type: "number", required: true, min: 0, max: 1, description: "Green (0-1)" },
+            { name: "b", type: "number", required: true, min: 0, max: 1, description: "Blue (0-1)" },
+            { name: "a", type: "number", required: false, min: 0, max: 1, description: "Alpha (0-1)" }
+          ] },
+          { name: "name", type: "string", required: false, default: "Text", description: "Semantic layer name" },
+          { name: "parentId", type: "string", required: false, description: "Optional parent node ID" }
+        ] },
+        { group: "Creating Elements", command: "clone_node", description: "Clone an existing node in Figma", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to clone" },
+          { name: "x", type: "number", required: false, description: "New X position for the clone" },
+          { name: "y", type: "number", required: false, description: "New Y position for the clone" }
+        ] },
+
+        { group: "Layout & Organization", command: "move_node", description: "Move a node to a new position", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to move" },
+          { name: "x", type: "number", required: true, description: "New X position" },
+          { name: "y", type: "number", required: true, description: "New Y position" }
+        ] },
+        { group: "Layout & Organization", command: "resize_node", description: "Resize a node", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to resize" },
+          { name: "width", type: "number", required: true, description: "New width (positive)" },
+          { name: "height", type: "number", required: true, description: "New height (positive)" }
+        ] },
+        { group: "Layout & Organization", command: "delete_node", description: "Delete a node", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to delete" }
+        ] },
+        { group: "Layout & Organization", command: "delete_multiple_nodes", description: "Delete multiple nodes at once", params: [
+          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs to delete", example: '["123:1","123:2"]' }
+        ] },
+        { group: "Layout & Organization", command: "scan_nodes_by_types", description: "Scan for child nodes with specific types in the selected node", params: [
+          { name: "nodeId", type: "string", required: true, description: "ID of the node to scan" },
+          { name: "types", type: "json", required: true, description: "Array of node types to find", example: '["COMPONENT","INSTANCE","FRAME"]' }
+        ] },
+
+        { group: "Styling", command: "set_fill_color", description: "Set the fill color of a node (TextNode or FrameNode)", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to modify" },
+          { name: "color", type: "object", required: true, description: "Fill color in RGBA format", fields: [
+            { name: "r", type: "number", required: true, min: 0, max: 1, description: "Red (0-1)" },
+            { name: "g", type: "number", required: true, min: 0, max: 1, description: "Green (0-1)" },
+            { name: "b", type: "number", required: true, min: 0, max: 1, description: "Blue (0-1)" },
+            { name: "a", type: "number", required: false, default: 1, description: "Alpha (0-1)" }
+          ] }
+        ] },
+        { group: "Styling", command: "set_stroke_color", description: "Set the stroke color of a node", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to modify" },
+          { name: "color", type: "object", required: true, description: "Stroke color in RGBA format", fields: [
+            { name: "r", type: "number", required: true, min: 0, max: 1, description: "Red (0-1)" },
+            { name: "g", type: "number", required: true, min: 0, max: 1, description: "Green (0-1)" },
+            { name: "b", type: "number", required: true, min: 0, max: 1, description: "Blue (0-1)" },
+            { name: "a", type: "number", required: false, default: 1, description: "Alpha (0-1)" }
+          ] },
+          { name: "weight", type: "number", required: false, default: 1, description: "Stroke weight (positive)" }
+        ] },
+        { group: "Styling", command: "set_corner_radius", description: "Set the corner radius of a node", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to modify" },
+          { name: "radius", type: "number", required: true, min: 0, description: "Corner radius value" },
+          { name: "corners", type: "json", required: false, description: "4 booleans [topLeft, topRight, bottomRight, bottomLeft]", example: "[true,true,true,true]" }
+        ] },
+
+        { group: "Text", command: "set_text_content", description: "Set the text content of an existing text node", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the text node to modify" },
+          { name: "text", type: "string", required: true, description: "New text content" }
+        ] },
+        { group: "Text", command: "set_multiple_text_contents", description: "Set multiple text contents in parallel within a node", params: [
+          { name: "nodeId", type: "string", required: true, description: "ID of the node containing the text nodes" },
+          { name: "text", type: "json", required: true, description: "Array of {nodeId, text}", example: '[{"nodeId":"1:2","text":"Hello"},{"nodeId":"1:3","text":"World"}]' }
+        ] },
+        { group: "Text", command: "scan_text_nodes", description: "Scan all text nodes in the selected node (chunked)", params: [
+          { name: "nodeId", type: "string", required: true, description: "ID of the node to scan" },
+          { name: "useChunking", type: "boolean", required: true, default: true, description: "Enable chunked processing" },
+          { name: "chunkSize", type: "number", required: true, default: 10, description: "Nodes per chunk" }
+        ] },
+
+        { group: "Components & Styles", command: "get_styles", description: "Get all styles from the current document", params: [] },
+        { group: "Components & Styles", command: "get_local_components", description: "Get all local components", params: [] },
+        { group: "Components & Styles", command: "create_component_instance", description: "Create an instance of a component", params: [
+          { name: "componentId", type: "string", required: false, description: "ID of a local component" },
+          { name: "componentKey", type: "string", required: false, description: "Key of a published library component" },
+          { name: "x", type: "number", required: true, description: "X position" },
+          { name: "y", type: "number", required: true, description: "Y position" },
+          { name: "parentId", type: "string", required: false, description: "Optional parent node ID" }
+        ] },
+        { group: "Components & Styles", command: "get_instance_overrides", description: "Get override properties from a component instance", params: [
+          { name: "instanceNodeId", type: "string", required: false, description: "Instance ID (empty = use current selection)" }
+        ] },
+        { group: "Components & Styles", command: "set_instance_overrides", description: "Apply copied overrides to target component instances", params: [
+          { name: "sourceInstanceId", type: "string", required: true, description: "ID of the source component instance" },
+          { name: "targetNodeIds", type: "json", required: false, description: "Array of target instance IDs", example: '["1:2","1:3"]' }
+        ] },
+
+        { group: "Annotations", command: "get_annotations", description: "Get annotations in the document or a specific node", params: [
+          { name: "nodeId", type: "string", required: true, description: "Node ID to get annotations for" },
+          { name: "includeCategories", type: "boolean", required: false, default: true, description: "Include category information" }
+        ] },
+        { group: "Annotations", command: "set_annotation", description: "Create or update an annotation", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to annotate" },
+          { name: "annotationId", type: "string", required: false, description: "Existing annotation ID (to update)" },
+          { name: "labelMarkdown", type: "string", required: true, description: "Annotation text in markdown" },
+          { name: "categoryId", type: "string", required: false, description: "Annotation category ID" },
+          { name: "properties", type: "json", required: false, description: "Additional properties", example: '[{"type":"effects"}]' }
+        ] },
+        { group: "Annotations", command: "set_multiple_annotations", description: "Set multiple annotations in parallel within a node", params: [
+          { name: "nodeId", type: "string", required: true, description: "ID of the node containing the elements to annotate" },
+          { name: "annotations", type: "json", required: true, description: "Array of annotations", example: '[{"nodeId":"1:2","labelMarkdown":"Label","categoryId":"cat1"}]' }
+        ] },
+
+        { group: "Auto Layout & Spacing", command: "set_layout_mode", description: "Set the layout mode and wrap behavior of a frame", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the frame to modify" },
+          { name: "layoutMode", type: "enum", required: true, values: ["NONE", "HORIZONTAL", "VERTICAL"], description: "Layout mode" },
+          { name: "layoutWrap", type: "enum", required: false, default: "NO_WRAP", values: ["NO_WRAP", "WRAP"], description: "Whether the frame wraps children" }
+        ] },
+        { group: "Auto Layout & Spacing", command: "set_padding", description: "Set padding values for an auto-layout frame", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the frame to modify" },
+          { name: "paddingTop", type: "number", required: false, description: "Top padding" },
+          { name: "paddingRight", type: "number", required: false, description: "Right padding" },
+          { name: "paddingBottom", type: "number", required: false, description: "Bottom padding" },
+          { name: "paddingLeft", type: "number", required: false, description: "Left padding" }
+        ] },
+        { group: "Auto Layout & Spacing", command: "set_axis_align", description: "Set primary and counter axis alignment for an auto-layout frame", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the frame to modify" },
+          { name: "primaryAxisAlignItems", type: "enum", required: false, values: ["MIN", "MAX", "CENTER", "SPACE_BETWEEN"], description: "Primary axis alignment" },
+          { name: "counterAxisAlignItems", type: "enum", required: false, values: ["MIN", "MAX", "CENTER", "BASELINE"], description: "Counter axis alignment" }
+        ] },
+        { group: "Auto Layout & Spacing", command: "set_layout_sizing", description: "Set horizontal/vertical sizing modes for an auto-layout frame", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the frame to modify" },
+          { name: "layoutSizingHorizontal", type: "enum", required: false, values: ["FIXED", "HUG", "FILL"], description: "Horizontal sizing mode" },
+          { name: "layoutSizingVertical", type: "enum", required: false, values: ["FIXED", "HUG", "FILL"], description: "Vertical sizing mode" }
+        ] },
+        { group: "Auto Layout & Spacing", command: "set_item_spacing", description: "Set distance between children in an auto-layout frame", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the frame to modify" },
+          { name: "itemSpacing", type: "number", required: false, description: "Distance between children" },
+          { name: "counterAxisSpacing", type: "number", required: false, description: "Distance between wrapped rows/columns (WRAP only)" }
+        ] },
+
+        { group: "Prototyping & Connections", command: "get_reactions", description: "Get prototyping reactions from multiple nodes", params: [
+          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs", example: '["1:2","1:3"]' }
+        ] },
+        { group: "Prototyping & Connections", command: "set_default_connector", description: "Set a copied connector node as the default connector", params: [
+          { name: "connectorId", type: "string", required: false, description: "The ID of the connector node" }
+        ] },
+        { group: "Prototyping & Connections", command: "create_connections", description: "Create connections between nodes using the default connector", params: [
+          { name: "connections", type: "json", required: true, description: "Array of {startNodeId, endNodeId, text}", example: '[{"startNodeId":"1:2","endNodeId":"1:3","text":"On click"}]' }
+        ] },
+
+        { group: "Export", command: "export_node_as_image", description: "Export a node as an image", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to export" },
+          { name: "format", type: "enum", required: false, default: "PNG", values: ["PNG", "JPG", "SVG", "PDF"], description: "Export format" },
+          { name: "scale", type: "number", required: false, default: 1, description: "Export scale (positive)" }
+        ] }
+      ];
+
+      // Coerce a form value into the typed wire value (undefined = omit)
+      function coerceParam(p, raw) {
+        switch (p.type) {
+          case "number": {
+            if (raw === "" || raw === undefined || raw === null) return undefined;
+            const n = Number(raw);
+            return Number.isNaN(n) ? undefined : n;
+          }
+          case "boolean":
+            return !!raw; // explicit true/false
+          case "enum":
+          case "string":
+            return raw === "" || raw === undefined || raw === null ? undefined : raw;
+          case "json": {
+            if (raw === undefined || raw === null || !String(raw).trim()) return undefined;
+            return JSON.parse(raw); // may throw -> caller handles
+          }
+          case "object": {
+            const o = {};
+            let any = false;
+            for (const f of p.fields) {
+              const v = coerceParam(f, (raw || {})[f.name]);
+              if (v !== undefined) { o[f.name] = v; any = true; }
+            }
+            return any ? o : undefined;
+          }
+          default:
+            return raw;
+        }
+      }
+
+      // Build the wire params object from form values; throws on bad JSON
+      function buildParams(spec, values) {
+        const out = {};
+        for (const p of spec.params) {
+          let v;
+          try {
+            v = coerceParam(p, values[p.name]);
+          } catch (e) {
+            throw new Error(`${p.name}: ${e.message}`);
+          }
+          if (v !== undefined) out[p.name] = v;
+        }
+        return out;
       }
 
       // ----- Channels sidebar ------------------------------------------------
@@ -298,14 +591,67 @@
       }
 
       // ----- Test call panel (uses its own peer WebSocket) -------------------
-      function TestCall({ channels }) {
+      // ----- Swagger-style request explorer ---------------------------------
+      function Field({ p, value, onChange }) {
+        const req = p.required ? <span className="req">*</span> : null;
+        if (p.type === "object") {
+          return (
+            <div className="obj-field">
+              <div className="obj-head">{p.name}{req} <span className="muted">{p.description}</span></div>
+              <div className="obj-body">
+                {p.fields.map((f) => (
+                  <Field
+                    key={f.name}
+                    p={f}
+                    value={(value || {})[f.name]}
+                    onChange={(v) => onChange({ ...(value || {}), [f.name]: v })}
+                  />
+                ))}
+              </div>
+            </div>
+          );
+        }
+        let input;
+        if (p.type === "boolean") {
+          input = <input type="checkbox" checked={!!value} onChange={(e) => onChange(e.target.checked)} />;
+        } else if (p.type === "enum") {
+          input = (
+            <select value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
+              <option value="">{p.required ? "(select)" : "(none)"}</option>
+              {p.values.map((v) => <option key={v} value={v}>{v}</option>)}
+            </select>
+          );
+        } else if (p.type === "number") {
+          input = <input type="number" value={value ?? ""} onChange={(e) => onChange(e.target.value)} placeholder={p.default !== undefined ? String(p.default) : ""} />;
+        } else if (p.type === "json") {
+          input = <textarea rows={3} value={value ?? ""} onChange={(e) => onChange(e.target.value)} placeholder={p.example || "JSON"} spellCheck={false} />;
+        } else {
+          input = <input value={value ?? ""} onChange={(e) => onChange(e.target.value)} placeholder={p.default !== undefined ? String(p.default) : ""} />;
+        }
+        return (
+          <div className={"field" + (p.type === "boolean" ? " field-inline" : "")}>
+            <label>{p.name}{req} <span className="ptype">{p.type}{p.values ? ` ${p.values.join("|")}` : ""}</span></label>
+            {input}
+            {p.description && <div className="phint">{p.description}</div>}
+          </div>
+        );
+      }
+
+      function RequestExplorer({ channels }) {
         const [channel, setChannel] = useState("");
         const [command, setCommand] = useState("get_document_info");
-        const [paramsText, setParamsText] = useState("{}");
+        const [values, setValues] = useState({});
         const [busy, setBusy] = useState(false);
         const [result, setResult] = useState(null);
         const wsRef = useRef(null);
         const stateRef = useRef({ channel: null, joined: false, pending: new Map() });
+
+        const spec = useMemo(() => COMMAND_CATALOG.find((c) => c.command === command), [command]);
+        const grouped = useMemo(() => {
+          const m = {};
+          for (const c of COMMAND_CATALOG) (m[c.group] = m[c.group] || []).push(c);
+          return m;
+        }, []);
 
         // default channel = first one that has a figma client
         useEffect(() => {
@@ -314,6 +660,30 @@
             setChannel((figma || channels[0]).channel);
           }
         }, [channels, channel]);
+
+        // reset form to defaults when the command changes
+        useEffect(() => {
+          const init = {};
+          if (spec) {
+            for (const p of spec.params) {
+              if ((p.type === "number" || p.type === "boolean" || p.type === "enum" || p.type === "string")
+                  && p.default !== undefined) {
+                init[p.name] = p.default;
+              }
+            }
+          }
+          setValues(init);
+          setResult(null);
+        }, [command]);
+
+        const preview = useMemo(() => {
+          if (!spec) return "";
+          try {
+            return JSON.stringify({ command, params: buildParams(spec, values) }, null, 2);
+          } catch (e) {
+            return "// " + e.message;
+          }
+        }, [spec, command, values]);
 
         function ensureSocket(target) {
           const st = stateRef.current;
@@ -331,7 +701,6 @@
             ws.onerror = () => { clearTimeout(to); reject(new Error("socket error")); };
             ws.onmessage = (ev) => {
               let d; try { d = JSON.parse(ev.data); } catch { return; }
-              // join confirmation carries message.result
               if (!st.joined && d.type === "system" && d.message && d.message.result) {
                 st.joined = true; clearTimeout(to); resolve(); return;
               }
@@ -344,14 +713,25 @@
         }
 
         async function send() {
-          setBusy(true); setResult(null);
+          // build + validate params
           let params;
-          try { params = paramsText.trim() ? JSON.parse(paramsText) : {}; }
-          catch (e) { setResult({ error: "Invalid JSON params: " + e.message }); setBusy(false); return; }
+          try {
+            params = buildParams(spec, values);
+          } catch (e) {
+            setResult({ error: "Param error — " + e.message });
+            return;
+          }
+          const missing = spec.params.filter((p) => p.required && params[p.name] === undefined).map((p) => p.name);
+          if (missing.length) {
+            setResult({ error: "Missing required: " + missing.join(", ") });
+            return;
+          }
+          setBusy(true); setResult(null);
           try {
             await ensureSocket(channel);
             const id = genId();
             const st = stateRef.current;
+            const startedAt = performance.now();
             const done = new Promise((resolve) => {
               const timer = setTimeout(() => { st.pending.delete(id); resolve({ error: "Timed out after 30s" }); }, 30000);
               st.pending.set(id, (m) => { clearTimeout(timer); resolve(m); });
@@ -361,7 +741,8 @@
               message: { id, command, params: { ...params, commandId: id } },
             }));
             const m = await done;
-            setResult(m.error ? { error: m.error } : { result: m.result });
+            const ms = Math.round(performance.now() - startedAt);
+            setResult(m.error ? { error: m.error, ms } : { result: m.result, ms });
           } catch (e) {
             setResult({ error: e.message });
           } finally {
@@ -370,28 +751,54 @@
         }
 
         return (
-          <div className="section">
-            <h2>Test Call</h2>
-            <label>Channel</label>
-            <select value={channel} onChange={(e) => setChannel(e.target.value)}>
-              {channels.length === 0 && <option value="">(no channels)</option>}
-              {channels.map((c) => <option key={c.channel} value={c.channel}>#{c.channel} ({c.count})</option>)}
-            </select>
-            <label>Command</label>
-            <input list="cmds" value={command} onChange={(e) => setCommand(e.target.value)} />
-            <datalist id="cmds">{COMMANDS.map((c) => <option key={c} value={c} />)}</datalist>
-            <label>Params (JSON)</label>
-            <textarea rows={4} value={paramsText} onChange={(e) => setParamsText(e.target.value)} spellCheck={false} />
-            <div className="row" style={{ marginTop: 8 }}>
-              <button onClick={send} disabled={busy || !channel}>{busy ? "Calling…" : "Send"}</button>
-              {result && <button className="ghost" onClick={() => setResult(null)}>Clear</button>}
-            </div>
-            {result && (
-              <div className="result-box">
-                <div className={result.error ? "bad" : "ok"}>{result.error ? "✗ error" : "✓ result"}</div>
-                <pre>{JSON.stringify(result.error ?? result.result, null, 2)}</pre>
+          <div className="explorer">
+            <div className="exp-top">
+              <div className="exp-field">
+                <label>Channel</label>
+                <select value={channel} onChange={(e) => setChannel(e.target.value)}>
+                  {channels.length === 0 && <option value="">(no channels)</option>}
+                  {channels.map((c) => (
+                    <option key={c.channel} value={c.channel}>
+                      #{c.channel}{c.document ? ` — ${c.document.documentName}` : ""} ({c.count})
+                    </option>
+                  ))}
+                </select>
               </div>
-            )}
+              <div className="exp-field">
+                <label>Command</label>
+                <select value={command} onChange={(e) => setCommand(e.target.value)}>
+                  {Object.entries(grouped).map(([g, cmds]) => (
+                    <optgroup key={g} label={g}>
+                      {cmds.map((c) => <option key={c.command} value={c.command}>{c.command}</option>)}
+                    </optgroup>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="exp-desc">{spec?.description}</div>
+
+            <div className="exp-body">
+              <div className="exp-form">
+                <h4>Parameters</h4>
+                {spec && spec.params.length === 0 && <div className="muted">No parameters.</div>}
+                {spec && spec.params.map((p) => (
+                  <Field key={p.name} p={p} value={values[p.name]} onChange={(v) => setValues((s) => ({ ...s, [p.name]: v }))} />
+                ))}
+              </div>
+              <div className="exp-side">
+                <h4>Request</h4>
+                <pre className="exp-preview">{preview}</pre>
+                <button onClick={send} disabled={busy || !channel}>{busy ? "Sending…" : "Send"}</button>
+                {result && (
+                  <div className="result-box">
+                    <div className={result.error ? "bad" : "ok"}>
+                      {result.error ? "✗ error" : "✓ response"}{result.ms != null ? ` · ${result.ms}ms` : ""}
+                    </div>
+                    <pre>{JSON.stringify(result.error ?? result.result, null, 2)}</pre>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         );
       }
@@ -495,6 +902,7 @@
         const [paused, setPaused] = useState(false);
         const [version, setVersion] = useState(0); // bumped on flush to trigger renders
         const [filter, setFilter] = useState("");  // shared: channel click sets this
+        const [view, setView] = useState("logs");   // main area: logs | explorer
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
 
@@ -550,18 +958,23 @@
               <span className={"dot " + (connected ? "on" : "off")}></span>
               <h1>Talk-to-Figma · Server Console</h1>
               <span className="muted">{WS_URL}</span>
+              <span className="view-tabs">
+                <button className={"vtab" + (view === "logs" ? " active" : "")} onClick={() => setView("logs")}>Logs</button>
+                <button className={"vtab" + (view === "explorer" ? " active" : "")} onClick={() => setView("explorer")}>Request Explorer</button>
+              </span>
               <span style={{ marginLeft: "auto" }} className="row">
-                <button className="ghost" onClick={() => setPaused((p) => !p)}>{paused ? "Resume" : "Pause"}</button>
-                <button className="ghost" onClick={clear}>Clear log</button>
+                {view === "logs" && <button className="ghost" onClick={() => setPaused((p) => !p)}>{paused ? "Resume" : "Pause"}</button>}
+                {view === "logs" && <button className="ghost" onClick={clear}>Clear log</button>}
               </span>
             </div>
             <div className="main">
               <div className="sidebar">
-                <Channels channels={channels} onPick={setFilter} onClearEmpty={clearEmpty} />
-                <TestCall channels={channels} />
+                <Channels channels={channels} onPick={(ch) => { setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">
-                <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
+                {view === "logs"
+                  ? <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
+                  : <RequestExplorer channels={channels} />}
               </div>
             </div>
           </>
