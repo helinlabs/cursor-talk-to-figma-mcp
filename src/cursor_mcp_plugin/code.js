@@ -156,19 +156,25 @@ function updateSettings(settings) {
 async function handleCommand(command, params) {
   switch (command) {
     case "get_document_info":
-      return await getDocumentInfo();
+      return await getDocumentInfo(params);
     case "get_selection":
       return await getSelection();
+    case "list_pages":
+      return await listPages();
+    case "set_current_page":
+      return await setCurrentPage(params);
+    case "get_node_by_key":
+      return await getNodeByKey(params);
     case "get_node_info":
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getNodeInfo(params.nodeId);
+      return await getNodeInfo(params.nodeId, params.fields, params.maxDepth);
     case "get_nodes_info":
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
-      return await getNodesInfo(params.nodeIds);
+      return await getNodesInfo(params.nodeIds, params.fields, params.maxDepth);
     case "read_my_design":
       return await readMyDesign();
     case "create_rectangle":
@@ -654,9 +660,16 @@ async function scanDesignUsage(params) {
 
 // Command implementations
 
-async function getDocumentInfo() {
-  await figma.currentPage.loadAsync();
-  const page = figma.currentPage;
+async function getDocumentInfo(params) {
+  // Optionally inspect a specific (possibly non-open) page by id.
+  let page = figma.currentPage;
+  if (params && params.pageId) {
+    const requested = await figma.getNodeByIdAsync(params.pageId);
+    if (requested && requested.type === "PAGE") {
+      page = requested;
+    }
+  }
+  await page.loadAsync();
   return {
     name: page.name,
     id: page.id,
@@ -671,14 +684,94 @@ async function getDocumentInfo() {
       name: page.name,
       childCount: page.children.length,
     },
-    pages: [
-      {
-        id: page.id,
-        name: page.name,
-        childCount: page.children.length,
-      },
-    ],
+    // All pages in the file (names/ids) so other pages are discoverable.
+    pages: figma.root.children.map((p) => ({ id: p.id, name: p.name })),
   };
+}
+
+// List all pages in the file (enables discovery of non-open pages).
+async function listPages() {
+  await figma.loadAllPagesAsync();
+  return {
+    currentPageId: figma.currentPage.id,
+    pages: figma.root.children.map((p) => ({
+      id: p.id,
+      name: p.name,
+      childCount: p.children.length,
+    })),
+  };
+}
+
+// Switch the current page so every current-page-scoped tool can reach it.
+async function setCurrentPage(params) {
+  const { pageId } = params || {};
+  if (!pageId) throw new Error("Missing pageId parameter");
+  const page = await figma.getNodeByIdAsync(pageId);
+  if (!page || page.type !== "PAGE") {
+    throw new Error(`Page not found with ID: ${pageId}`);
+  }
+  await figma.setCurrentPageAsync(page);
+  return { success: true, currentPageId: page.id, name: page.name };
+}
+
+// Resolve a design-system `key` (from the catalog) to a live node id, so an
+// agent can go straight from a catalog key to get_node_info/export.
+async function getNodeByKey(params) {
+  const { key, resolveNames = true } = params || {};
+  if (!key) throw new Error("Missing key parameter");
+
+  // 1) Local component / component-set with this key (same file).
+  await figma.loadAllPagesAsync();
+  const locals = figma.root.findAllWithCriteria({
+    types: ["COMPONENT", "COMPONENT_SET"],
+  });
+  for (const c of locals) {
+    if ("key" in c && c.key === key) {
+      return {
+        found: true,
+        source: "local",
+        id: c.id,
+        name: resolveNames ? c.name : undefined,
+        type: c.type,
+        remote: false,
+        key: c.key,
+      };
+    }
+  }
+
+  // 2) Published library component imported by key.
+  try {
+    const comp = await figma.importComponentByKeyAsync(key);
+    if (comp) {
+      return {
+        found: true,
+        source: "imported-component",
+        id: comp.id,
+        name: resolveNames ? comp.name : undefined,
+        type: comp.type,
+        remote: !!comp.remote,
+        key: comp.key,
+      };
+    }
+  } catch (e) {}
+
+  // 3) Published library style imported by key.
+  try {
+    const style = await figma.importStyleByKeyAsync(key);
+    if (style) {
+      return {
+        found: true,
+        source: "imported-style",
+        id: style.id,
+        name: resolveNames ? style.name : undefined,
+        styleType: style.type,
+        remote: !!style.remote,
+        key: style.key,
+      };
+    }
+  } catch (e) {}
+
+  return { found: false, key: key };
 }
 
 async function getSelection() {
@@ -720,7 +813,12 @@ function rgbaToHex(color) {
   );
 }
 
-function filterFigmaNode(node) {
+function filterFigmaNode(node, opts) {
+  opts = opts || {};
+  var fields = opts.fields;       // array of top-level fields to keep (besides id/name/type)
+  var maxDepth = opts.maxDepth;   // max levels of children to expand (undefined = unlimited)
+  var depth = opts.depth || 0;
+
   if (node.type === "VECTOR") {
     return null;
   }
@@ -730,6 +828,15 @@ function filterFigmaNode(node) {
     name: node.name,
     type: node.type,
   };
+
+  // Instance provenance (variant state + main component node id) — lets an
+  // agent map an instance to its component variant in one pass.
+  if (node.componentProperties) {
+    filtered.componentProperties = node.componentProperties;
+  }
+  if (node.componentId) {
+    filtered.componentId = node.componentId;
+  }
 
   if (node.fills && node.fills.length > 0) {
     filtered.fills = node.fills.map((fill) => {
@@ -794,19 +901,42 @@ function filterFigmaNode(node) {
   }
 
   if (node.children) {
-    filtered.children = node.children
-      .map((child) => {
-        return filterFigmaNode(child);
-      })
-      .filter((child) => {
-        return child !== null;
-      });
+    var wantChildren = !fields || fields.indexOf("children") !== -1;
+    var underDepth = maxDepth === undefined || depth < maxDepth;
+    if (wantChildren && underDepth) {
+      filtered.children = node.children
+        .map(function (child) {
+          return filterFigmaNode(child, {
+            fields: fields,
+            maxDepth: maxDepth,
+            depth: depth + 1,
+          });
+        })
+        .filter(function (child) {
+          return child !== null;
+        });
+    } else if (node.children.length) {
+      // Children exist but were not expanded (depth limit or field selection);
+      // surface the count so the caller knows to drill deeper.
+      filtered.childCount = node.children.length;
+    }
+  }
+
+  // Field selection: keep only id/name/type (+childCount) and requested fields.
+  if (fields && fields.length) {
+    var keep = { id: 1, name: 1, type: 1, childCount: 1 };
+    for (var fi = 0; fi < fields.length; fi++) keep[fields[fi]] = 1;
+    for (var fk in filtered) {
+      if (Object.prototype.hasOwnProperty.call(filtered, fk) && !keep[fk]) {
+        delete filtered[fk];
+      }
+    }
   }
 
   return filtered;
 }
 
-async function getNodeInfo(nodeId) {
+async function getNodeInfo(nodeId, fields, maxDepth) {
   const node = await figma.getNodeByIdAsync(nodeId);
 
   if (!node) {
@@ -817,10 +947,10 @@ async function getNodeInfo(nodeId) {
     format: "JSON_REST_V1",
   });
 
-  return filterFigmaNode(response.document);
+  return filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
 }
 
-async function getNodesInfo(nodeIds) {
+async function getNodesInfo(nodeIds, fields, maxDepth) {
   try {
     // Load all nodes in parallel
     const nodes = await Promise.all(
@@ -838,7 +968,7 @@ async function getNodesInfo(nodeIds) {
         });
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document),
+          document: filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth }),
         };
       })
     );
@@ -1563,14 +1693,18 @@ async function getLocalComponents(params) {
     var page = pages[i];
     await page.loadAsync();
 
-    var pageComponents = page.findAllWithCriteria({ types: ["COMPONENT"] });
+    var pageComponents = page.findAllWithCriteria({
+      types: ["COMPONENT", "COMPONENT_SET"],
+    });
 
     for (var j = 0; j < pageComponents.length; j++) {
       var component = pageComponents[j];
       allComponents.push({
         id: component.id,
         name: component.name,
+        type: component.type,
         key: "key" in component ? component.key : null,
+        remote: !!component.remote,
       });
     }
 
@@ -1598,9 +1732,24 @@ async function getLocalComponents(params) {
     null
   );
 
+  const total = allComponents.length;
+  const { limit, offset = 0, countOnly = false } = params || {};
+  if (countOnly) {
+    return { count: total, total: total, countOnly: true };
+  }
+  const start = offset > 0 ? offset : 0;
+  const slice =
+    limit !== undefined && limit !== null
+      ? allComponents.slice(start, start + limit)
+      : allComponents.slice(start);
+  const nextOffset = start + slice.length < total ? start + slice.length : null;
+
   return {
-    count: allComponents.length,
-    components: allComponents,
+    total: total,
+    count: slice.length,
+    offset: start,
+    nextOffset: nextOffset,
+    components: slice,
   };
 }
 
@@ -3092,25 +3241,67 @@ async function scanNodesByTypes(params) {
   // Recursively find nodes with specified types
   await findNodesByTypes(node, types, matchingNodes);
 
-  // Send completion update
-  sendProgressUpdate(
-    commandId,
-    "scan_nodes_by_types",
-    "completed",
-    100,
-    matchingNodes.length,
-    matchingNodes.length,
-    `Scan complete. Found ${matchingNodes.length} matching nodes.`,
-    { matchingNodes }
-  );
+  const total = matchingNodes.length;
+  const { limit, offset = 0, countOnly = false, resolveNames = true } = params || {};
+
+  // Count-only mode: skip enrichment and payload entirely.
+  if (countOnly) {
+    sendProgressUpdate(commandId, "scan_nodes_by_types", "completed", 100, total, total,
+      `Scan complete. Found ${total} matching nodes.`, { total });
+    return { success: true, countOnly: true, total: total, searchedTypes: types };
+  }
+
+  // Paginate, then enrich only the returned slice — so scanning a 762-node
+  // section doesn't resolve every main component.
+  const start = offset > 0 ? offset : 0;
+  const slice =
+    limit !== undefined && limit !== null
+      ? matchingNodes.slice(start, start + limit)
+      : matchingNodes.slice(start);
+
+  const resolver = makeDsResolver(resolveNames);
+  for (const m of slice) {
+    if (m.type === "INSTANCE") {
+      try {
+        const live = await figma.getNodeByIdAsync(m.id);
+        if (live) {
+          if (live.componentProperties) {
+            m.componentProperties = simplifyComponentProperties(live.componentProperties);
+          }
+          m.mainComponent = await resolver.mainComponent(live); // {id,key,remote,name,...}
+        }
+      } catch (e) {
+        /* leave instance un-enriched on failure */
+      }
+    }
+  }
+
+  const nextOffset = start + slice.length < total ? start + slice.length : null;
+
+  sendProgressUpdate(commandId, "scan_nodes_by_types", "completed", 100, total, total,
+    `Scan complete. Found ${total} matching nodes (returned ${slice.length}).`, { total });
 
   return {
     success: true,
-    message: `Found ${matchingNodes.length} matching nodes.`,
-    count: matchingNodes.length,
-    matchingNodes: matchingNodes,
+    total: total,
+    offset: start,
+    returned: slice.length,
+    nextOffset: nextOffset,
     searchedTypes: types,
+    matchingNodes: slice,
   };
+}
+
+// Compact instance variant state for scans (name -> {type, value})
+function simplifyComponentProperties(cp) {
+  const out = {};
+  try {
+    for (const k of Object.keys(cp)) {
+      const p = cp[k];
+      out[k] = { type: p.type, value: p.value };
+    }
+  } catch (e) {}
+  return out;
 }
 
 /**

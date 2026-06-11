@@ -88,11 +88,13 @@ const WS_URL = serverUrl === 'localhost' ? `ws://${serverUrl}` : `wss://${server
 // Document Info Tool
 server.tool(
   "get_document_info",
-  "Get detailed information about the current Figma document",
-  {},
-  async () => {
+  "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
+  {
+    pageId: z.string().optional().describe("Inspect this page instead of the current one (see list_pages for ids)."),
+  },
+  async ({ pageId }: any) => {
     try {
-      const result = await sendCommandToFigma("get_document_info");
+      const result = await sendCommandToFigma("get_document_info", { pageId });
       return {
         content: [
           {
@@ -178,18 +180,21 @@ server.tool(
 // Node Info Tool
 server.tool(
   "get_node_info",
-  "Get detailed information about a specific node in Figma",
+  "Get detailed information about a specific node in Figma. For large/deep nodes, pass `fields` to return only the properties you need and/or `maxDepth` to limit how deep the child tree is expanded (a 900K-char section becomes a few KB). When children are omitted (depth/field limit) a `childCount` is included so you know to drill deeper.",
   {
     nodeId: z.string().describe("The ID of the node to get information about"),
+    fields: z.array(z.string()).optional().describe("Only return these top-level fields (id/name/type are always included). e.g. ['fills','characters','style','absoluteBoundingBox','componentProperties','children']. Omit 'children' to get just this node."),
+    maxDepth: z.number().int().min(0).optional().describe("Max levels of children to expand. 0 = this node only, 1 = direct children, etc. Omit for the full subtree."),
   },
-  async ({ nodeId }: any) => {
+  async ({ nodeId, fields, maxDepth }: any) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      // The plugin already filters/shapes the node; return it directly.
+      const result = await sendCommandToFigma("get_node_info", { nodeId, fields, maxDepth });
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -313,15 +318,17 @@ function filterFigmaNode(node: any) {
 // Nodes Info Tool
 server.tool(
   "get_nodes_info",
-  "Get detailed information about multiple nodes in Figma",
+  "Get detailed information about multiple nodes in Figma. Supports the same `fields` / `maxDepth` shaping as get_node_info to keep responses small.",
   {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about")
+    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about"),
+    fields: z.array(z.string()).optional().describe("Only return these top-level fields (id/name/type always included)."),
+    maxDepth: z.number().int().min(0).optional().describe("Max levels of children to expand (0 = node only)."),
   },
-  async ({ nodeIds }: any) => {
+  async ({ nodeIds, fields, maxDepth }: any) => {
     try {
       const results = await Promise.all(
         nodeIds.map(async (nodeId: any) => {
-          const result = await sendCommandToFigma('get_node_info', { nodeId });
+          const result = await sendCommandToFigma('get_node_info', { nodeId, fields, maxDepth });
           return { nodeId, info: result };
         })
       );
@@ -329,7 +336,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info)))
+            text: JSON.stringify(results)
           }
         ]
       };
@@ -965,11 +972,15 @@ server.tool(
 // Get Local Components Tool
 server.tool(
   "get_local_components",
-  "Get all local components from the Figma document",
-  {},
-  async () => {
+  "Get local components and component sets (id, name, type, key, remote). Supports pagination (`limit`/`offset`, with `total`/`nextOffset` in the response) and `countOnly` for large libraries.",
+  {
+    limit: z.number().int().positive().optional().describe("Max components to return; response includes total and nextOffset."),
+    offset: z.number().int().min(0).optional().describe("Start index for pagination."),
+    countOnly: z.boolean().optional().describe("Return only the total count."),
+  },
+  async ({ limit, offset, countOnly }: any) => {
     try {
-      const result = await sendCommandToFigma("get_local_components");
+      const result = await sendCommandToFigma("get_local_components", { limit, offset, countOnly });
       return {
         content: [
           {
@@ -1564,68 +1575,28 @@ server.tool(
 // Node Type Scanning Tool
 server.tool(
   "scan_nodes_by_types",
-  "Scan for child nodes with specific types in the selected Figma node",
+  "Scan for descendant nodes of specific types under a node. Supports pagination (`limit`/`offset` with `nextOffset` in the response) and `countOnly` for an unbounded section. INSTANCE results are enriched with `componentProperties` (variant state) and `mainComponent` (key/remote) so instance→variant mapping needs no second file. Returns a single structured JSON object (status is in fields, not separate text blocks).",
   {
     nodeId: z.string().describe("ID of the node to scan"),
-    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])")
+    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME', 'INSTANCE'])"),
+    limit: z.number().int().positive().optional().describe("Max nodes to return; the response includes total and nextOffset for paging."),
+    offset: z.number().int().min(0).optional().describe("Start index for pagination (use the previous response's nextOffset)."),
+    countOnly: z.boolean().optional().describe("Return only the total count, no node payload."),
   },
-  async ({ nodeId, types }: any) => {
+  async ({ nodeId, types, limit, offset, countOnly }: any) => {
     try {
-      // Initial response to indicate we're starting the process
-      const initialStatus = {
-        type: "text" as const,
-        text: `Starting node type scanning for types: ${types.join(', ')}...`,
-      };
-
-      // Use the plugin's scan_nodes_by_types function
       const result = await sendCommandToFigma("scan_nodes_by_types", {
         nodeId,
-        types
+        types,
+        limit,
+        offset,
+        countOnly,
       });
-
-      // Format the response
-      if (result && typeof result === 'object' && 'matchingNodes' in result) {
-        const typedResult = result as {
-          success: boolean,
-          count: number,
-          matchingNodes: Array<{
-            id: string,
-            name: string,
-            type: string,
-            bbox: {
-              x: number,
-              y: number,
-              width: number,
-              height: number
-            }
-          }>,
-          searchedTypes: Array<string>
-        };
-
-        const summaryText = `Scan completed: Found ${typedResult.count} nodes matching types: ${typedResult.searchedTypes.join(', ')}`;
-
-        return {
-          content: [
-            initialStatus,
-            {
-              type: "text" as const,
-              text: summaryText
-            },
-            {
-              type: "text" as const,
-              text: JSON.stringify(typedResult.matchingNodes, null, 2)
-            }
-          ],
-        };
-      }
-
-      // If the result is in an unexpected format, return it as is
       return {
         content: [
-          initialStatus,
           {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
+            type: "text" as const,
+            text: JSON.stringify(result),
           },
         ],
       };
@@ -3035,6 +3006,56 @@ function sendCommandToFigma(
     ws.send(JSON.stringify(request));
   });
 }
+
+// ===========================================================================
+// Page navigation & key resolution
+// ===========================================================================
+
+server.tool(
+  "list_pages",
+  "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
+  {},
+  async () => {
+    try {
+      const result = await sendCommandToFigma("list_pages");
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "set_current_page",
+  "Switch Figma's current page to the given pageId. Every current-page-scoped tool (scan, selection, etc.) then operates on that page.",
+  {
+    pageId: z.string().describe("The page id to switch to (from list_pages)."),
+  },
+  async ({ pageId }: any) => {
+    try {
+      const result = await sendCommandToFigma("set_current_page", { pageId });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error setting current page: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_node_by_key",
+  "Resolve a design-system `key` (component, component set, or style key from get_design_system_info / get_local_components) to a live node id, so you can go straight from a catalog key to get_node_info or export. Tries local components first, then imports a published component/style by key. Returns { found, id, type, remote, source, ... }.",
+  {
+    key: z.string().describe("The component/style key to resolve."),
+  },
+  async ({ key }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_node_by_key", { key });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error resolving key: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
 
 // ===========================================================================
 // Design-system usage analysis tools

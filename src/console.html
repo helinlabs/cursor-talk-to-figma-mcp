@@ -241,14 +241,27 @@
 
       // ----- Command catalog (wire format sent to the Figma plugin) ---------
       const COMMAND_CATALOG = [
-        { group: "Document & Selection", command: "get_document_info", description: "Get detailed information about the current Figma document", params: [] },
+        { group: "Document & Selection", command: "get_document_info", description: "Page info + all pages (pass pageId to inspect a non-open page)", params: [
+          { name: "pageId", type: "string", required: false, description: "Inspect this page instead of the current one" }
+        ] },
+        { group: "Document & Selection", command: "list_pages", description: "List all pages (id, name, childCount) + current page id", params: [] },
+        { group: "Document & Selection", command: "set_current_page", description: "Switch the current page so current-page tools reach it", params: [
+          { name: "pageId", type: "string", required: true, description: "Page id to switch to (from list_pages)" }
+        ] },
+        { group: "Document & Selection", command: "get_node_by_key", description: "Resolve a component/style key to a live node id", params: [
+          { name: "key", type: "string", required: true, description: "Component/style key from the catalog" }
+        ] },
         { group: "Document & Selection", command: "get_selection", description: "Get information about the current selection in Figma", params: [] },
         { group: "Document & Selection", command: "read_my_design", description: "Get detailed information about the current selection, including all node details", params: [] },
-        { group: "Document & Selection", command: "get_node_info", description: "Get detailed information about a specific node", params: [
-          { name: "nodeId", type: "string", required: true, description: "The ID of the node to get information about" }
+        { group: "Document & Selection", command: "get_node_info", description: "Node info; use fields/maxDepth to shrink large nodes", params: [
+          { name: "nodeId", type: "string", required: true, description: "The ID of the node to get information about" },
+          { name: "fields", type: "json", required: false, description: "Only these top-level fields (id/name/type always kept)", example: '["fills","characters","style","componentProperties"]' },
+          { name: "maxDepth", type: "number", required: false, description: "Max child levels to expand (0=node only, 1=direct children)" }
         ] },
-        { group: "Document & Selection", command: "get_nodes_info", description: "Get detailed info about multiple nodes (plugin supports a nodeIds array directly)", params: [
-          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs", example: '["123:1","123:2"]' }
+        { group: "Document & Selection", command: "get_nodes_info", description: "Multi-node info; supports fields/maxDepth", params: [
+          { name: "nodeIds", type: "json", required: true, description: "Array of node IDs", example: '["123:1","123:2"]' },
+          { name: "fields", type: "json", required: false, description: "Only these top-level fields", example: '["fills","characters"]' },
+          { name: "maxDepth", type: "number", required: false, description: "Max child levels to expand" }
         ] },
         { group: "Document & Selection", command: "set_focus", description: "Set focus on a node by selecting it and scrolling the viewport to it", params: [
           { name: "nodeId", type: "string", required: true, description: "The ID of the node to focus on" }
@@ -334,9 +347,12 @@
         { group: "Layout & Organization", command: "delete_multiple_nodes", description: "Delete multiple nodes at once", params: [
           { name: "nodeIds", type: "json", required: true, description: "Array of node IDs to delete", example: '["123:1","123:2"]' }
         ] },
-        { group: "Layout & Organization", command: "scan_nodes_by_types", description: "Scan for child nodes with specific types in the selected node", params: [
+        { group: "Layout & Organization", command: "scan_nodes_by_types", description: "Scan descendants by type; paginated; INSTANCEs enriched with variant state + main component key", params: [
           { name: "nodeId", type: "string", required: true, description: "ID of the node to scan" },
-          { name: "types", type: "json", required: true, description: "Array of node types to find", example: '["COMPONENT","INSTANCE","FRAME"]' }
+          { name: "types", type: "json", required: true, description: "Array of node types to find", example: '["COMPONENT","INSTANCE","FRAME"]' },
+          { name: "limit", type: "number", required: false, description: "Max nodes to return (response has total + nextOffset)" },
+          { name: "offset", type: "number", required: false, description: "Start index (use previous nextOffset)" },
+          { name: "countOnly", type: "boolean", required: false, description: "Return only the total count" }
         ] },
 
         { group: "Styling", command: "set_fill_color", description: "Set the fill color of a node (TextNode or FrameNode)", params: [
@@ -395,7 +411,11 @@
         ] },
 
         { group: "Components & Styles", command: "get_styles", description: "Get all styles from the current document", params: [] },
-        { group: "Components & Styles", command: "get_local_components", description: "Get all local components", params: [] },
+        { group: "Components & Styles", command: "get_local_components", description: "Local components & sets (key, remote); paginated", params: [
+          { name: "limit", type: "number", required: false, description: "Max to return (response has total + nextOffset)" },
+          { name: "offset", type: "number", required: false, description: "Start index" },
+          { name: "countOnly", type: "boolean", required: false, description: "Return only the total count" }
+        ] },
         { group: "Components & Styles", command: "create_component_instance", description: "Create an instance of a component", params: [
           { name: "componentId", type: "string", required: false, description: "ID of a local component" },
           { name: "componentKey", type: "string", required: false, description: "Key of a published library component" },
