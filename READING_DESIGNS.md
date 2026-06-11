@@ -35,7 +35,10 @@ get_node_info({ nodeId: "…", fields: ["fills","characters","style"] })
 - **INSTANCE enrichment**: each returned INSTANCE now carries
   `componentProperties` (variant state, e.g. `State=Disabled`) and
   `mainComponent` (`{ id, key, remote, name, componentSetKey }`) — so mapping an
-  instance to its component variant no longer needs a second file.
+  instance to its component variant no longer needs a second file. Enrichment is
+  capped at **300 instances per call** (it costs one async resolve each); when a
+  slice has more, `enrichmentTruncated: true` is returned — page with `limit` to
+  enrich the rest.
 - Response is now a **single structured JSON object** (`{ total, offset, returned,
   nextOffset, matchingNodes, searchedTypes }`), not a mix of status strings and
   a JSON array.

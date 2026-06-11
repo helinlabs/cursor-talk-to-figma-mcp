@@ -3259,22 +3259,31 @@ async function scanNodesByTypes(params) {
       ? matchingNodes.slice(start, start + limit)
       : matchingNodes.slice(start);
 
+  // Enrich INSTANCE nodes, but bound the async work (one getMainComponentAsync
+  // per instance) so an unpaginated scan of a huge section can't stall.
+  // Page with `limit` to enrich beyond the cap.
   const resolver = makeDsResolver(resolveNames);
+  const ENRICH_CAP = 300;
+  let instanceCount = 0;
+  let enrichedCount = 0;
   for (const m of slice) {
-    if (m.type === "INSTANCE") {
-      try {
-        const live = await figma.getNodeByIdAsync(m.id);
-        if (live) {
-          if (live.componentProperties) {
-            m.componentProperties = simplifyComponentProperties(live.componentProperties);
-          }
-          m.mainComponent = await resolver.mainComponent(live); // {id,key,remote,name,...}
+    if (m.type !== "INSTANCE") continue;
+    instanceCount++;
+    if (enrichedCount >= ENRICH_CAP) continue;
+    try {
+      const live = await figma.getNodeByIdAsync(m.id);
+      if (live) {
+        if (live.componentProperties) {
+          m.componentProperties = simplifyComponentProperties(live.componentProperties);
         }
-      } catch (e) {
-        /* leave instance un-enriched on failure */
+        m.mainComponent = await resolver.mainComponent(live); // {id,key,remote,name,...}
+        enrichedCount++;
       }
+    } catch (e) {
+      /* leave instance un-enriched on failure */
     }
   }
+  const enrichmentTruncated = instanceCount > enrichedCount;
 
   const nextOffset = start + slice.length < total ? start + slice.length : null;
 
@@ -3287,6 +3296,7 @@ async function scanNodesByTypes(params) {
     offset: start,
     returned: slice.length,
     nextOffset: nextOffset,
+    enrichmentTruncated: enrichmentTruncated, // true if >ENRICH_CAP instances; page for the rest
     searchedTypes: types,
     matchingNodes: slice,
   };
