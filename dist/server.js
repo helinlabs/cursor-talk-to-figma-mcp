@@ -6,6 +6,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
+import * as fs from "fs";
+import * as path from "path";
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -31,11 +33,13 @@ var serverUrl = serverArg ? serverArg.split("=")[1] : "localhost";
 var WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
 server.tool(
   "get_document_info",
-  "Get detailed information about the current Figma document",
-  {},
-  async () => {
+  "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
+  {
+    pageId: z.string().optional().describe("Inspect this page instead of the current one (see list_pages for ids).")
+  },
+  async ({ pageId }) => {
     try {
-      const result = await sendCommandToFigma("get_document_info");
+      const result = await sendCommandToFigma("get_document_info", { pageId });
       return {
         content: [
           {
@@ -112,18 +116,21 @@ server.tool(
 );
 server.tool(
   "get_node_info",
-  "Get detailed information about a specific node in Figma",
+  "Get detailed information about a specific node in Figma. For large/deep nodes, pass `fields` to return only the properties you need and/or `maxDepth` to limit how deep the child tree is expanded (a 900K-char section becomes a few KB). When children are omitted (depth/field limit) a `childCount` is included so you know to drill deeper.",
   {
-    nodeId: z.string().describe("The ID of the node to get information about")
+    nodeId: z.string().describe("The ID of the node to get information about"),
+    fields: z.array(z.string()).optional().describe("Only return these top-level fields (id/name/type are always included). e.g. ['fills','characters','style','absoluteBoundingBox','componentProperties','children']. Omit 'children' to get just this node."),
+    maxDepth: z.number().int().min(0).optional().describe("Max levels of children to expand. 0 = this node only, 1 = direct children, etc. Omit for the full subtree."),
+    includeHash: z.boolean().optional().describe("Also return a stable `subtreeHash` covering the subtree's structure, text, bound tokens, and sizes. Same content \u2192 same hash; useful for detecting which screens changed between runs.")
   },
-  async ({ nodeId }) => {
+  async ({ nodeId, fields, maxDepth, includeHash }) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      const result = await sendCommandToFigma("get_node_info", { nodeId, fields, maxDepth, includeHash });
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -139,92 +146,20 @@ server.tool(
     }
   }
 );
-function rgbaToHex(color) {
-  if (color.startsWith("#")) {
-    return color;
-  }
-  const r = Math.round(color.r * 255);
-  const g = Math.round(color.g * 255);
-  const b = Math.round(color.b * 255);
-  const a = Math.round(color.a * 255);
-  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}${a === 255 ? "" : a.toString(16).padStart(2, "0")}`;
-}
-function filterFigmaNode(node) {
-  if (node.type === "VECTOR") {
-    return null;
-  }
-  const filtered = {
-    id: node.id,
-    name: node.name,
-    type: node.type
-  };
-  if (node.fills && node.fills.length > 0) {
-    filtered.fills = node.fills.map((fill) => {
-      const processedFill = { ...fill };
-      delete processedFill.boundVariables;
-      delete processedFill.imageRef;
-      if (processedFill.gradientStops) {
-        processedFill.gradientStops = processedFill.gradientStops.map((stop) => {
-          const processedStop = { ...stop };
-          if (processedStop.color) {
-            processedStop.color = rgbaToHex(processedStop.color);
-          }
-          delete processedStop.boundVariables;
-          return processedStop;
-        });
-      }
-      if (processedFill.color) {
-        processedFill.color = rgbaToHex(processedFill.color);
-      }
-      return processedFill;
-    });
-  }
-  if (node.strokes && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map((stroke) => {
-      const processedStroke = { ...stroke };
-      delete processedStroke.boundVariables;
-      if (processedStroke.color) {
-        processedStroke.color = rgbaToHex(processedStroke.color);
-      }
-      return processedStroke;
-    });
-  }
-  if (node.cornerRadius !== void 0) {
-    filtered.cornerRadius = node.cornerRadius;
-  }
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = node.absoluteBoundingBox;
-  }
-  if (node.characters) {
-    filtered.characters = node.characters;
-  }
-  if (node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx
-    };
-  }
-  if (node.children) {
-    filtered.children = node.children.map((child) => filterFigmaNode(child)).filter((child) => child !== null);
-  }
-  return filtered;
-}
 server.tool(
   "get_nodes_info",
-  "Get detailed information about multiple nodes in Figma",
+  "Get detailed information about multiple nodes in Figma. Supports the same `fields` / `maxDepth` shaping as get_node_info to keep responses small.",
   {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about")
+    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about"),
+    fields: z.array(z.string()).optional().describe("Only return these top-level fields (id/name/type always included)."),
+    maxDepth: z.number().int().min(0).optional().describe("Max levels of children to expand (0 = node only)."),
+    includeHash: z.boolean().optional().describe("Also return a stable `subtreeHash` per node (see get_node_info).")
   },
-  async ({ nodeIds }) => {
+  async ({ nodeIds, fields, maxDepth, includeHash }) => {
     try {
       const results = await Promise.all(
         nodeIds.map(async (nodeId) => {
-          const result = await sendCommandToFigma("get_node_info", { nodeId });
+          const result = await sendCommandToFigma("get_node_info", { nodeId, fields, maxDepth, includeHash });
           return { nodeId, info: result };
         })
       );
@@ -232,7 +167,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info)))
+            text: JSON.stringify(results)
           }
         ]
       };
@@ -242,6 +177,38 @@ server.tool(
           {
             type: "text",
             text: `Error getting nodes info: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+server.tool(
+  "get_frame_context",
+  "Get a single, pruned, RN-ready digest of a frame's subtree \u2014 replaces the get_node_info + scan_text_nodes + get_nodes_design_info round-trips. OS chrome (Status Bar / Home Indicator / Keyboard / Notch / Dynamic Island) and hidden nodes are dropped; each remaining node carries only relative bounds, text + typography, flex-friendly layout (flexDirection/gap/padding/justify/align), resolved semantic tokens (fill/stroke/radius/textStyle\u2026), and a hasImageFill flag. Call it on a screen frame and write the spec from the one response.",
+  {
+    nodeId: z.string().describe("The ID of the frame/screen node to digest"),
+    excludeChrome: z.boolean().optional().describe("Drop OS chrome + hidden nodes (default true). Set false to keep everything."),
+    chromeNames: z.array(z.string()).optional().describe("Override the default chrome name list (case-insensitive substring match)."),
+    includeHash: z.boolean().optional().describe("Also include a stable `subtreeHash` at the root for change detection.")
+  },
+  async ({ nodeId, excludeChrome, chromeNames, includeHash }) => {
+    try {
+      const result = await sendCommandToFigma("get_frame_context", {
+        nodeId,
+        excludeChrome: excludeChrome === void 0 ? true : excludeChrome,
+        chromeNames,
+        includeHash: !!includeHash
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting frame context: ${error instanceof Error ? error.message : String(error)}`
           }
         ]
       };
@@ -677,26 +644,55 @@ server.tool(
 );
 server.tool(
   "export_node_as_image",
-  "Export a node as an image from Figma",
+  "Export a node as an image from Figma. If `outputPath` is given, the bytes are written to that file on disk (parent dirs auto-created) and the tool returns the saved path + dimensions \u2014 no inline image, no curl/base64 dance. Without `outputPath` it returns the image inline (PNG/JPG/PDF) or the SVG text (SVG). For SVG, pass `tokenizeColors: true` to replace color-variable-bound hexes with {{tokenName}} placeholders (returns the list of tokens used).",
   {
     nodeId: z.string().describe("The ID of the node to export"),
-    format: z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
-    scale: z.number().positive().optional().describe("Export scale")
+    format: z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format (default PNG)"),
+    scale: z.number().positive().optional().describe("Export scale (raster only, default 1)"),
+    outputPath: z.string().optional().describe("If set, save the export to this file path (absolute, or relative to the server's working dir) instead of returning it inline. Parent directories are created automatically."),
+    tokenizeColors: z.boolean().optional().describe("SVG only: replace hexes bound to color variables with {{tokenName}} placeholders so they can be re-injected as design tokens.")
   },
-  async ({ nodeId, format, scale }) => {
+  async ({ nodeId, format, scale, outputPath, tokenizeColors }) => {
     try {
+      const fmt = (format || "PNG").toUpperCase();
       const result = await sendCommandToFigma("export_node_as_image", {
         nodeId,
-        format: format || "PNG",
-        scale: scale || 1
+        format: fmt,
+        scale: scale || 1,
+        tokenizeColors: !!tokenizeColors
       });
-      const typedResult = result;
+      if (outputPath) {
+        const resolved = path.resolve(outputPath);
+        fs.mkdirSync(path.dirname(resolved), { recursive: true });
+        if (fmt === "SVG" && typeof result.svg === "string") {
+          fs.writeFileSync(resolved, result.svg, "utf8");
+        } else {
+          fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+        }
+        const stat = fs.statSync(resolved);
+        const summary = {
+          saved: true,
+          path: resolved,
+          nodeName: result.nodeName,
+          format: fmt,
+          bytes: stat.size
+        };
+        if (typeof result.width === "number") summary.width = result.width;
+        if (typeof result.height === "number") summary.height = result.height;
+        if (result.usedTokens) summary.usedTokens = result.usedTokens;
+        return { content: [{ type: "text", text: JSON.stringify(summary) }] };
+      }
+      if (fmt === "SVG" && typeof result.svg === "string") {
+        const header = result.usedTokens && result.usedTokens.length ? `<!-- usedTokens: ${result.usedTokens.join(", ")} -->
+` : "";
+        return { content: [{ type: "text", text: header + result.svg }] };
+      }
       return {
         content: [
           {
             type: "image",
-            data: typedResult.imageData,
-            mimeType: typedResult.mimeType || "image/png"
+            data: result.imageData,
+            mimeType: result.mimeType || "image/png"
           }
         ]
       };
@@ -775,11 +771,15 @@ server.tool(
 );
 server.tool(
   "get_local_components",
-  "Get all local components from the Figma document",
-  {},
-  async () => {
+  "Get local components and component sets (id, name, type, key, remote). Supports pagination (`limit`/`offset`, with `total`/`nextOffset` in the response) and `countOnly` for large libraries.",
+  {
+    limit: z.number().int().positive().optional().describe("Max components to return; response includes total and nextOffset."),
+    offset: z.number().int().min(0).optional().describe("Start index for pagination."),
+    countOnly: z.boolean().optional().describe("Return only the total count.")
+  },
+  async ({ limit, offset, countOnly }) => {
     try {
-      const result = await sendCommandToFigma("get_local_components");
+      const result = await sendCommandToFigma("get_local_components", { limit, offset, countOnly });
       return {
         content: [
           {
@@ -1222,9 +1222,11 @@ server.tool(
   "scan_text_nodes",
   "Scan all text nodes in the selected Figma node",
   {
-    nodeId: z.string().describe("ID of the node to scan")
+    nodeId: z.string().describe("ID of the node to scan"),
+    chunkSize: z.number().int().positive().optional().describe("Nodes processed per chunk (default 50). Larger = fewer round-trips/progress updates."),
+    highlight: z.boolean().optional().describe("Visually flash each text node while scanning. Default false \u2014 enabling it is much slower (adds a fill write + delay per node).")
   },
-  async ({ nodeId }) => {
+  async ({ nodeId, chunkSize, highlight }) => {
     try {
       const initialStatus = {
         type: "text",
@@ -1234,8 +1236,10 @@ server.tool(
         nodeId,
         useChunking: true,
         // Enable chunking on the plugin side
-        chunkSize: 10
-        // Process 10 nodes at a time
+        chunkSize: chunkSize || 50,
+        // Process 50 nodes at a time by default
+        skipHighlight: !highlight
+        // Skip cosmetic per-node highlighting unless asked
       });
       if (result && typeof result === "object" && "chunks" in result) {
         const typedResult = result;
@@ -1281,44 +1285,28 @@ server.tool(
 );
 server.tool(
   "scan_nodes_by_types",
-  "Scan for child nodes with specific types in the selected Figma node",
+  "Scan for descendant nodes of specific types under a node. Supports pagination (`limit`/`offset` with `nextOffset` in the response) and `countOnly` for an unbounded section. INSTANCE results are enriched with `componentProperties` (variant state) and `mainComponent` (key/remote) so instance\u2192variant mapping needs no second file \u2014 enrichment is capped at 300 instances per call (`enrichmentTruncated:true` in the response means you should page with `limit` to enrich the rest). Returns a single structured JSON object (status is in fields, not separate text blocks).",
   {
     nodeId: z.string().describe("ID of the node to scan"),
-    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])")
+    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME', 'INSTANCE'])"),
+    limit: z.number().int().positive().optional().describe("Max nodes to return; the response includes total and nextOffset for paging."),
+    offset: z.number().int().min(0).optional().describe("Start index for pagination (use the previous response's nextOffset)."),
+    countOnly: z.boolean().optional().describe("Return only the total count, no node payload.")
   },
-  async ({ nodeId, types }) => {
+  async ({ nodeId, types, limit, offset, countOnly }) => {
     try {
-      const initialStatus = {
-        type: "text",
-        text: `Starting node type scanning for types: ${types.join(", ")}...`
-      };
       const result = await sendCommandToFigma("scan_nodes_by_types", {
         nodeId,
-        types
+        types,
+        limit,
+        offset,
+        countOnly
       });
-      if (result && typeof result === "object" && "matchingNodes" in result) {
-        const typedResult = result;
-        const summaryText = `Scan completed: Found ${typedResult.count} nodes matching types: ${typedResult.searchedTypes.join(", ")}`;
-        return {
-          content: [
-            initialStatus,
-            {
-              type: "text",
-              text: summaryText
-            },
-            {
-              type: "text",
-              text: JSON.stringify(typedResult.matchingNodes, null, 2)
-            }
-          ]
-        };
-      }
       return {
         content: [
-          initialStatus,
           {
             type: "text",
-            text: JSON.stringify(result, null, 2)
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -2240,6 +2228,19 @@ function connectToFigma(port = 3055) {
         }
         return;
       }
+      if (json.type === "system" && json.event === "channel_closed") {
+        logger.warn(`Channel "${json.channel}" closed: the Figma plugin left. You must join a channel again.`);
+        currentChannel = null;
+        const reason = new Error(
+          "Channel closed: the Figma plugin disconnected. Use list_figma_channels to find the current channel, then join_channel again."
+        );
+        pendingRequests.forEach((request, id) => {
+          clearTimeout(request.timeout);
+          request.reject(reason);
+          pendingRequests.delete(id);
+        });
+        return;
+      }
       const myResponse = json.message;
       logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
       logger.log("myResponse" + JSON.stringify(myResponse));
@@ -2291,7 +2292,7 @@ async function joinChannel(channelName) {
   }
 }
 function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve2, reject) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectToFigma();
       reject(new Error("Not connected to Figma. Attempting to connect..."));
@@ -2325,7 +2326,7 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
       }
     }, timeoutMs);
     pendingRequests.set(id, {
-      resolve,
+      resolve: resolve2,
       reject,
       timeout,
       lastActivity: Date.now()
@@ -2335,6 +2336,126 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
     ws.send(JSON.stringify(request));
   });
 }
+server.tool(
+  "list_pages",
+  "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
+  {},
+  async () => {
+    try {
+      const result = await sendCommandToFigma("list_pages");
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "set_current_page",
+  "Switch Figma's current page to the given pageId. Every current-page-scoped tool (scan, selection, etc.) then operates on that page.",
+  {
+    pageId: z.string().describe("The page id to switch to (from list_pages).")
+  },
+  async ({ pageId }) => {
+    try {
+      const result = await sendCommandToFigma("set_current_page", { pageId });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error setting current page: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "diagnose_pages",
+  "Scan every page and report which pages have a node this plugin API can't classify (the cause of 'Unknown node type \u2026 getPublicNodeType' errors). For each unreadable page it returns the container(s) whose children couldn't be read, and best-effort tries a REST export of those containers to surface the offending child node's id/name/type. Use this to find what node is breaking reads.",
+  {
+    tryExport: z.boolean().optional().describe("Try a REST export of each skipped container to identify the offending child type (default true)."),
+    deep: z.boolean().optional().describe("Also recurse below readable containers to find deeply-nested unclassifiable nodes (slower; default false checks only each page's direct children).")
+  },
+  async ({ tryExport, deep }) => {
+    try {
+      const result = await sendCommandToFigma("diagnose_pages", { tryExport: tryExport !== false, deep: !!deep }, 12e4);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error diagnosing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "get_node_by_key",
+  "Resolve a design-system `key` (component, component set, or style key from get_design_system_info / get_local_components) to a live node id, so you can go straight from a catalog key to get_node_info or export. Tries local components first; for a published key not found locally it falls back to importing the asset into the file (importComponentByKeyAsync/importStyleByKeyAsync) \u2014 a read with a small side effect (the library asset becomes referenced in this file). Returns { found, id, type, remote, source, ... }.",
+  {
+    key: z.string().describe("The component/style key to resolve.")
+  },
+  async ({ key }) => {
+    try {
+      const result = await sendCommandToFigma("get_node_by_key", { key });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error resolving key: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "get_design_system_info",
+  "Get the full design-system catalog of the current file: components & component sets, paint/text/effect/grid styles, and Variables (with collections, modes, and per-mode values). Every item includes its `key` \u2014 the identifier shared with consuming files for a published library asset. Run this on the Foundation/library file to build the catalog you match Product references against. Unlike get_styles, this includes Variables (color tokens).",
+  {
+    includeVariableValues: z.boolean().optional().describe("Include each variable's resolved value per mode (default true)."),
+    resolveNames: z.boolean().optional().describe("Include human-readable names (default true).")
+  },
+  async ({ includeVariableValues, resolveNames }) => {
+    try {
+      const result = await sendCommandToFigma("get_design_system_info", {
+        includeVariableValues: includeVariableValues !== false,
+        resolveNames: resolveNames !== false
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting design system info: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "get_nodes_design_info",
+  "For specific node IDs, return what each node references in the design system: for INSTANCEs the main component (key, remote flag, component-set key), any fill/stroke/text/effect/grid STYLE references (key, remote), and any bound VARIABLES per property (key, resolvedType). Use the keys to match against get_design_system_info from the Foundation file. Missing/raw values are omitted (a node with no `component`/`styles`/`boundVariables` uses no tokens there).",
+  {
+    nodeIds: z.array(z.string()).describe("Node IDs to inspect"),
+    resolveNames: z.boolean().optional().describe("Include human-readable names (default true).")
+  },
+  async ({ nodeIds, resolveNames }) => {
+    try {
+      const result = await sendCommandToFigma("get_nodes_design_info", {
+        nodeIds,
+        resolveNames: resolveNames !== false
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting node design info: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "scan_design_usage",
+  "Scan a node subtree (chunked) and return an AGGREGATED design-system usage summary: instances grouped by main-component key (with remote/local/detached counts), style references grouped by style key per slot, variable bindings grouped by variable key, and a fill token-coverage signal (tokenizedOrStyled vs rawSolid). Built for large trees (~1000s of nodes) \u2014 returns counts + sample node IDs per key, not every node, unless includeNodes is set. Match the keys against get_design_system_info from the Foundation file to compute reuse rates.",
+  {
+    nodeId: z.string().describe("Root node ID of the subtree to scan (e.g. a page or top frame)"),
+    chunkSize: z.number().int().positive().optional().describe("Nodes per chunk (default 200)."),
+    includeNodes: z.boolean().optional().describe("Also return a per-node list of nodes that reference the design system (default false; can be large)."),
+    resolveNames: z.boolean().optional().describe("Include human-readable names (default true).")
+  },
+  async ({ nodeId, chunkSize, includeNodes, resolveNames }) => {
+    try {
+      const result = await sendCommandToFigma("scan_design_usage", {
+        nodeId,
+        chunkSize: chunkSize || 200,
+        includeNodes: !!includeNodes,
+        resolveNames: resolveNames !== false
+      }, 12e4);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error scanning design usage: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
 server.tool(
   "list_figma_channels",
   "List the channels on the Talk-to-Figma relay server and which Figma document each is connected to. Use this BEFORE join_channel when you don't already know the channel name: find the channel whose document matches what the user wants, then call join_channel with it. Channels where hasFigma is true have a live Figma plugin and are joinable; empty channels are kept for history and show which document they were. Returns the currently joined channel as `current`.",
