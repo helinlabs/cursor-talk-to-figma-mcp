@@ -2778,6 +2778,23 @@ function connectToFigma(port: number = 3055) {
         return;
       }
 
+      // The relay closed our channel because the Figma plugin left. We're no
+      // longer in a channel — reset state and fail in-flight requests fast with
+      // an actionable message instead of letting them time out.
+      if (json.type === 'system' && (json as any).event === 'channel_closed') {
+        logger.warn(`Channel "${json.channel}" closed: the Figma plugin left. You must join a channel again.`);
+        currentChannel = null;
+        const reason = new Error(
+          'Channel closed: the Figma plugin disconnected. Use list_figma_channels to find the current channel, then join_channel again.'
+        );
+        pendingRequests.forEach((request, id) => {
+          clearTimeout(request.timeout);
+          request.reject(reason);
+          pendingRequests.delete(id);
+        });
+        return;
+      }
+
       // Handle regular responses
       const myResponse = json.message;
       logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
