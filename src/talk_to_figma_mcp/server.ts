@@ -2945,6 +2945,22 @@ server.tool(
 );
 
 server.tool(
+  "diagnose_pages",
+  "Scan every page and report which pages have a node this plugin API can't classify (the cause of 'Unknown node type … getPublicNodeType' errors). For each unreadable page it returns the container(s) whose children couldn't be read, and best-effort tries a REST export of those containers to surface the offending child node's id/name/type. Use this to find what node is breaking reads.",
+  {
+    tryExport: z.boolean().optional().describe("Try a REST export of each skipped container to identify the offending child type (default true)."),
+  },
+  async ({ tryExport }: any) => {
+    try {
+      const result = await sendCommandToFigma("diagnose_pages", { tryExport: tryExport !== false }, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error diagnosing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
   "get_node_by_key",
   "Resolve a design-system `key` (component, component set, or style key from get_design_system_info / get_local_components) to a live node id, so you can go straight from a catalog key to get_node_info or export. Tries local components first; for a published key not found locally it falls back to importing the asset into the file (importComponentByKeyAsync/importStyleByKeyAsync) — a read with a small side effect (the library asset becomes referenced in this file). Returns { found, id, type, remote, source, ... }.",
   {

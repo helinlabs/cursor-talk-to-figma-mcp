@@ -119,12 +119,19 @@ function getDocMeta() {
   try {
     pageCount = figma.root.children.length;
   } catch (e) {}
+  // currentPage.children can throw if the page holds a node type this plugin
+  // API can't classify — guard it so the document still gets announced (this
+  // was silently aborting the announce, leaving the channel doc-less).
+  let nodeCount = null;
+  try {
+    nodeCount = figma.currentPage.children.length;
+  } catch (e) {}
   return {
     documentName: figma.root.name,
     fileKey: figma.fileKey || null,
     page: figma.currentPage.name,
     pageId: figma.currentPage.id,
-    nodeCount: figma.currentPage.children.length,
+    nodeCount: nodeCount,
     pageCount,
   };
 }
@@ -165,6 +172,8 @@ async function handleCommand(command, params) {
       return await setCurrentPage(params);
     case "get_node_by_key":
       return await getNodeByKey(params);
+    case "diagnose_pages":
+      return await diagnosePages(params);
     case "get_node_info":
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
@@ -806,6 +815,79 @@ async function getNodeByKey(params) {
   } catch (e) {}
 
   return { found: false, key: key };
+}
+
+// Diagnose, per page, where an unclassifiable node lives. We can't read the
+// node's type from the plugin API (Figma refuses a public type for it), but we
+// can locate the container whose `.children` throws, and try a REST export of
+// that container — which sometimes surfaces the child's type string.
+async function diagnosePages(params) {
+  const { tryExport = true } = params || {};
+  await figma.loadAllPagesAsync();
+  const pages = [];
+  for (const page of figma.root.children) {
+    const entry = {
+      id: page.id,
+      name: page.name,
+      readable: true,
+      childCount: null,
+      skippedContainers: [],
+    };
+    try {
+      await page.loadAsync();
+    } catch (e) {
+      entry.loadError = String((e && e.message) || e);
+    }
+    const skipped = [];
+    (function walk(n) {
+      if ("children" in n) {
+        let kids = null;
+        try {
+          kids = n.children;
+        } catch (e) {
+          skipped.push({ id: n.id, name: n.name, type: n.type });
+        }
+        if (kids) for (const c of kids) walk(c);
+      }
+    })(page);
+    try {
+      entry.childCount = page.children.length;
+    } catch (e) {}
+    if (skipped.length) {
+      entry.readable = false;
+      entry.skippedContainers = skipped;
+    }
+    pages.push(entry);
+  }
+
+  // Best-effort: try to identify the offending child node's type via a REST
+  // export of each skipped container (a different code path than the live
+  // .children getter; may also throw — reported per container).
+  if (tryExport) {
+    for (const p of pages) {
+      for (const sc of p.skippedContainers) {
+        try {
+          const node = await figma.getNodeByIdAsync(sc.id);
+          if (!node) {
+            sc.exportOk = false;
+            continue;
+          }
+          const exp = await node.exportAsync({ format: "JSON_REST_V1" });
+          const kids = (exp.document && exp.document.children) || [];
+          sc.exportOk = true;
+          sc.childTypes = kids.map((k) => k.type);
+          // surface ids/types of children so the unknown one is identifiable
+          sc.children = kids.map((k) => ({ id: k.id, name: k.name, type: k.type }));
+        } catch (e) {
+          sc.exportOk = false;
+          sc.exportError = String((e && e.message) || e);
+        }
+      }
+    }
+  }
+
+  const unreadablePages = pages.filter((p) => !p.readable).length;
+  return { pages: pages, unreadablePages: unreadablePages };
 }
 
 async function getSelection() {
