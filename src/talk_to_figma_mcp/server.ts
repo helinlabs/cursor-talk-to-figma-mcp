@@ -5,6 +5,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
+import * as fs from "fs";
+import * as path from "path";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -185,11 +187,12 @@ server.tool(
     nodeId: z.string().describe("The ID of the node to get information about"),
     fields: z.array(z.string()).optional().describe("Only return these top-level fields (id/name/type are always included). e.g. ['fills','characters','style','absoluteBoundingBox','componentProperties','children']. Omit 'children' to get just this node."),
     maxDepth: z.number().int().min(0).optional().describe("Max levels of children to expand. 0 = this node only, 1 = direct children, etc. Omit for the full subtree."),
+    includeHash: z.boolean().optional().describe("Also return a stable `subtreeHash` covering the subtree's structure, text, bound tokens, and sizes. Same content → same hash; useful for detecting which screens changed between runs."),
   },
-  async ({ nodeId, fields, maxDepth }: any) => {
+  async ({ nodeId, fields, maxDepth, includeHash }: any) => {
     try {
       // The plugin already filters/shapes the node; return it directly.
-      const result = await sendCommandToFigma("get_node_info", { nodeId, fields, maxDepth });
+      const result = await sendCommandToFigma("get_node_info", { nodeId, fields, maxDepth, includeHash });
       return {
         content: [
           {
@@ -226,12 +229,13 @@ server.tool(
     nodeIds: z.array(z.string()).describe("Array of node IDs to get information about"),
     fields: z.array(z.string()).optional().describe("Only return these top-level fields (id/name/type always included)."),
     maxDepth: z.number().int().min(0).optional().describe("Max levels of children to expand (0 = node only)."),
+    includeHash: z.boolean().optional().describe("Also return a stable `subtreeHash` per node (see get_node_info)."),
   },
-  async ({ nodeIds, fields, maxDepth }: any) => {
+  async ({ nodeIds, fields, maxDepth, includeHash }: any) => {
     try {
       const results = await Promise.all(
         nodeIds.map(async (nodeId: any) => {
-          const result = await sendCommandToFigma('get_node_info', { nodeId, fields, maxDepth });
+          const result = await sendCommandToFigma('get_node_info', { nodeId, fields, maxDepth, includeHash });
           return { nodeId, info: result };
         })
       );
@@ -250,6 +254,41 @@ server.tool(
             type: "text",
             text: `Error getting nodes info: ${error instanceof Error ? error.message : String(error)
               }`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+
+// Frame Context Tool — one-shot, RN-ready digest of a screen subtree
+server.tool(
+  "get_frame_context",
+  "Get a single, pruned, RN-ready digest of a frame's subtree — replaces the get_node_info + scan_text_nodes + get_nodes_design_info round-trips. OS chrome (Status Bar / Home Indicator / Keyboard / Notch / Dynamic Island) and hidden nodes are dropped; each remaining node carries only relative bounds, text + typography, flex-friendly layout (flexDirection/gap/padding/justify/align), resolved semantic tokens (fill/stroke/radius/textStyle…), and a hasImageFill flag. Call it on a screen frame and write the spec from the one response.",
+  {
+    nodeId: z.string().describe("The ID of the frame/screen node to digest"),
+    excludeChrome: z.boolean().optional().describe("Drop OS chrome + hidden nodes (default true). Set false to keep everything."),
+    chromeNames: z.array(z.string()).optional().describe("Override the default chrome name list (case-insensitive substring match)."),
+    includeHash: z.boolean().optional().describe("Also include a stable `subtreeHash` at the root for change detection."),
+  },
+  async ({ nodeId, excludeChrome, chromeNames, includeHash }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_frame_context", {
+        nodeId,
+        excludeChrome: excludeChrome === undefined ? true : excludeChrome,
+        chromeNames,
+        includeHash: !!includeHash,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting frame context: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
       };
@@ -764,30 +803,93 @@ server.tool(
 // Export Node as Image Tool
 server.tool(
   "export_node_as_image",
-  "Export a node as an image from Figma",
+  "Export a node as an image from Figma. If `outputPath` is given, the bytes are written to that file on disk (parent dirs auto-created) and the tool returns the saved path + dimensions — no inline image, no curl/base64 dance. Without `outputPath` it returns the image inline (PNG/JPG/PDF) or the SVG text (SVG). The exported SVG always carries REAL, renderable colors. For SVG, pass `includeColorTokens: true` to ALSO get `colorTokens` — the authoritative list of which color variable each paint is bound to ([{token, hex, property}] in document order) so the caller can inject its own {{token}} placeholders. (The plugin never mutates the SVG: matching hexes in SVG text is lossy — hard-coded colors collide with token colors — so token injection is left to the caller, which has the design-system context.)",
   {
     nodeId: z.string().describe("The ID of the node to export"),
     format: z
       .enum(["PNG", "JPG", "SVG", "PDF"])
       .optional()
-      .describe("Export format"),
-    scale: z.number().positive().optional().describe("Export scale"),
+      .describe("Export format (default PNG)"),
+    scale: z.number().positive().optional().describe("Export scale (raster only, default 1)"),
+    outputPath: z
+      .string()
+      .optional()
+      .describe("If set, save the export to this file path (absolute, or relative to the server's working dir) instead of returning it inline. Parent directories are created automatically."),
+    includeColorTokens: z
+      .boolean()
+      .optional()
+      .describe("SVG only: also return `colorTokens` ([{token, hex, property}], document order) listing every paint bound to a color variable, so the caller can map resolved colors back to design tokens. The SVG itself keeps real colors."),
   },
-  async ({ nodeId, format, scale }: any) => {
+  async ({ nodeId, format, scale, outputPath, includeColorTokens }: any) => {
     try {
-      const result = await sendCommandToFigma("export_node_as_image", {
+      const fmt = (format || "PNG").toUpperCase();
+      const result = (await sendCommandToFigma("export_node_as_image", {
         nodeId,
-        format: format || "PNG",
+        format: fmt,
         scale: scale || 1,
-      });
-      const typedResult = result as { imageData: string; mimeType: string };
+        includeColorTokens: !!includeColorTokens,
+      })) as {
+        imageData: string;
+        mimeType: string;
+        nodeName?: string;
+        svg?: string;
+        colorTokens?: Array<{ token: string; hex: string; property: string }>;
+        usedTokens?: string[];
+        width?: number;
+        height?: number;
+      };
 
+      // --- Save to disk when an output path is provided ---------------------
+      if (outputPath) {
+        const resolved = path.resolve(outputPath);
+        fs.mkdirSync(path.dirname(resolved), { recursive: true });
+        if (fmt === "SVG" && typeof result.svg === "string") {
+          fs.writeFileSync(resolved, result.svg, "utf8");
+        } else {
+          fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+        }
+        const stat = fs.statSync(resolved);
+        const summary: any = {
+          saved: true,
+          path: resolved,
+          nodeName: result.nodeName,
+          format: fmt,
+          bytes: stat.size,
+        };
+        if (typeof result.width === "number") summary.width = result.width;
+        if (typeof result.height === "number") summary.height = result.height;
+        if (result.colorTokens) summary.colorTokens = result.colorTokens;
+        if (result.usedTokens) summary.usedTokens = result.usedTokens;
+        return { content: [{ type: "text", text: JSON.stringify(summary) }] };
+      }
+
+      // --- SVG inline -------------------------------------------------------
+      // With color tokens: return svg + the binding metadata as JSON.
+      // Without: return the raw SVG text (directly usable / renderable).
+      if (fmt === "SVG" && typeof result.svg === "string") {
+        if (result.colorTokens) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                nodeName: result.nodeName,
+                svg: result.svg,
+                colorTokens: result.colorTokens,
+                usedTokens: result.usedTokens,
+              }),
+            }],
+          };
+        }
+        return { content: [{ type: "text", text: result.svg }] };
+      }
+
+      // --- Raster / PDF inline image ---------------------------------------
       return {
         content: [
           {
             type: "image",
-            data: typedResult.imageData,
-            mimeType: typedResult.mimeType || "image/png",
+            data: result.imageData,
+            mimeType: result.mimeType || "image/png",
           },
         ],
       };
@@ -2494,6 +2596,7 @@ type FigmaCommand =
   | "get_selection"
   | "get_node_info"
   | "get_nodes_info"
+  | "get_frame_context"
   | "read_my_design"
   | "create_rectangle"
   | "create_frame"
@@ -2529,7 +2632,14 @@ type FigmaCommand =
   | "set_default_connector"
   | "create_connections"
   | "set_focus"
-  | "set_selections";
+  | "set_selections"
+  | "list_pages"
+  | "set_current_page"
+  | "get_node_by_key"
+  | "diagnose_pages"
+  | "get_design_system_info"
+  | "get_nodes_design_info"
+  | "scan_design_usage";
 
 type CommandParams = {
   get_document_info: Record<string, never>;

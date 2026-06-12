@@ -1,6 +1,24 @@
 #!/usr/bin/env bun
 
 import { Server, ServerWebSocket } from "bun";
+import { readFileSync } from "fs";
+import { createHash } from "crypto";
+
+// Build id served to the plugin UI (GET /plugin-version): a content hash of the
+// on-disk plugin files. Lets the plugin show which code is loaded WITHOUT
+// baking a version into the source (nothing committed per build). Computed per
+// request so edits are reflected without restarting the relay.
+function pluginVersion(): string {
+  try {
+    const code = readFileSync(new URL("./cursor_mcp_plugin/code.js", import.meta.url), "utf8");
+    const ui = readFileSync(new URL("./cursor_mcp_plugin/ui.html", import.meta.url), "utf8")
+      // neutralize the build-id span so it can't affect its own hash
+      .replace(/(<span id="build-id">)(.*?)(<\/span>)/, "$1$3");
+    return createHash("sha256").update(code).update(ui).digest("hex").slice(0, 7);
+  } catch (e) {
+    return "unknown";
+  }
+}
 
 // Store clients by channel
 const channels = new Map<string, Set<ServerWebSocket<any>>>();
@@ -177,6 +195,16 @@ const server = Bun.serve({
     // JSON list of channels + their document identity (for controllers/tools)
     if (url.pathname === "/channels") {
       return new Response(JSON.stringify({ channels: snapshotChannels() }, null, 2), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    // Build id of the on-disk plugin files (for the plugin UI's version badge).
+    if (url.pathname === "/plugin-version") {
+      return new Response(JSON.stringify({ build: pluginVersion() }), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Access-Control-Allow-Origin": "*",

@@ -178,12 +178,14 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getNodeInfo(params.nodeId, params.fields, params.maxDepth);
+      return await getNodeInfo(params.nodeId, params.fields, params.maxDepth, params.includeHash);
+    case "get_frame_context":
+      return await getFrameContext(params);
     case "get_nodes_info":
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
-      return await getNodesInfo(params.nodeIds, params.fields, params.maxDepth);
+      return await getNodesInfo(params.nodeIds, params.fields, params.maxDepth, params.includeHash);
     case "read_my_design":
       return await readMyDesign();
     case "create_rectangle":
@@ -698,11 +700,13 @@ async function getDocumentInfo(params) {
   let childCount = null;
   let childrenReadable = true;
   try {
-    children = page.children.map((node) => ({
-      id: node.id,
-      name: node.name,
-      type: node.type,
-    }));
+    children = page.children.map((node) => {
+      const entry = { id: node.id, name: node.name, type: node.type };
+      // Flag reference captures (image-fill rectangles) so a sync workflow can
+      // auto-separate them from real design frames.
+      if (nodeHasImageFill(node)) entry.hasImageFill = true;
+      return entry;
+    });
     childCount = children.length;
   } catch (e) {
     childrenReadable = false;
@@ -980,6 +984,11 @@ function filterFigmaNode(node, opts) {
   }
 
   if (node.fills && node.fills.length > 0) {
+    // Flag image fills so reference captures (screenshots/pasted images) can be
+    // told apart from real design frames without inspecting raw paint data.
+    if (node.fills.some((f) => f && f.type === "IMAGE")) {
+      filtered.hasImageFill = true;
+    }
     filtered.fills = node.fills.map((fill) => {
       var processedFill = Object.assign({}, fill);
       delete processedFill.boundVariables;
@@ -1065,7 +1074,7 @@ function filterFigmaNode(node, opts) {
 
   // Field selection: keep only id/name/type (+childCount) and requested fields.
   if (fields && fields.length) {
-    var keep = { id: 1, name: 1, type: 1, childCount: 1 };
+    var keep = { id: 1, name: 1, type: 1, childCount: 1, hasImageFill: 1, subtreeHash: 1 };
     for (var fi = 0; fi < fields.length; fi++) keep[fields[fi]] = 1;
     for (var fk in filtered) {
       if (Object.prototype.hasOwnProperty.call(filtered, fk) && !keep[fk]) {
@@ -1077,7 +1086,7 @@ function filterFigmaNode(node, opts) {
   return filtered;
 }
 
-async function getNodeInfo(nodeId, fields, maxDepth) {
+async function getNodeInfo(nodeId, fields, maxDepth, includeHash) {
   const node = await figma.getNodeByIdAsync(nodeId);
 
   if (!node) {
@@ -1088,10 +1097,12 @@ async function getNodeInfo(nodeId, fields, maxDepth) {
     format: "JSON_REST_V1",
   });
 
-  return filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
+  const out = filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
+  if (includeHash && out) out.subtreeHash = computeSubtreeHash(node);
+  return out;
 }
 
-async function getNodesInfo(nodeIds, fields, maxDepth) {
+async function getNodesInfo(nodeIds, fields, maxDepth, includeHash) {
   try {
     // Load all nodes in parallel
     const nodes = await Promise.all(
@@ -1107,9 +1118,11 @@ async function getNodesInfo(nodeIds, fields, maxDepth) {
         const response = await node.exportAsync({
           format: "JSON_REST_V1",
         });
+        const document = filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
+        if (includeHash && document) document.subtreeHash = computeSubtreeHash(node);
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth }),
+          document: document,
         };
       })
     );
@@ -1118,6 +1131,232 @@ async function getNodesInfo(nodeIds, fields, maxDepth) {
   } catch (error) {
     throw new Error(`Error getting nodes info: ${error.message}`);
   }
+}
+
+// ===========================================================================
+// get_frame_context — one-shot, RN-ready digest of a screen subtree
+// ---------------------------------------------------------------------------
+// Returns a pruned node tree (OS chrome + hidden nodes removed) where each node
+// carries only what a React Native implementation needs: relative bounds, text
+// + typography, flex-friendly layout, semantic tokens, and an image-fill flag.
+// Replaces the get_node_info + scan_text_nodes + get_nodes_design_info round
+// trips with a single call.
+
+const DEFAULT_CHROME_NAMES = [
+  "status bar",
+  "home indicator",
+  "keyboard",
+  "notch",
+  "dynamic island",
+];
+
+// Normalize a node name for chrome matching: lowercase + strip non-alphanumerics
+// so "Status Bar" / "HomeIndicator" / "status-bar" all collapse to one key.
+// Matching is then EXACT (not substring), so real content like
+// "Keyboard Shortcuts" is never mistaken for OS chrome.
+function normalizeName(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Figma auto-layout alignment -> CSS/RN flex equivalents.
+function mapPrimaryAxis(v) {
+  switch (v) {
+    case "MIN": return "flex-start";
+    case "MAX": return "flex-end";
+    case "CENTER": return "center";
+    case "SPACE_BETWEEN": return "space-between";
+    default: return v;
+  }
+}
+function mapCounterAxis(v) {
+  switch (v) {
+    case "MIN": return "flex-start";
+    case "MAX": return "flex-end";
+    case "CENTER": return "center";
+    case "BASELINE": return "baseline";
+    default: return v;
+  }
+}
+
+// Compact, resolved semantic tokens for one node (variable/style NAMES).
+async function nodeTokens(node, resolver) {
+  const tokens = {};
+  try {
+    const bv = await extractBoundVariables(node, resolver); // {prop:[{name,...}]}
+    if (bv) {
+      const pick = (k) => bv[k] && bv[k][0] && bv[k][0].name;
+      const skip = {
+        fills: 1, strokes: 1, cornerRadius: 1,
+        topLeftRadius: 1, topRightRadius: 1,
+        bottomLeftRadius: 1, bottomRightRadius: 1,
+      };
+      const fill = pick("fills"); if (fill) tokens.fill = fill;
+      const stroke = pick("strokes"); if (stroke) tokens.stroke = stroke;
+      const radius =
+        pick("cornerRadius") || pick("topLeftRadius") ||
+        pick("bottomLeftRadius") || pick("topRightRadius") ||
+        pick("bottomRightRadius");
+      if (radius) tokens.radius = radius;
+      // Surface any other bound props (itemSpacing, padding*, fontSize, …).
+      for (const k of Object.keys(bv)) {
+        if (skip[k]) continue;
+        const name = bv[k] && bv[k][0] && bv[k][0].name;
+        if (name && tokens[k] === undefined) tokens[k] = name;
+      }
+    }
+  } catch (e) {}
+  try {
+    const styles = await extractStyleRefs(node, resolver); // {fill,stroke,text,...:{name}}
+    if (styles) {
+      if (styles.text && styles.text.name) tokens.textStyle = styles.text.name;
+      if (!tokens.fill && styles.fill && styles.fill.name) tokens.fillStyle = styles.fill.name;
+      if (!tokens.stroke && styles.stroke && styles.stroke.name) tokens.strokeStyle = styles.stroke.name;
+      if (styles.effect && styles.effect.name) tokens.effectStyle = styles.effect.name;
+    }
+  } catch (e) {}
+  return Object.keys(tokens).length ? tokens : null;
+}
+
+async function getFrameContext(params) {
+  const { nodeId, excludeChrome = true, includeHash = false } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const root = await figma.getNodeByIdAsync(nodeId);
+  if (!root) throw new Error(`Node not found with ID: ${nodeId}`);
+
+  const commandId = (params && params.commandId) || generateCommandId();
+  const resolver = makeDsResolver(true);
+  // Exact (normalized) chrome match — see normalizeName.
+  const chrome = new Set(
+    (Array.isArray(params && params.chromeNames) && params.chromeNames.length
+      ? params.chromeNames
+      : DEFAULT_CHROME_NAMES
+    ).map(normalizeName)
+  );
+  let rb = { x: 0, y: 0 };
+  try { if (root.absoluteBoundingBox) rb = root.absoluteBoundingBox; } catch (e) {}
+
+  // Cheap synchronous pre-count so we can emit progress and not trip the 30s
+  // MCP inactivity timeout on large screens.
+  let total = 0;
+  (function countNodes(n) {
+    total++;
+    let k = null;
+    try { k = n.children; } catch (e) {}
+    if (k) for (const c of k) countNodes(c);
+  })(root);
+  let processed = 0;
+  await sendProgressUpdate(commandId, "get_frame_context", "started", 0, total, 0, "Digesting frame...", null);
+
+  // Per-node work is fully guarded: a single unclassifiable node (widget / a
+  // newer Figma node type whose props throw) is skipped instead of failing the
+  // whole digest.
+  async function walk(node) {
+    // visibility + chrome filters
+    try {
+      if (node.visible === false) return null;
+      if (excludeChrome && chrome.has(normalizeName(node.name))) return null;
+    } catch (e) {}
+
+    // node identity — if even this throws, the node is unusable: skip it.
+    let rec;
+    try {
+      rec = { id: node.id, name: node.name, type: node.type };
+    } catch (e) {
+      return null;
+    }
+
+    processed++;
+    if (processed % 50 === 0) {
+      await sendProgressUpdate(
+        commandId, "get_frame_context", "in_progress",
+        Math.min(99, Math.round((processed / total) * 100)),
+        total, processed, `Digested ${processed}/${total} nodes`, null
+      );
+    }
+
+    try {
+      const box = node.absoluteBoundingBox;
+      if (box) {
+        rec.bounds = {
+          x: Math.round(box.x - rb.x),
+          y: Math.round(box.y - rb.y),
+          w: Math.round(box.width),
+          h: Math.round(box.height),
+        };
+      }
+    } catch (e) {}
+
+    if (rec.type === "TEXT") {
+      try { rec.characters = node.characters; } catch (e) {}
+      try {
+        const typ = {
+          fontSize: typeof node.fontSize === "number" ? node.fontSize : undefined,
+          fontWeight: typeof node.fontWeight === "number" ? node.fontWeight : undefined,
+          letterSpacing: node.letterSpacing,
+          lineHeight: node.lineHeight,
+          textAlignHorizontal: node.textAlignHorizontal,
+          textAlignVertical: node.textAlignVertical,
+        };
+        if (node.fontName && node.fontName.family) {
+          typ.fontFamily = node.fontName.family;
+          typ.fontStyle = node.fontName.style;
+        }
+        rec.typography = typ;
+      } catch (e) {}
+    }
+
+    try {
+      if (node.layoutMode && node.layoutMode !== "NONE") {
+        rec.layout = {
+          flexDirection: node.layoutMode === "HORIZONTAL" ? "row" : "column",
+          gap: node.itemSpacing,
+          padding: {
+            top: node.paddingTop,
+            right: node.paddingRight,
+            bottom: node.paddingBottom,
+            left: node.paddingLeft,
+          },
+          justifyContent: mapPrimaryAxis(node.primaryAxisAlignItems),
+          alignItems: mapCounterAxis(node.counterAxisAlignItems),
+        };
+        if (node.layoutWrap === "WRAP") rec.layout.flexWrap = "wrap";
+      }
+    } catch (e) {}
+
+    try {
+      if (typeof node.cornerRadius === "number" && node.cornerRadius) {
+        rec.cornerRadius = node.cornerRadius;
+      }
+      if (typeof node.opacity === "number" && node.opacity !== 1) {
+        rec.opacity = node.opacity;
+      }
+    } catch (e) {}
+
+    try {
+      const tokens = await nodeTokens(node, resolver);
+      if (tokens) rec.tokens = tokens;
+    } catch (e) {}
+
+    try { if (nodeHasImageFill(node)) rec.hasImageFill = true; } catch (e) {}
+
+    let kids = null;
+    try { kids = node.children; } catch (e) {}
+    if (kids && kids.length) {
+      const arr = [];
+      for (const c of kids) {
+        let r = null;
+        try { r = await walk(c); } catch (e) {}
+        if (r) arr.push(r);
+      }
+      if (arr.length) rec.children = arr;
+    }
+    return rec;
+  }
+
+  const tree = await walk(root);
+  if (tree && includeHash) tree.subtreeHash = computeSubtreeHash(root);
+  await sendProgressUpdate(commandId, "get_frame_context", "completed", 100, total, processed, "Frame digested", null);
+  return tree;
 }
 
 async function getReactions(nodeIds) {
@@ -1969,10 +2208,141 @@ async function createComponentInstance(params) {
   }
 }
 
-async function exportNodeAsImage(params) {
-  const { nodeId, scale = 1 } = params || {};
+// 6-digit lowercase hex from a Figma RGBA (0..1). Matches Figma's SVG output,
+// which uses #rrggbb + a separate fill-opacity (alpha is ignored here).
+function rgbToHex6(c) {
+  const h = (x) => Math.round((x || 0) * 255).toString(16).padStart(2, "0");
+  return "#" + h(c.r) + h(c.g) + h(c.b);
+}
 
-  const format = "PNG";
+// True if a live node paints any IMAGE fill (used to flag reference captures
+// like screenshots / pasted images vs. real design frames).
+function nodeHasImageFill(node) {
+  try {
+    const fills = node.fills;
+    return (
+      Array.isArray(fills) &&
+      fills.some((p) => p && p.type === "IMAGE" && p.visible !== false)
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+// Walk a subtree collecting, in document order, every SOLID paint bound to a
+// color variable: { token, hex, property }. The binding can live on the paint
+// (paint.boundVariables.color) or on the node (node.boundVariables.fills[i]),
+// so we check both.
+//
+// This is returned as authoritative METADATA — the plugin deliberately does
+// NOT mutate the SVG. Matching resolved hexes against SVG text is lossy: a
+// hard-coded hex that happens to equal a token's color would be wrongly
+// tokenized, and two tokens resolving to the same color are indistinguishable.
+// The caller (sync-figma skill / RN tooling) has the design-system context to
+// inject {{token}} placeholders correctly; we just hand it the facts.
+async function collectColorTokens(node, resolver, out) {
+  const scanPaints = async (paints, nodeLevelAliases, property) => {
+    if (!Array.isArray(paints)) return;
+    for (let i = 0; i < paints.length; i++) {
+      const p = paints[i];
+      if (!p || p.type !== "SOLID" || !p.color) continue;
+      const varId =
+        (p.boundVariables && p.boundVariables.color && p.boundVariables.color.id) ||
+        (Array.isArray(nodeLevelAliases) && nodeLevelAliases[i] && nodeLevelAliases[i].id);
+      if (!varId) continue;
+      const v = await resolver.variable(varId);
+      if (v && v.name) {
+        out.push({
+          token: v.name,
+          hex: rgbToHex6(p.color).toLowerCase(),
+          property: property,
+        });
+      }
+    }
+  };
+  const nbv = node.boundVariables || {};
+  try { await scanPaints(node.fills, nbv.fills, "fill"); } catch (e) {}
+  try { await scanPaints(node.strokes, nbv.strokes, "stroke"); } catch (e) {}
+  let kids = null;
+  try { kids = node.children; } catch (e) {}
+  if (kids) for (const c of kids) await collectColorTokens(c, resolver, out);
+}
+
+// UTF-8 encode a string to a Uint8Array (for base64 transport of SVG text).
+function utf8ToUint8(str) {
+  const enc = encodeURIComponent(str);
+  const out = [];
+  for (let i = 0; i < enc.length; i++) {
+    if (enc[i] === "%") {
+      out.push(parseInt(enc.substr(i + 1, 2), 16));
+      i += 2;
+    } else {
+      out.push(enc.charCodeAt(i));
+    }
+  }
+  return new Uint8Array(out);
+}
+
+// cyrb53 — fast, well-distributed string hash. Deterministic (no Date/random),
+// so identical input always yields the identical hash.
+function cyrb53(str, seed) {
+  let h1 = 0xdeadbeef ^ (seed || 0);
+  let h2 = 0x41c6ce57 ^ (seed || 0);
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const out = 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  return out.toString(16);
+}
+
+// Stable structural hash of a node's subtree: child structure/order, text
+// characters, bound variable ids, and rounded SIZE (not absolute position, so
+// relocating the whole frame doesn't change it). Same content -> same hash.
+function computeSubtreeHash(node) {
+  const lines = [];
+  function walk(n, depth) {
+    let line = depth + ":" + n.type;
+    try {
+      if (n.type === "TEXT" && typeof n.characters === "string")
+        line += "|t=" + n.characters;
+    } catch (e) {}
+    try {
+      const bv = n.boundVariables;
+      if (bv && typeof bv === "object") {
+        const keys = Object.keys(bv).sort();
+        for (const k of keys) {
+          const val = bv[k];
+          const arr = Array.isArray(val) ? val : [val];
+          line += "|" + k + "=" + arr.map((a) => (a && a.id) || "").join(",");
+        }
+      }
+    } catch (e) {}
+    try {
+      // "?" distinguishes a node without a size from one that is genuinely 0×0,
+      // so they don't hash identically.
+      const w = typeof n.width === "number" ? Math.round(n.width) : "?";
+      const h = typeof n.height === "number" ? Math.round(n.height) : "?";
+      line += "|s=" + w + "x" + h;
+    } catch (e) {}
+    if (n.visible === false) line += "|hidden";
+    lines.push(line);
+    let kids = null;
+    try { kids = n.children; } catch (e) {}
+    if (kids) for (const c of kids) walk(c, depth + 1);
+  }
+  walk(node, 0);
+  return cyrb53(lines.join("\n"));
+}
+
+async function exportNodeAsImage(params) {
+  const { nodeId, scale = 1, includeColorTokens = false } = params || {};
+  let format = ((params && params.format) || "PNG").toString().toUpperCase();
 
   if (!nodeId) {
     throw new Error("Missing nodeId parameter");
@@ -1988,42 +2358,56 @@ async function exportNodeAsImage(params) {
   }
 
   try {
+    const base = { nodeId, nodeName: node.name, format, scale };
+
+    // SVG path: always return the real, renderable SVG (resolved colors). When
+    // asked, ALSO return authoritative color-token metadata so the caller can
+    // inject its own {{token}} placeholders — the SVG itself is never mutated.
+    if (format === "SVG") {
+      const svg = await node.exportAsync({ format: "SVG_STRING" });
+      const out = Object.assign(base, {
+        mimeType: "image/svg+xml",
+        svg: svg,
+        imageData: customBase64Encode(utf8ToUint8(svg)),
+      });
+      if (includeColorTokens) {
+        const resolver = makeDsResolver(true);
+        const colorTokens = [];
+        await collectColorTokens(node, resolver, colorTokens);
+        out.colorTokens = colorTokens; // ordered [{ token, hex, property }]
+        const seen = [];
+        for (const t of colorTokens) if (seen.indexOf(t.token) === -1) seen.push(t.token);
+        out.usedTokens = seen;
+      }
+      return out;
+    }
+
+    // Raster / PDF path.
     const settings = {
       format: format,
       constraint: { type: "SCALE", value: scale },
     };
-
     const bytes = await node.exportAsync(settings);
+    const mimeType =
+      format === "JPG"
+        ? "image/jpeg"
+        : format === "PDF"
+        ? "application/pdf"
+        : "image/png";
 
-    let mimeType;
-    switch (format) {
-      case "PNG":
-        mimeType = "image/png";
-        break;
-      case "JPG":
-        mimeType = "image/jpeg";
-        break;
-      case "SVG":
-        mimeType = "image/svg+xml";
-        break;
-      case "PDF":
-        mimeType = "application/pdf";
-        break;
-      default:
-        mimeType = "application/octet-stream";
-    }
-
-    // Proper way to convert Uint8Array to base64
-    const base64 = customBase64Encode(bytes);
-    // const imageData = `data:${mimeType};base64,${base64}`;
-
-    return {
-      nodeId,
-      format,
-      scale,
+    const out = Object.assign(base, {
       mimeType,
-      imageData: base64,
-    };
+      imageData: customBase64Encode(bytes),
+    });
+    if (
+      format !== "PDF" &&
+      typeof node.width === "number" &&
+      typeof node.height === "number"
+    ) {
+      out.width = Math.round(node.width * scale);
+      out.height = Math.round(node.height * scale);
+    }
+    return out;
   } catch (error) {
     throw new Error(`Error exporting node as image: ${error.message}`);
   }
