@@ -503,6 +503,9 @@
         pendingRequests: new Map(),
         channel: null,
         commandTracking: new Map(),
+        // Auto-reconnect bookkeeping
+        userDisconnected: false, // true only when the user clicks Disconnect
+        everConnected: false, // only auto-reconnect after a real connection
       };
 
       // --- Anonymous analytics (GA4 Measurement Protocol) ---
@@ -742,11 +745,21 @@
         }
       }
 
-      // Connect to WebSocket server
-      async function connectToServer(port) {
+      // Connect to WebSocket server.
+      // options.channel — rejoin a specific channel (used by auto-reconnect so
+      //   the MCP↔plugin pairing is preserved instead of getting a fresh channel).
+      async function connectToServer(port, options) {
+        options = options || {};
         try {
-          if (state.connected && state.socket) {
-            updateConnectionStatus(true, "Already connected to server");
+          if (
+            state.socket &&
+            (state.socket.readyState === WebSocket.CONNECTING ||
+              state.socket.readyState === WebSocket.OPEN)
+          ) {
+            // Already connected or a connect is in flight — don't open a second socket.
+            if (state.connected) {
+              updateConnectionStatus(true, "Already connected to server");
+            }
             return;
           }
 
@@ -756,8 +769,9 @@
           state.socket = new WebSocket(wsUrl);
 
           state.socket.onopen = () => {
-            // Generate random channel name
-            const channelName = generateChannelName();
+            // Reuse the previous channel on reconnect; otherwise pick a new one.
+            const channelName =
+              options.channel || state.channel || generateChannelName();
             console.log("Joining channel:", channelName);
             state.channel = channelName;
 
@@ -785,6 +799,8 @@
                 // Successfully joined channel
                 if (data.message && data.message.result) {
                   state.connected = true;
+                  state.everConnected = true;
+                  reconnect.stop(); // we're back — stop any retry loop
                   const channelName = data.channel;
                   updateConnectionStatus(
                     true,
@@ -824,14 +840,14 @@
           state.socket.onclose = () => {
             state.connected = false;
             state.socket = null;
-            updateConnectionStatus(false, "Disconnected from server");
+            handleDisconnect("connection lost");
           };
 
           state.socket.onerror = (error) => {
             console.error("WebSocket error:", error);
-            updateConnectionStatus(false, "Connection error");
             state.connected = false;
             state.socket = null;
+            handleDisconnect("connection error");
           };
         } catch (error) {
           console.error("Connection error:", error);
@@ -851,6 +867,71 @@
           updateConnectionStatus(false, "Disconnected from server");
         }
       }
+
+      // --- Auto-reconnect ---------------------------------------------------
+      // When the relay connection drops unexpectedly (relay restarted, network
+      // blip, etc.) try to get back on automatically. Triggers, in order:
+      //   1) one immediate attempt the moment we notice the drop
+      //   2) whenever the Figma window/plugin regains focus
+      //   3) a periodic retry every RECONNECT_INTERVAL_MS as a fallback
+      // We never auto-reconnect after the user clicked Disconnect on purpose,
+      // and we always rejoin the SAME channel so the MCP pairing is preserved.
+      const RECONNECT_INTERVAL_MS = 15000;
+      const reconnect = {
+        timer: null,
+        attempt(reason) {
+          if (!state.everConnected) return; // never connected yet — don't auto-connect
+          if (state.userDisconnected) return; // user is intentionally offline
+          if (state.connected) return; // already good
+          if (
+            state.socket &&
+            (state.socket.readyState === WebSocket.CONNECTING ||
+              state.socket.readyState === WebSocket.OPEN)
+          ) {
+            return; // a connect is already in flight
+          }
+          console.log("[reconnect] attempting —", reason);
+          updateConnectionStatus(false, `Reconnecting… (${reason})`);
+          connectionStatus.className = "status info";
+          connectToServer(state.serverPort, {
+            channel: state.channel,
+            isReconnect: true,
+          });
+        },
+        start() {
+          if (this.timer) return;
+          this.timer = setInterval(
+            () => this.attempt("retry"),
+            RECONNECT_INTERVAL_MS
+          );
+        },
+        stop() {
+          if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+          }
+        },
+      };
+
+      // Called whenever the socket closes/errors unexpectedly.
+      function handleDisconnect(reason) {
+        if (state.userDisconnected) {
+          updateConnectionStatus(false, "Disconnected from server");
+          return;
+        }
+        updateConnectionStatus(false, `Disconnected from server (${reason})`);
+        // Only the FIRST drop fires an immediate retry; once the periodic timer
+        // is running, failed retries fall through to it (no tight busy-loop).
+        const firstDrop = !reconnect.timer;
+        reconnect.start(); // keep retrying every RECONNECT_INTERVAL_MS
+        if (firstDrop) reconnect.attempt("connection lost"); // immediate, once
+      }
+
+      // Reconnect as soon as the user comes back to Figma / the plugin.
+      window.addEventListener("focus", () => reconnect.attempt("window focus"));
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) reconnect.attempt("tab visible");
+      });
 
       // Handle messages from the WebSocket
       async function handleSocketMessage(payload) {
@@ -1026,10 +1107,14 @@
       // Replace the separate connect/disconnect button listeners with a single toggle
       connectButton.addEventListener("click", () => {
         if (state.connected) {
+          // Intentional disconnect — stop auto-reconnect from fighting the user.
+          state.userDisconnected = true;
+          reconnect.stop();
           updateConnectionStatus(false, "Disconnecting...");
           connectionStatus.className = "status info";
           disconnectFromServer();
         } else {
+          state.userDisconnected = false;
           const port = parseInt(portInput.value, 10) || 3055;
           updateConnectionStatus(false, "Connecting...");
           connectionStatus.className = "status info";
