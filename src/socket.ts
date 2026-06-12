@@ -447,6 +447,35 @@ const server = Bun.serve({
             }
           });
 
+          // When the Figma plugin leaves, the channel can no longer do anything
+          // useful (no one to execute commands), so evict the remaining
+          // clients from it. Skip if another Figma client is still present.
+          if (meta && meta.role === "figma" && clients.size > 0) {
+            let figmaRemains = false;
+            clients.forEach((c) => {
+              const cm = clientMeta.get(c);
+              if (cm && cm.role === "figma") figmaRemains = true;
+            });
+            if (!figmaRemains) {
+              const evictedCount = clients.size;
+              clients.forEach((c) => {
+                if (c.readyState === WebSocket.OPEN) {
+                  c.send(JSON.stringify({
+                    type: "system",
+                    event: "channel_closed",
+                    message: "Figma left the channel; channel closed.",
+                    channel: channelName,
+                  }));
+                }
+                const cm = clientMeta.get(c);
+                if (cm) cm.channel = null;
+              });
+              clients.clear();
+              console.log(`\n🚪 Figma left "${channelName}" → evicted ${evictedCount} remaining client(s)`);
+              pushEvent({ kind: "channel_closed", channel: channelName, reason: "figma_left", evicted: evictedCount });
+            }
+          }
+
           // Keep the (now empty) channel around so its history stays visible
           // in the console, but mark it empty and prune old ones.
           if (clients.size === 0) {

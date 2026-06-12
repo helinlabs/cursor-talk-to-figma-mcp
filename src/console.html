@@ -235,6 +235,7 @@
           case "result": return `${e.ok ? "ok" : "ERROR: " + (e.error || "")}  ${e.commandId ? "· " + e.commandId.slice(0, 8) : ""}`;
           case "progress": return `${e.commandType || ""} ${e.progress ?? ""}% ${e.status || ""} ${e.message || ""}`;
           case "document": return `${e.document?.documentName || "(untitled)"} · ${e.document?.page || ""}`;
+          case "channel_closed": return `figma left → evicted ${e.evicted} client(s)`;
           default: return JSON.stringify(e);
         }
       }
@@ -844,7 +845,7 @@
       }
 
       // ----- Virtualized log list -------------------------------------------
-      const KINDS = ["command", "result", "join", "connect", "disconnect", "progress", "document"];
+      const KINDS = ["command", "result", "join", "connect", "disconnect", "progress", "document", "channel_closed"];
 
       function LogPanel({ getEvents, version, filter, setFilter }) {
         const [enabled, setEnabled] = useState(() => new Set(KINDS));
