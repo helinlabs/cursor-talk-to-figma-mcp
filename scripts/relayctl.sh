@@ -14,6 +14,7 @@
 #   ./scripts/relayctl.sh update     # git pull (if clean) + restart
 #   ./scripts/relayctl.sh status     # show whether it's running + recent log tail
 #   ./scripts/relayctl.sh logs       # follow the log (Ctrl-C to stop)
+#   ./scripts/relayctl.sh crashes    # show the crash history (abnormal exits)
 #
 set -euo pipefail
 
@@ -23,6 +24,7 @@ PLIST_SRC="$PROJECT_DIR/scripts/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$PROJECT_DIR/.relay"
 LOG_FILE="$LOG_DIR/relay.log"
+CRASH_FILE="$LOG_DIR/crash.log"
 GUI_DOMAIN="gui/$(id -u)"
 SERVICE_TARGET="$GUI_DOMAIN/$LABEL"
 
@@ -46,10 +48,20 @@ render_plist() {
     "$PLIST_SRC" > "$PLIST_DST"
 }
 
+wait_unloaded() {
+  # bootout is async; bootstrap fails with EIO if the old job is still around.
+  local i
+  for i in $(seq 1 20); do
+    is_loaded || return 0
+    sleep 0.2
+  done
+}
+
 cmd_install() {
   render_plist
   # Reload if already loaded so a re-install picks up plist changes.
   launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
+  wait_unloaded
   launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DST"
   launchctl enable "$SERVICE_TARGET"
   launchctl kickstart -k "$SERVICE_TARGET"
@@ -107,9 +119,30 @@ cmd_status() {
   else
     echo "🔴 not installed/loaded"
   fi
+  if [ -f "$CRASH_FILE" ]; then
+    local n
+    n="$(grep -c 'relay exited' "$CRASH_FILE" 2>/dev/null || echo 0)"
+    if [ "$n" -gt 0 ]; then
+      echo "💥 $n crash(es) recorded — \`relayctl crashes\` for details. Last:"
+      tail -n 1 "$CRASH_FILE"
+    fi
+  fi
   if [ -f "$LOG_FILE" ]; then
     echo "--- last 15 log lines ---"
     tail -n 15 "$LOG_FILE"
+  fi
+}
+
+cmd_crashes() {
+  if [ -f "$CRASH_FILE" ] && [ -s "$CRASH_FILE" ]; then
+    local n; n="$(grep -c 'relay exited' "$CRASH_FILE" 2>/dev/null || echo 0)"
+    echo "💥 $n abnormal exit(s) recorded in $CRASH_FILE:"
+    echo
+    cat "$CRASH_FILE"
+    echo
+    echo "→ For the stack trace of any crash, open $LOG_FILE near that timestamp."
+  else
+    echo "✨ no crashes recorded — $CRASH_FILE is empty."
   fi
 }
 
@@ -128,7 +161,8 @@ case "${1:-}" in
   update)    cmd_update ;;
   status)    cmd_status ;;
   logs)      cmd_logs ;;
+  crashes)   cmd_crashes ;;
   *)
-    echo "usage: $0 {install|uninstall|start|stop|restart|update|status|logs}" >&2
+    echo "usage: $0 {install|uninstall|start|stop|restart|update|status|logs|crashes}" >&2
     exit 1 ;;
 esac
