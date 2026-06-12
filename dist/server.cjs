@@ -666,22 +666,22 @@ server.tool(
 );
 server.tool(
   "export_node_as_image",
-  "Export a node as an image from Figma. If `outputPath` is given, the bytes are written to that file on disk (parent dirs auto-created) and the tool returns the saved path + dimensions \u2014 no inline image, no curl/base64 dance. Without `outputPath` it returns the image inline (PNG/JPG/PDF) or the SVG text (SVG). For SVG, pass `tokenizeColors: true` to replace color-variable-bound hexes with {{tokenName}} placeholders (returns the list of tokens used).",
+  "Export a node as an image from Figma. If `outputPath` is given, the bytes are written to that file on disk (parent dirs auto-created) and the tool returns the saved path + dimensions \u2014 no inline image, no curl/base64 dance. Without `outputPath` it returns the image inline (PNG/JPG/PDF) or the SVG text (SVG). The exported SVG always carries REAL, renderable colors. For SVG, pass `includeColorTokens: true` to ALSO get `colorTokens` \u2014 the authoritative list of which color variable each paint is bound to ([{token, hex, property}] in document order) so the caller can inject its own {{token}} placeholders. (The plugin never mutates the SVG: matching hexes in SVG text is lossy \u2014 hard-coded colors collide with token colors \u2014 so token injection is left to the caller, which has the design-system context.)",
   {
     nodeId: import_zod.z.string().describe("The ID of the node to export"),
     format: import_zod.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format (default PNG)"),
     scale: import_zod.z.number().positive().optional().describe("Export scale (raster only, default 1)"),
     outputPath: import_zod.z.string().optional().describe("If set, save the export to this file path (absolute, or relative to the server's working dir) instead of returning it inline. Parent directories are created automatically."),
-    tokenizeColors: import_zod.z.boolean().optional().describe("SVG only: replace hexes bound to color variables with {{tokenName}} placeholders so they can be re-injected as design tokens.")
+    includeColorTokens: import_zod.z.boolean().optional().describe("SVG only: also return `colorTokens` ([{token, hex, property}], document order) listing every paint bound to a color variable, so the caller can map resolved colors back to design tokens. The SVG itself keeps real colors.")
   },
-  async ({ nodeId, format, scale, outputPath, tokenizeColors }) => {
+  async ({ nodeId, format, scale, outputPath, includeColorTokens }) => {
     try {
       const fmt = (format || "PNG").toUpperCase();
       const result = await sendCommandToFigma("export_node_as_image", {
         nodeId,
         format: fmt,
         scale: scale || 1,
-        tokenizeColors: !!tokenizeColors
+        includeColorTokens: !!includeColorTokens
       });
       if (outputPath) {
         const resolved = path.resolve(outputPath);
@@ -701,13 +701,25 @@ server.tool(
         };
         if (typeof result.width === "number") summary.width = result.width;
         if (typeof result.height === "number") summary.height = result.height;
+        if (result.colorTokens) summary.colorTokens = result.colorTokens;
         if (result.usedTokens) summary.usedTokens = result.usedTokens;
         return { content: [{ type: "text", text: JSON.stringify(summary) }] };
       }
       if (fmt === "SVG" && typeof result.svg === "string") {
-        const header = result.usedTokens && result.usedTokens.length ? `<!-- usedTokens: ${result.usedTokens.join(", ")} -->
-` : "";
-        return { content: [{ type: "text", text: header + result.svg }] };
+        if (result.colorTokens) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                nodeName: result.nodeName,
+                svg: result.svg,
+                colorTokens: result.colorTokens,
+                usedTokens: result.usedTokens
+              })
+            }]
+          };
+        }
+        return { content: [{ type: "text", text: result.svg }] };
       }
       return {
         content: [
