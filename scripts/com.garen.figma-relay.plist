@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.garen.figma-relay</string>
+
+    <!-- bun run src/socket.ts (runs straight from source; no build needed) -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BUN__</string>
+        <string>run</string>
+        <string>src/socket.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__BUN_DIR__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PORT</key>
+        <string>3055</string>
+    </dict>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if it crashes / is killed -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't hammer-restart in a tight loop -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/.relay/relay.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/.relay/relay.log</string>
+</dict>
+</plist>

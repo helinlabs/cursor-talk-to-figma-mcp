@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# relayctl — manage the Talk-to-Figma relay server as a macOS launchd agent.
+#
+# The relay runs `bun run src/socket.ts` (straight from source, no build step),
+# so after editing the source you just `relayctl restart` to pick up changes.
+#
+# Usage:
+#   ./scripts/relayctl.sh install    # install + start, and enable start-at-login
+#   ./scripts/relayctl.sh uninstall  # stop + remove the launchd agent
+#   ./scripts/relayctl.sh start      # start now
+#   ./scripts/relayctl.sh stop       # stop now (stays installed; won't auto-restart)
+#   ./scripts/relayctl.sh restart    # restart (use after editing source)
+#   ./scripts/relayctl.sh update     # git pull (if clean) + restart
+#   ./scripts/relayctl.sh status     # show whether it's running + recent log tail
+#   ./scripts/relayctl.sh logs       # follow the log (Ctrl-C to stop)
+#
+set -euo pipefail
+
+LABEL="com.garen.figma-relay"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PLIST_SRC="$PROJECT_DIR/scripts/$LABEL.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$PROJECT_DIR/.relay"
+LOG_FILE="$LOG_DIR/relay.log"
+GUI_DOMAIN="gui/$(id -u)"
+SERVICE_TARGET="$GUI_DOMAIN/$LABEL"
+
+bun_bin() {
+  command -v bun || echo "$HOME/.bun/bin/bun"
+}
+
+is_loaded() {
+  launchctl print "$SERVICE_TARGET" >/dev/null 2>&1
+}
+
+render_plist() {
+  local bun_path bun_dir
+  bun_path="$(bun_bin)"
+  bun_dir="$(dirname "$bun_path")"
+  mkdir -p "$LOG_DIR"
+  sed \
+    -e "s#__BUN__#$bun_path#g" \
+    -e "s#__BUN_DIR__#$bun_dir#g" \
+    -e "s#__PROJECT_DIR__#$PROJECT_DIR#g" \
+    "$PLIST_SRC" > "$PLIST_DST"
+}
+
+cmd_install() {
+  render_plist
+  # Reload if already loaded so a re-install picks up plist changes.
+  launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DST"
+  launchctl enable "$SERVICE_TARGET"
+  launchctl kickstart -k "$SERVICE_TARGET"
+  echo "✅ installed & started ($LABEL) — http://localhost:${PORT:-3055}/console"
+  echo "   will auto-start at login and auto-restart on crash."
+}
+
+cmd_uninstall() {
+  launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
+  rm -f "$PLIST_DST"
+  echo "🗑  uninstalled ($LABEL). Source code is untouched."
+}
+
+cmd_start() {
+  is_loaded || { render_plist; launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DST"; }
+  launchctl enable "$SERVICE_TARGET"
+  launchctl kickstart "$SERVICE_TARGET"
+  echo "▶️  started"
+}
+
+cmd_stop() {
+  # bootout fully unloads so KeepAlive won't resurrect it until next start/login.
+  launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
+  echo "⏹  stopped (won't auto-restart until you start it or log in again)"
+}
+
+cmd_restart() {
+  if is_loaded; then
+    launchctl kickstart -k "$SERVICE_TARGET"
+  else
+    cmd_start
+  fi
+  echo "🔁 restarted (latest source loaded)"
+}
+
+cmd_update() {
+  if [ -n "$(git -C "$PROJECT_DIR" status --porcelain)" ]; then
+    echo "⚠️  working tree has local changes — skipping git pull, just restarting."
+  else
+    echo "⬇️  git pull…"
+    git -C "$PROJECT_DIR" pull --ff-only
+  fi
+  cmd_restart
+}
+
+cmd_status() {
+  if is_loaded; then
+    local pid
+    pid="$(launchctl print "$SERVICE_TARGET" 2>/dev/null | awk '/pid =/{print $3; exit}')"
+    if [ -n "${pid:-}" ]; then
+      echo "🟢 running (pid $pid) — http://localhost:3055/console"
+    else
+      echo "🟡 loaded but not running (check log below)"
+    fi
+  else
+    echo "🔴 not installed/loaded"
+  fi
+  if [ -f "$LOG_FILE" ]; then
+    echo "--- last 15 log lines ---"
+    tail -n 15 "$LOG_FILE"
+  fi
+}
+
+cmd_logs() {
+  mkdir -p "$LOG_DIR"; touch "$LOG_FILE"
+  echo "tailing $LOG_FILE (Ctrl-C to stop)…"
+  tail -f "$LOG_FILE"
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  update)    cmd_update ;;
+  status)    cmd_status ;;
+  logs)      cmd_logs ;;
+  *)
+    echo "usage: $0 {install|uninstall|start|stop|restart|update|status|logs}" >&2
+    exit 1 ;;
+esac
