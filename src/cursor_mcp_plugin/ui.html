@@ -195,6 +195,13 @@
         color: #999999;
       }
 
+      .header-text p.build-badge {
+        margin-top: 2px;
+        font-size: 10px;
+        color: #b3b3b3;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+
       .tabs {
         display: flex;
         border-bottom: 1px solid #444444;
@@ -355,6 +362,12 @@
         <div class="header-text">
           <h1>Talk To Figma MCP Plugin</h1>
           <p>Connect Figma to Cursor AI using MCP</p>
+          <!-- build id is fetched from the relay at runtime (a content hash of
+               the on-disk plugin files) so nothing is baked into / committed to
+               source. "loaded" is the re-run time, proving Figma reloaded. -->
+          <p class="build-badge">
+            build <span id="build-id">…</span><span id="build-loaded"></span>
+          </p>
         </div>
       </div>
 
@@ -507,6 +520,37 @@
         userDisconnected: false, // true only when the user clicks Disconnect
         everConnected: false, // only auto-reconnect after a real connection
       };
+
+      // Build badge: the load time proves Figma reloaded; the build id is a
+      // content hash of the on-disk plugin files, fetched from the relay (so
+      // nothing is baked into source). They update together on a fresh re-run.
+      (function () {
+        try {
+          const loaded = document.getElementById("build-loaded");
+          if (loaded) {
+            const d = new Date();
+            const p = (n) => String(n).padStart(2, "0");
+            loaded.textContent =
+              " · loaded " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+          }
+        } catch (e) {}
+        // Fetch the build id from the relay (default port 3055; dev manifest
+        // allows http://localhost:3055).
+        try {
+          const portEl = document.getElementById("port");
+          const port = (portEl && parseInt(portEl.value, 10)) || 3055;
+          fetch("http://localhost:" + port + "/plugin-version")
+            .then((r) => r.json())
+            .then((j) => {
+              const el = document.getElementById("build-id");
+              if (el && j && j.build) el.textContent = j.build;
+            })
+            .catch(() => {
+              const el = document.getElementById("build-id");
+              if (el) el.textContent = "?";
+            });
+        } catch (e) {}
+      })();
 
       // --- Anonymous analytics (GA4 Measurement Protocol) ---
       const analytics = (() => {
