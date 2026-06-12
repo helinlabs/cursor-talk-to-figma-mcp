@@ -822,72 +822,97 @@ async function getNodeByKey(params) {
 // can locate the container whose `.children` throws, and try a REST export of
 // that container — which sometimes surfaces the child's type string.
 async function diagnosePages(params) {
-  const { tryExport = true } = params || {};
+  // deep=false (default): only check each page's DIRECT children (the observed
+  //   failure mode — page.children throwing). Fast, doesn't block on huge files.
+  // deep=true: also recurse to find unclassifiable nodes nested deeper (slow).
+  const { tryExport = true, deep = false, commandId = generateCommandId() } =
+    params || {};
+
+  sendProgressUpdate(commandId, "diagnose_pages", "started", 0, 1, 0, "Loading pages...", null);
   await figma.loadAllPagesAsync();
+
+  const allPages = figma.root.children;
+  const totalP = allPages.length;
   const pages = [];
-  for (const page of figma.root.children) {
+
+  for (let pi = 0; pi < totalP; pi++) {
+    const page = allPages[pi];
+    console.log(`[diagnose_pages] ${pi + 1}/${totalP}: "${page.name}"`);
+    sendProgressUpdate(
+      commandId, "diagnose_pages", "in_progress",
+      Math.round((pi / totalP) * 80), totalP, pi,
+      `Scanning page "${page.name}" (${pi + 1}/${totalP})`, null
+    );
+
     const entry = {
-      id: page.id,
-      name: page.name,
-      readable: true,
-      childCount: null,
-      skippedContainers: [],
+      id: page.id, name: page.name, readable: true,
+      childCount: null, skippedContainers: [],
     };
     try {
       await page.loadAsync();
     } catch (e) {
       entry.loadError = String((e && e.message) || e);
     }
-    const skipped = [];
-    (function walk(n) {
-      if ("children" in n) {
-        let kids = null;
-        try {
-          kids = n.children;
-        } catch (e) {
-          skipped.push({ id: n.id, name: n.name, type: n.type });
-        }
-        if (kids) for (const c of kids) walk(c);
-      }
-    })(page);
+
+    // Direct children (the level that threw in list_pages)
+    let topKids = null;
     try {
-      entry.childCount = page.children.length;
-    } catch (e) {}
-    if (skipped.length) {
+      topKids = page.children;
+      entry.childCount = topKids.length;
+    } catch (e) {
       entry.readable = false;
-      entry.skippedContainers = skipped;
+      entry.skippedContainers.push({ id: page.id, name: page.name, type: page.type, level: "page" });
     }
+
+    // Optional deep walk for nodes nested below readable containers
+    if (deep && topKids) {
+      (function walk(n) {
+        if ("children" in n) {
+          let kids = null;
+          try {
+            kids = n.children;
+          } catch (e) {
+            entry.readable = false;
+            entry.skippedContainers.push({ id: n.id, name: n.name, type: n.type, level: "nested" });
+          }
+          if (kids) for (const c of kids) walk(c);
+        }
+      })(page);
+    }
+
     pages.push(entry);
   }
 
-  // Best-effort: try to identify the offending child node's type via a REST
-  // export of each skipped container (a different code path than the live
-  // .children getter; may also throw — reported per container).
+  // Best-effort: identify the offending child node's type via a REST export of
+  // each skipped container (a different code path than the live .children
+  // getter; may also throw — reported per container).
   if (tryExport) {
+    sendProgressUpdate(commandId, "diagnose_pages", "in_progress", 85, totalP, totalP, "Identifying offending nodes via export...", null);
     for (const p of pages) {
       for (const sc of p.skippedContainers) {
         try {
           const node = await figma.getNodeByIdAsync(sc.id);
-          if (!node) {
-            sc.exportOk = false;
-            continue;
-          }
+          if (!node) { sc.exportOk = false; continue; }
           const exp = await node.exportAsync({ format: "JSON_REST_V1" });
           const kids = (exp.document && exp.document.children) || [];
           sc.exportOk = true;
-          sc.childTypes = kids.map((k) => k.type);
-          // surface ids/types of children so the unknown one is identifiable
           sc.children = kids.map((k) => ({ id: k.id, name: k.name, type: k.type }));
+          sc.childTypes = kids
+            .map((k) => k.type)
+            .filter((t, i, a) => a.indexOf(t) === i);
+          console.log(`[diagnose_pages] export "${sc.name}" childTypes: ${JSON.stringify(sc.childTypes)}`);
         } catch (e) {
           sc.exportOk = false;
           sc.exportError = String((e && e.message) || e);
+          console.log(`[diagnose_pages] export "${sc.name}" FAILED: ${sc.exportError}`);
         }
       }
     }
   }
 
   const unreadablePages = pages.filter((p) => !p.readable).length;
-  return { pages: pages, unreadablePages: unreadablePages };
+  sendProgressUpdate(commandId, "diagnose_pages", "completed", 100, totalP, totalP, `Done. ${unreadablePages} unreadable page(s).`, null);
+  return { pages: pages, unreadablePages: unreadablePages, deep: deep };
 }
 
 async function getSelection() {

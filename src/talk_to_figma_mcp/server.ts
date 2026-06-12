@@ -2949,10 +2949,11 @@ server.tool(
   "Scan every page and report which pages have a node this plugin API can't classify (the cause of 'Unknown node type … getPublicNodeType' errors). For each unreadable page it returns the container(s) whose children couldn't be read, and best-effort tries a REST export of those containers to surface the offending child node's id/name/type. Use this to find what node is breaking reads.",
   {
     tryExport: z.boolean().optional().describe("Try a REST export of each skipped container to identify the offending child type (default true)."),
+    deep: z.boolean().optional().describe("Also recurse below readable containers to find deeply-nested unclassifiable nodes (slower; default false checks only each page's direct children)."),
   },
-  async ({ tryExport }: any) => {
+  async ({ tryExport, deep }: any) => {
     try {
-      const result = await sendCommandToFigma("diagnose_pages", { tryExport: tryExport !== false }, 120000);
+      const result = await sendCommandToFigma("diagnose_pages", { tryExport: tryExport !== false, deep: !!deep }, 120000);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error diagnosing pages: ${error instanceof Error ? error.message : String(error)}` }] };

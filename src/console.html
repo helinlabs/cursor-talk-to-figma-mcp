@@ -252,7 +252,8 @@
           { name: "key", type: "string", required: true, description: "Component/style key from the catalog" }
         ] },
         { group: "Document & Selection", command: "diagnose_pages", description: "Find pages/containers with an unclassifiable node + try to identify its type", params: [
-          { name: "tryExport", type: "boolean", required: false, default: true, description: "REST-export skipped containers to surface the offending child type" }
+          { name: "tryExport", type: "boolean", required: false, default: true, description: "REST-export skipped containers to surface the offending child type" },
+          { name: "deep", type: "boolean", required: false, default: false, description: "Recurse below direct page children (slower)" }
         ] },
         { group: "Document & Selection", command: "get_selection", description: "Get information about the current selection in Figma", params: [] },
         { group: "Document & Selection", command: "read_my_design", description: "Get detailed information about the current selection, including all node details", params: [] },
