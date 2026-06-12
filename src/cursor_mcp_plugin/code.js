@@ -568,11 +568,22 @@ async function scanDesignUsage(params) {
     throw new Error(`Node with ID ${nodeId} not found`);
   }
 
-  // Flatten the subtree (sync tree walk; nodes are already loaded in-page)
+  // Flatten the subtree (sync tree walk; nodes are already loaded in-page).
+  // Reading `.children` can throw on a node type this plugin API can't
+  // classify; skip that subtree (and record it) rather than failing the scan.
   const all = [];
+  const skippedContainers = [];
   (function walk(n) {
     all.push(n);
-    if ("children" in n && n.children) for (const c of n.children) walk(c);
+    if ("children" in n) {
+      let kids = null;
+      try {
+        kids = n.children;
+      } catch (e) {
+        skippedContainers.push({ id: n.id, name: n.name, type: n.type });
+      }
+      if (kids) for (const c of kids) walk(c);
+    }
   })(root);
   const total = all.length;
   const totalChunks = Math.max(1, Math.ceil(total / chunkSize));
@@ -653,6 +664,7 @@ async function scanDesignUsage(params) {
   return {
     scannedNodes: total,
     summary,
+    skippedContainers: skippedContainers, // subtrees skipped (unclassifiable node type)
     nodes: includeNodes ? nodes : undefined,
     commandId,
   };
@@ -675,6 +687,7 @@ async function getDocumentInfo(params) {
   // degrade gracefully instead of failing the whole call.
   let children = [];
   let childCount = null;
+  let childrenReadable = true;
   try {
     children = page.children.map((node) => ({
       id: node.id,
@@ -682,12 +695,15 @@ async function getDocumentInfo(params) {
       type: node.type,
     }));
     childCount = children.length;
-  } catch (e) {}
+  } catch (e) {
+    childrenReadable = false;
+  }
   return {
     name: page.name,
     id: page.id,
     type: page.type,
     children: children,
+    childrenReadable: childrenReadable,
     currentPage: {
       id: page.id,
       name: page.name,
@@ -707,11 +723,13 @@ async function listPages() {
       const entry = { id: p.id, name: p.name };
       // Reading .children can throw ("Unknown node type ... getPublicNodeType")
       // when a page contains a node type this plugin API version can't classify
-      // (e.g. a widget). childCount is best-effort.
+      // (e.g. a widget / a newer Figma feature node). Surface that explicitly
+      // rather than silently reporting an empty page.
       try {
         entry.childCount = p.children.length;
       } catch (e) {
         entry.childCount = null;
+        entry.childrenReadable = false;
       }
       return entry;
     }),
@@ -3255,7 +3273,8 @@ async function scanNodesByTypes(params) {
   );
 
   // Recursively find nodes with specified types
-  await findNodesByTypes(node, types, matchingNodes);
+  const skipped = [];
+  await findNodesByTypes(node, types, matchingNodes, skipped);
 
   const total = matchingNodes.length;
   const { limit, offset = 0, countOnly = false, resolveNames = true } = params || {};
@@ -3264,7 +3283,7 @@ async function scanNodesByTypes(params) {
   if (countOnly) {
     sendProgressUpdate(commandId, "scan_nodes_by_types", "completed", 100, total, total,
       `Scan complete. Found ${total} matching nodes.`, { total });
-    return { success: true, countOnly: true, total: total, searchedTypes: types };
+    return { success: true, countOnly: true, total: total, searchedTypes: types, skippedContainers: skipped };
   }
 
   // Paginate, then enrich only the returned slice — so scanning a 762-node
@@ -3313,6 +3332,9 @@ async function scanNodesByTypes(params) {
     returned: slice.length,
     nextOffset: nextOffset,
     enrichmentTruncated: enrichmentTruncated, // true if >ENRICH_CAP instances; page for the rest
+    // Containers whose children couldn't be read (a descendant node type this
+    // plugin API can't classify); their subtrees were skipped, not failed.
+    skippedContainers: skipped,
     searchedTypes: types,
     matchingNodes: slice,
   };
@@ -3336,7 +3358,7 @@ function simplifyComponentProperties(cp) {
  * @param {Array<string>} types - Array of node types to find
  * @param {Array} matchingNodes - Array to store found nodes
  */
-async function findNodesByTypes(node, types, matchingNodes = []) {
+async function findNodesByTypes(node, types, matchingNodes = [], skipped = []) {
   // Skip invisible nodes
   if (node.visible === false) return;
 
@@ -3357,10 +3379,20 @@ async function findNodesByTypes(node, types, matchingNodes = []) {
     });
   }
 
-  // Recursively process children of container nodes
+  // Recursively process children of container nodes. Reading `.children` can
+  // throw if a descendant is a node type this plugin API can't classify;
+  // skip that subtree (and record it) instead of failing the whole scan.
   if ("children" in node) {
-    for (const child of node.children) {
-      await findNodesByTypes(child, types, matchingNodes);
+    let kids = null;
+    try {
+      kids = node.children;
+    } catch (e) {
+      skipped.push({ id: node.id, name: node.name, type: node.type });
+    }
+    if (kids) {
+      for (const child of kids) {
+        await findNodesByTypes(child, types, matchingNodes, skipped);
+      }
     }
   }
 }

@@ -70,6 +70,21 @@ to a live node id, so you can go straight to `get_node_info` / `export_node_as_i
   style (`importStyleByKeyAsync`) by key.
 - Returns `{ found, id, type, remote, source, key, name? }` (or `{ found:false }`).
 
+## Resilience to unclassifiable nodes
+
+Some files contain a node type this plugin's Figma API can't classify (a widget
+or a newer Figma feature node); reading that node's `.children` throws
+`Internal Figma error: Unknown node type ... getPublicNodeType`. That node
+itself can't be read (the classification is internal to Figma), but a single
+such node no longer fails a whole operation:
+- tree walks (`scan_nodes_by_types`, `scan_design_usage`) **skip that subtree
+  and continue**, listing what they skipped under `skippedContainers`.
+- `list_pages` / `get_document_info` report `childrenReadable: false` (and
+  `childCount: null`) for the affected page instead of erroring.
+
+So results are partial-but-honest: you can see everything readable plus exactly
+what was skipped.
+
 ## Build / reload
 - **MCP server** runs from source — new params/tools appear on the next session.
 - **Plugin** (`code.js`): re-run it in Figma so the new handlers load.
