@@ -1150,6 +1150,14 @@ const DEFAULT_CHROME_NAMES = [
   "dynamic island",
 ];
 
+// Normalize a node name for chrome matching: lowercase + strip non-alphanumerics
+// so "Status Bar" / "HomeIndicator" / "status-bar" all collapse to one key.
+// Matching is then EXACT (not substring), so real content like
+// "Keyboard Shortcuts" is never mistaken for OS chrome.
+function normalizeName(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 // Figma auto-layout alignment -> CSS/RN flex equivalents.
 function mapPrimaryAxis(v) {
   switch (v) {
@@ -1215,32 +1223,70 @@ async function getFrameContext(params) {
   const root = await figma.getNodeByIdAsync(nodeId);
   if (!root) throw new Error(`Node not found with ID: ${nodeId}`);
 
+  const commandId = (params && params.commandId) || generateCommandId();
   const resolver = makeDsResolver(true);
-  const chrome = (
-    Array.isArray(params && params.chromeNames) && params.chromeNames.length
+  // Exact (normalized) chrome match — see normalizeName.
+  const chrome = new Set(
+    (Array.isArray(params && params.chromeNames) && params.chromeNames.length
       ? params.chromeNames
       : DEFAULT_CHROME_NAMES
-  ).map((s) => String(s).toLowerCase());
-  const rb = root.absoluteBoundingBox || { x: 0, y: 0 };
+    ).map(normalizeName)
+  );
+  let rb = { x: 0, y: 0 };
+  try { if (root.absoluteBoundingBox) rb = root.absoluteBoundingBox; } catch (e) {}
 
+  // Cheap synchronous pre-count so we can emit progress and not trip the 30s
+  // MCP inactivity timeout on large screens.
+  let total = 0;
+  (function countNodes(n) {
+    total++;
+    let k = null;
+    try { k = n.children; } catch (e) {}
+    if (k) for (const c of k) countNodes(c);
+  })(root);
+  let processed = 0;
+  await sendProgressUpdate(commandId, "get_frame_context", "started", 0, total, 0, "Digesting frame...", null);
+
+  // Per-node work is fully guarded: a single unclassifiable node (widget / a
+  // newer Figma node type whose props throw) is skipped instead of failing the
+  // whole digest.
   async function walk(node) {
-    if (node.visible === false) return null;
-    const lname = String(node.name || "").toLowerCase();
-    if (excludeChrome && chrome.some((c) => lname.indexOf(c) !== -1)) return null;
+    // visibility + chrome filters
+    try {
+      if (node.visible === false) return null;
+      if (excludeChrome && chrome.has(normalizeName(node.name))) return null;
+    } catch (e) {}
 
-    const rec = { id: node.id, name: node.name, type: node.type };
-
-    const box = node.absoluteBoundingBox;
-    if (box) {
-      rec.bounds = {
-        x: Math.round(box.x - rb.x),
-        y: Math.round(box.y - rb.y),
-        w: Math.round(box.width),
-        h: Math.round(box.height),
-      };
+    // node identity — if even this throws, the node is unusable: skip it.
+    let rec;
+    try {
+      rec = { id: node.id, name: node.name, type: node.type };
+    } catch (e) {
+      return null;
     }
 
-    if (node.type === "TEXT") {
+    processed++;
+    if (processed % 50 === 0) {
+      await sendProgressUpdate(
+        commandId, "get_frame_context", "in_progress",
+        Math.min(99, Math.round((processed / total) * 100)),
+        total, processed, `Digested ${processed}/${total} nodes`, null
+      );
+    }
+
+    try {
+      const box = node.absoluteBoundingBox;
+      if (box) {
+        rec.bounds = {
+          x: Math.round(box.x - rb.x),
+          y: Math.round(box.y - rb.y),
+          w: Math.round(box.width),
+          h: Math.round(box.height),
+        };
+      }
+    } catch (e) {}
+
+    if (rec.type === "TEXT") {
       try { rec.characters = node.characters; } catch (e) {}
       try {
         const typ = {
@@ -1259,40 +1305,47 @@ async function getFrameContext(params) {
       } catch (e) {}
     }
 
-    if (node.layoutMode && node.layoutMode !== "NONE") {
-      rec.layout = {
-        flexDirection: node.layoutMode === "HORIZONTAL" ? "row" : "column",
-        gap: node.itemSpacing,
-        padding: {
-          top: node.paddingTop,
-          right: node.paddingRight,
-          bottom: node.paddingBottom,
-          left: node.paddingLeft,
-        },
-        justifyContent: mapPrimaryAxis(node.primaryAxisAlignItems),
-        alignItems: mapCounterAxis(node.counterAxisAlignItems),
-      };
-      if (node.layoutWrap === "WRAP") rec.layout.flexWrap = "wrap";
-    }
+    try {
+      if (node.layoutMode && node.layoutMode !== "NONE") {
+        rec.layout = {
+          flexDirection: node.layoutMode === "HORIZONTAL" ? "row" : "column",
+          gap: node.itemSpacing,
+          padding: {
+            top: node.paddingTop,
+            right: node.paddingRight,
+            bottom: node.paddingBottom,
+            left: node.paddingLeft,
+          },
+          justifyContent: mapPrimaryAxis(node.primaryAxisAlignItems),
+          alignItems: mapCounterAxis(node.counterAxisAlignItems),
+        };
+        if (node.layoutWrap === "WRAP") rec.layout.flexWrap = "wrap";
+      }
+    } catch (e) {}
 
-    if (typeof node.cornerRadius === "number" && node.cornerRadius) {
-      rec.cornerRadius = node.cornerRadius;
-    }
-    if (typeof node.opacity === "number" && node.opacity !== 1) {
-      rec.opacity = node.opacity;
-    }
+    try {
+      if (typeof node.cornerRadius === "number" && node.cornerRadius) {
+        rec.cornerRadius = node.cornerRadius;
+      }
+      if (typeof node.opacity === "number" && node.opacity !== 1) {
+        rec.opacity = node.opacity;
+      }
+    } catch (e) {}
 
-    const tokens = await nodeTokens(node, resolver);
-    if (tokens) rec.tokens = tokens;
+    try {
+      const tokens = await nodeTokens(node, resolver);
+      if (tokens) rec.tokens = tokens;
+    } catch (e) {}
 
-    if (nodeHasImageFill(node)) rec.hasImageFill = true;
+    try { if (nodeHasImageFill(node)) rec.hasImageFill = true; } catch (e) {}
 
     let kids = null;
     try { kids = node.children; } catch (e) {}
     if (kids && kids.length) {
       const arr = [];
       for (const c of kids) {
-        const r = await walk(c);
+        let r = null;
+        try { r = await walk(c); } catch (e) {}
         if (r) arr.push(r);
       }
       if (arr.length) rec.children = arr;
@@ -1302,6 +1355,7 @@ async function getFrameContext(params) {
 
   const tree = await walk(root);
   if (tree && includeHash) tree.subtreeHash = computeSubtreeHash(root);
+  await sendProgressUpdate(commandId, "get_frame_context", "completed", 100, total, processed, "Frame digested", null);
   return tree;
 }
 
@@ -2175,76 +2229,43 @@ function nodeHasImageFill(node) {
   }
 }
 
-// Walk a subtree collecting resolvedHex -> variable token name for every SOLID
-// paint bound to a color variable. The binding can live either on the paint
+// Walk a subtree collecting, in document order, every SOLID paint bound to a
+// color variable: { token, hex, property }. The binding can live on the paint
 // (paint.boundVariables.color) or on the node (node.boundVariables.fills[i]),
-// so we check both. Used to re-tokenize SVG exports.
-async function collectColorTokenMap(node, resolver, map) {
-  const scanPaints = async (paints, nodeLevelAliases) => {
+// so we check both.
+//
+// This is returned as authoritative METADATA — the plugin deliberately does
+// NOT mutate the SVG. Matching resolved hexes against SVG text is lossy: a
+// hard-coded hex that happens to equal a token's color would be wrongly
+// tokenized, and two tokens resolving to the same color are indistinguishable.
+// The caller (sync-figma skill / RN tooling) has the design-system context to
+// inject {{token}} placeholders correctly; we just hand it the facts.
+async function collectColorTokens(node, resolver, out) {
+  const scanPaints = async (paints, nodeLevelAliases, property) => {
     if (!Array.isArray(paints)) return;
     for (let i = 0; i < paints.length; i++) {
       const p = paints[i];
       if (!p || p.type !== "SOLID" || !p.color) continue;
-      let varId =
+      const varId =
         (p.boundVariables && p.boundVariables.color && p.boundVariables.color.id) ||
-        (Array.isArray(nodeLevelAliases) &&
-          nodeLevelAliases[i] &&
-          nodeLevelAliases[i].id);
+        (Array.isArray(nodeLevelAliases) && nodeLevelAliases[i] && nodeLevelAliases[i].id);
       if (!varId) continue;
       const v = await resolver.variable(varId);
-      if (v && v.name) map[rgbToHex6(p.color).toLowerCase()] = v.name;
+      if (v && v.name) {
+        out.push({
+          token: v.name,
+          hex: rgbToHex6(p.color).toLowerCase(),
+          property: property,
+        });
+      }
     }
   };
   const nbv = node.boundVariables || {};
-  try { await scanPaints(node.fills, nbv.fills); } catch (e) {}
-  try { await scanPaints(node.strokes, nbv.strokes); } catch (e) {}
+  try { await scanPaints(node.fills, nbv.fills, "fill"); } catch (e) {}
+  try { await scanPaints(node.strokes, nbv.strokes, "stroke"); } catch (e) {}
   let kids = null;
   try { kids = node.children; } catch (e) {}
-  if (kids) for (const c of kids) await collectColorTokenMap(c, resolver, map);
-}
-
-// Figma's SVG exporter sometimes emits CSS color keywords ("black"/"white") or
-// rgb()/rgba() instead of #rrggbb. Normalize everything to lowercase 6-digit
-// hex so the token map (built from resolved hexes) can match reliably.
-const CSS_NAMED_COLORS = {
-  black: "#000000", silver: "#c0c0c0", gray: "#808080", grey: "#808080",
-  white: "#ffffff", maroon: "#800000", red: "#ff0000", purple: "#800080",
-  fuchsia: "#ff00ff", magenta: "#ff00ff", green: "#008000", lime: "#00ff00",
-  olive: "#808000", yellow: "#ffff00", navy: "#000080", blue: "#0000ff",
-  teal: "#008080", aqua: "#00ffff", cyan: "#00ffff", orange: "#ffa500",
-};
-function normalizeSvgColors(svg) {
-  // CSS keyword in an attribute value: fill="black" / stroke='white' / stop-color="..."
-  for (const name of Object.keys(CSS_NAMED_COLORS)) {
-    const hex = CSS_NAMED_COLORS[name];
-    svg = svg.replace(
-      new RegExp('(["\':])' + name + '(["\';\\s])', "gi"),
-      "$1" + hex + "$2"
-    );
-  }
-  // rgb()/rgba() -> #rrggbb (alpha dropped; Figma uses separate *-opacity attrs)
-  svg = svg.replace(
-    /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*[\d.]+)?\s*\)/gi,
-    function (_m, r, g, b) {
-      return rgbToHex6({ r: r / 255, g: g / 255, b: b / 255 });
-    }
-  );
-  return svg;
-}
-
-// Replace hard-coded hexes in an SVG string with {{tokenName}} placeholders.
-// Unbound paints keep their literal hex. Returns the rewritten svg + token list.
-function applySvgColorTokens(svg, hexToToken) {
-  const usedTokens = [];
-  for (const hex of Object.keys(hexToToken)) {
-    const token = hexToToken[hex];
-    // match #rrggbb case-insensitively, not followed by another hex digit
-    const re = new RegExp(hex + "(?![0-9a-fA-F])", "gi");
-    let replaced = false;
-    svg = svg.replace(re, () => { replaced = true; return "{{" + token + "}}"; });
-    if (replaced && usedTokens.indexOf(token) === -1) usedTokens.push(token);
-  }
-  return { svg: svg, usedTokens: usedTokens };
+  if (kids) for (const c of kids) await collectColorTokens(c, resolver, out);
 }
 
 // UTF-8 encode a string to a Uint8Array (for base64 transport of SVG text).
@@ -2303,7 +2324,11 @@ function computeSubtreeHash(node) {
       }
     } catch (e) {}
     try {
-      line += "|s=" + Math.round(n.width || 0) + "x" + Math.round(n.height || 0);
+      // "?" distinguishes a node without a size from one that is genuinely 0×0,
+      // so they don't hash identically.
+      const w = typeof n.width === "number" ? Math.round(n.width) : "?";
+      const h = typeof n.height === "number" ? Math.round(n.height) : "?";
+      line += "|s=" + w + "x" + h;
     } catch (e) {}
     if (n.visible === false) line += "|hidden";
     lines.push(line);
@@ -2316,7 +2341,7 @@ function computeSubtreeHash(node) {
 }
 
 async function exportNodeAsImage(params) {
-  const { nodeId, scale = 1, tokenizeColors = false } = params || {};
+  const { nodeId, scale = 1, includeColorTokens = false } = params || {};
   let format = ((params && params.format) || "PNG").toString().toUpperCase();
 
   if (!nodeId) {
@@ -2335,25 +2360,26 @@ async function exportNodeAsImage(params) {
   try {
     const base = { nodeId, nodeName: node.name, format, scale };
 
-    // SVG path: export as a string so we can (optionally) re-tokenize colors.
+    // SVG path: always return the real, renderable SVG (resolved colors). When
+    // asked, ALSO return authoritative color-token metadata so the caller can
+    // inject its own {{token}} placeholders — the SVG itself is never mutated.
     if (format === "SVG") {
-      let svg = await node.exportAsync({ format: "SVG_STRING" });
-      let usedTokens = [];
-      if (tokenizeColors) {
-        const resolver = makeDsResolver(true);
-        const map = {};
-        await collectColorTokenMap(node, resolver, map);
-        svg = normalizeSvgColors(svg); // CSS keywords / rgb() -> #rrggbb
-        const t = applySvgColorTokens(svg, map);
-        svg = t.svg;
-        usedTokens = t.usedTokens;
-      }
-      return Object.assign(base, {
+      const svg = await node.exportAsync({ format: "SVG_STRING" });
+      const out = Object.assign(base, {
         mimeType: "image/svg+xml",
         svg: svg,
         imageData: customBase64Encode(utf8ToUint8(svg)),
-        usedTokens: usedTokens,
       });
+      if (includeColorTokens) {
+        const resolver = makeDsResolver(true);
+        const colorTokens = [];
+        await collectColorTokens(node, resolver, colorTokens);
+        out.colorTokens = colorTokens; // ordered [{ token, hex, property }]
+        const seen = [];
+        for (const t of colorTokens) if (seen.indexOf(t.token) === -1) seen.push(t.token);
+        out.usedTokens = seen;
+      }
+      return out;
     }
 
     // Raster / PDF path.
@@ -2373,7 +2399,11 @@ async function exportNodeAsImage(params) {
       mimeType,
       imageData: customBase64Encode(bytes),
     });
-    if (format !== "PDF" && typeof node.width === "number") {
+    if (
+      format !== "PDF" &&
+      typeof node.width === "number" &&
+      typeof node.height === "number"
+    ) {
       out.width = Math.round(node.width * scale);
       out.height = Math.round(node.height * scale);
     }
