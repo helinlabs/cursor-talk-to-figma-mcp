@@ -178,12 +178,14 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getNodeInfo(params.nodeId, params.fields, params.maxDepth);
+      return await getNodeInfo(params.nodeId, params.fields, params.maxDepth, params.includeHash);
+    case "get_frame_context":
+      return await getFrameContext(params);
     case "get_nodes_info":
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
-      return await getNodesInfo(params.nodeIds, params.fields, params.maxDepth);
+      return await getNodesInfo(params.nodeIds, params.fields, params.maxDepth, params.includeHash);
     case "read_my_design":
       return await readMyDesign();
     case "create_rectangle":
@@ -698,11 +700,13 @@ async function getDocumentInfo(params) {
   let childCount = null;
   let childrenReadable = true;
   try {
-    children = page.children.map((node) => ({
-      id: node.id,
-      name: node.name,
-      type: node.type,
-    }));
+    children = page.children.map((node) => {
+      const entry = { id: node.id, name: node.name, type: node.type };
+      // Flag reference captures (image-fill rectangles) so a sync workflow can
+      // auto-separate them from real design frames.
+      if (nodeHasImageFill(node)) entry.hasImageFill = true;
+      return entry;
+    });
     childCount = children.length;
   } catch (e) {
     childrenReadable = false;
@@ -980,6 +984,11 @@ function filterFigmaNode(node, opts) {
   }
 
   if (node.fills && node.fills.length > 0) {
+    // Flag image fills so reference captures (screenshots/pasted images) can be
+    // told apart from real design frames without inspecting raw paint data.
+    if (node.fills.some((f) => f && f.type === "IMAGE")) {
+      filtered.hasImageFill = true;
+    }
     filtered.fills = node.fills.map((fill) => {
       var processedFill = Object.assign({}, fill);
       delete processedFill.boundVariables;
@@ -1065,7 +1074,7 @@ function filterFigmaNode(node, opts) {
 
   // Field selection: keep only id/name/type (+childCount) and requested fields.
   if (fields && fields.length) {
-    var keep = { id: 1, name: 1, type: 1, childCount: 1 };
+    var keep = { id: 1, name: 1, type: 1, childCount: 1, hasImageFill: 1, subtreeHash: 1 };
     for (var fi = 0; fi < fields.length; fi++) keep[fields[fi]] = 1;
     for (var fk in filtered) {
       if (Object.prototype.hasOwnProperty.call(filtered, fk) && !keep[fk]) {
@@ -1077,7 +1086,7 @@ function filterFigmaNode(node, opts) {
   return filtered;
 }
 
-async function getNodeInfo(nodeId, fields, maxDepth) {
+async function getNodeInfo(nodeId, fields, maxDepth, includeHash) {
   const node = await figma.getNodeByIdAsync(nodeId);
 
   if (!node) {
@@ -1088,10 +1097,12 @@ async function getNodeInfo(nodeId, fields, maxDepth) {
     format: "JSON_REST_V1",
   });
 
-  return filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
+  const out = filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
+  if (includeHash && out) out.subtreeHash = computeSubtreeHash(node);
+  return out;
 }
 
-async function getNodesInfo(nodeIds, fields, maxDepth) {
+async function getNodesInfo(nodeIds, fields, maxDepth, includeHash) {
   try {
     // Load all nodes in parallel
     const nodes = await Promise.all(
@@ -1107,9 +1118,11 @@ async function getNodesInfo(nodeIds, fields, maxDepth) {
         const response = await node.exportAsync({
           format: "JSON_REST_V1",
         });
+        const document = filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth });
+        if (includeHash && document) document.subtreeHash = computeSubtreeHash(node);
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document, { fields: fields, maxDepth: maxDepth }),
+          document: document,
         };
       })
     );
@@ -1118,6 +1131,178 @@ async function getNodesInfo(nodeIds, fields, maxDepth) {
   } catch (error) {
     throw new Error(`Error getting nodes info: ${error.message}`);
   }
+}
+
+// ===========================================================================
+// get_frame_context — one-shot, RN-ready digest of a screen subtree
+// ---------------------------------------------------------------------------
+// Returns a pruned node tree (OS chrome + hidden nodes removed) where each node
+// carries only what a React Native implementation needs: relative bounds, text
+// + typography, flex-friendly layout, semantic tokens, and an image-fill flag.
+// Replaces the get_node_info + scan_text_nodes + get_nodes_design_info round
+// trips with a single call.
+
+const DEFAULT_CHROME_NAMES = [
+  "status bar",
+  "home indicator",
+  "keyboard",
+  "notch",
+  "dynamic island",
+];
+
+// Figma auto-layout alignment -> CSS/RN flex equivalents.
+function mapPrimaryAxis(v) {
+  switch (v) {
+    case "MIN": return "flex-start";
+    case "MAX": return "flex-end";
+    case "CENTER": return "center";
+    case "SPACE_BETWEEN": return "space-between";
+    default: return v;
+  }
+}
+function mapCounterAxis(v) {
+  switch (v) {
+    case "MIN": return "flex-start";
+    case "MAX": return "flex-end";
+    case "CENTER": return "center";
+    case "BASELINE": return "baseline";
+    default: return v;
+  }
+}
+
+// Compact, resolved semantic tokens for one node (variable/style NAMES).
+async function nodeTokens(node, resolver) {
+  const tokens = {};
+  try {
+    const bv = await extractBoundVariables(node, resolver); // {prop:[{name,...}]}
+    if (bv) {
+      const pick = (k) => bv[k] && bv[k][0] && bv[k][0].name;
+      const skip = {
+        fills: 1, strokes: 1, cornerRadius: 1,
+        topLeftRadius: 1, topRightRadius: 1,
+        bottomLeftRadius: 1, bottomRightRadius: 1,
+      };
+      const fill = pick("fills"); if (fill) tokens.fill = fill;
+      const stroke = pick("strokes"); if (stroke) tokens.stroke = stroke;
+      const radius =
+        pick("cornerRadius") || pick("topLeftRadius") ||
+        pick("bottomLeftRadius") || pick("topRightRadius") ||
+        pick("bottomRightRadius");
+      if (radius) tokens.radius = radius;
+      // Surface any other bound props (itemSpacing, padding*, fontSize, …).
+      for (const k of Object.keys(bv)) {
+        if (skip[k]) continue;
+        const name = bv[k] && bv[k][0] && bv[k][0].name;
+        if (name && tokens[k] === undefined) tokens[k] = name;
+      }
+    }
+  } catch (e) {}
+  try {
+    const styles = await extractStyleRefs(node, resolver); // {fill,stroke,text,...:{name}}
+    if (styles) {
+      if (styles.text && styles.text.name) tokens.textStyle = styles.text.name;
+      if (!tokens.fill && styles.fill && styles.fill.name) tokens.fillStyle = styles.fill.name;
+      if (!tokens.stroke && styles.stroke && styles.stroke.name) tokens.strokeStyle = styles.stroke.name;
+      if (styles.effect && styles.effect.name) tokens.effectStyle = styles.effect.name;
+    }
+  } catch (e) {}
+  return Object.keys(tokens).length ? tokens : null;
+}
+
+async function getFrameContext(params) {
+  const { nodeId, excludeChrome = true, includeHash = false } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const root = await figma.getNodeByIdAsync(nodeId);
+  if (!root) throw new Error(`Node not found with ID: ${nodeId}`);
+
+  const resolver = makeDsResolver(true);
+  const chrome = (
+    Array.isArray(params && params.chromeNames) && params.chromeNames.length
+      ? params.chromeNames
+      : DEFAULT_CHROME_NAMES
+  ).map((s) => String(s).toLowerCase());
+  const rb = root.absoluteBoundingBox || { x: 0, y: 0 };
+
+  async function walk(node) {
+    if (node.visible === false) return null;
+    const lname = String(node.name || "").toLowerCase();
+    if (excludeChrome && chrome.some((c) => lname.indexOf(c) !== -1)) return null;
+
+    const rec = { id: node.id, name: node.name, type: node.type };
+
+    const box = node.absoluteBoundingBox;
+    if (box) {
+      rec.bounds = {
+        x: Math.round(box.x - rb.x),
+        y: Math.round(box.y - rb.y),
+        w: Math.round(box.width),
+        h: Math.round(box.height),
+      };
+    }
+
+    if (node.type === "TEXT") {
+      try { rec.characters = node.characters; } catch (e) {}
+      try {
+        const typ = {
+          fontSize: typeof node.fontSize === "number" ? node.fontSize : undefined,
+          fontWeight: typeof node.fontWeight === "number" ? node.fontWeight : undefined,
+          letterSpacing: node.letterSpacing,
+          lineHeight: node.lineHeight,
+          textAlignHorizontal: node.textAlignHorizontal,
+          textAlignVertical: node.textAlignVertical,
+        };
+        if (node.fontName && node.fontName.family) {
+          typ.fontFamily = node.fontName.family;
+          typ.fontStyle = node.fontName.style;
+        }
+        rec.typography = typ;
+      } catch (e) {}
+    }
+
+    if (node.layoutMode && node.layoutMode !== "NONE") {
+      rec.layout = {
+        flexDirection: node.layoutMode === "HORIZONTAL" ? "row" : "column",
+        gap: node.itemSpacing,
+        padding: {
+          top: node.paddingTop,
+          right: node.paddingRight,
+          bottom: node.paddingBottom,
+          left: node.paddingLeft,
+        },
+        justifyContent: mapPrimaryAxis(node.primaryAxisAlignItems),
+        alignItems: mapCounterAxis(node.counterAxisAlignItems),
+      };
+      if (node.layoutWrap === "WRAP") rec.layout.flexWrap = "wrap";
+    }
+
+    if (typeof node.cornerRadius === "number" && node.cornerRadius) {
+      rec.cornerRadius = node.cornerRadius;
+    }
+    if (typeof node.opacity === "number" && node.opacity !== 1) {
+      rec.opacity = node.opacity;
+    }
+
+    const tokens = await nodeTokens(node, resolver);
+    if (tokens) rec.tokens = tokens;
+
+    if (nodeHasImageFill(node)) rec.hasImageFill = true;
+
+    let kids = null;
+    try { kids = node.children; } catch (e) {}
+    if (kids && kids.length) {
+      const arr = [];
+      for (const c of kids) {
+        const r = await walk(c);
+        if (r) arr.push(r);
+      }
+      if (arr.length) rec.children = arr;
+    }
+    return rec;
+  }
+
+  const tree = await walk(root);
+  if (tree && includeHash) tree.subtreeHash = computeSubtreeHash(root);
+  return tree;
 }
 
 async function getReactions(nodeIds) {
@@ -1969,10 +2154,170 @@ async function createComponentInstance(params) {
   }
 }
 
-async function exportNodeAsImage(params) {
-  const { nodeId, scale = 1 } = params || {};
+// 6-digit lowercase hex from a Figma RGBA (0..1). Matches Figma's SVG output,
+// which uses #rrggbb + a separate fill-opacity (alpha is ignored here).
+function rgbToHex6(c) {
+  const h = (x) => Math.round((x || 0) * 255).toString(16).padStart(2, "0");
+  return "#" + h(c.r) + h(c.g) + h(c.b);
+}
 
-  const format = "PNG";
+// True if a live node paints any IMAGE fill (used to flag reference captures
+// like screenshots / pasted images vs. real design frames).
+function nodeHasImageFill(node) {
+  try {
+    const fills = node.fills;
+    return (
+      Array.isArray(fills) &&
+      fills.some((p) => p && p.type === "IMAGE" && p.visible !== false)
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+// Walk a subtree collecting resolvedHex -> variable token name for every SOLID
+// paint bound to a color variable. The binding can live either on the paint
+// (paint.boundVariables.color) or on the node (node.boundVariables.fills[i]),
+// so we check both. Used to re-tokenize SVG exports.
+async function collectColorTokenMap(node, resolver, map) {
+  const scanPaints = async (paints, nodeLevelAliases) => {
+    if (!Array.isArray(paints)) return;
+    for (let i = 0; i < paints.length; i++) {
+      const p = paints[i];
+      if (!p || p.type !== "SOLID" || !p.color) continue;
+      let varId =
+        (p.boundVariables && p.boundVariables.color && p.boundVariables.color.id) ||
+        (Array.isArray(nodeLevelAliases) &&
+          nodeLevelAliases[i] &&
+          nodeLevelAliases[i].id);
+      if (!varId) continue;
+      const v = await resolver.variable(varId);
+      if (v && v.name) map[rgbToHex6(p.color).toLowerCase()] = v.name;
+    }
+  };
+  const nbv = node.boundVariables || {};
+  try { await scanPaints(node.fills, nbv.fills); } catch (e) {}
+  try { await scanPaints(node.strokes, nbv.strokes); } catch (e) {}
+  let kids = null;
+  try { kids = node.children; } catch (e) {}
+  if (kids) for (const c of kids) await collectColorTokenMap(c, resolver, map);
+}
+
+// Figma's SVG exporter sometimes emits CSS color keywords ("black"/"white") or
+// rgb()/rgba() instead of #rrggbb. Normalize everything to lowercase 6-digit
+// hex so the token map (built from resolved hexes) can match reliably.
+const CSS_NAMED_COLORS = {
+  black: "#000000", silver: "#c0c0c0", gray: "#808080", grey: "#808080",
+  white: "#ffffff", maroon: "#800000", red: "#ff0000", purple: "#800080",
+  fuchsia: "#ff00ff", magenta: "#ff00ff", green: "#008000", lime: "#00ff00",
+  olive: "#808000", yellow: "#ffff00", navy: "#000080", blue: "#0000ff",
+  teal: "#008080", aqua: "#00ffff", cyan: "#00ffff", orange: "#ffa500",
+};
+function normalizeSvgColors(svg) {
+  // CSS keyword in an attribute value: fill="black" / stroke='white' / stop-color="..."
+  for (const name of Object.keys(CSS_NAMED_COLORS)) {
+    const hex = CSS_NAMED_COLORS[name];
+    svg = svg.replace(
+      new RegExp('(["\':])' + name + '(["\';\\s])', "gi"),
+      "$1" + hex + "$2"
+    );
+  }
+  // rgb()/rgba() -> #rrggbb (alpha dropped; Figma uses separate *-opacity attrs)
+  svg = svg.replace(
+    /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*[\d.]+)?\s*\)/gi,
+    function (_m, r, g, b) {
+      return rgbToHex6({ r: r / 255, g: g / 255, b: b / 255 });
+    }
+  );
+  return svg;
+}
+
+// Replace hard-coded hexes in an SVG string with {{tokenName}} placeholders.
+// Unbound paints keep their literal hex. Returns the rewritten svg + token list.
+function applySvgColorTokens(svg, hexToToken) {
+  const usedTokens = [];
+  for (const hex of Object.keys(hexToToken)) {
+    const token = hexToToken[hex];
+    // match #rrggbb case-insensitively, not followed by another hex digit
+    const re = new RegExp(hex + "(?![0-9a-fA-F])", "gi");
+    let replaced = false;
+    svg = svg.replace(re, () => { replaced = true; return "{{" + token + "}}"; });
+    if (replaced && usedTokens.indexOf(token) === -1) usedTokens.push(token);
+  }
+  return { svg: svg, usedTokens: usedTokens };
+}
+
+// UTF-8 encode a string to a Uint8Array (for base64 transport of SVG text).
+function utf8ToUint8(str) {
+  const enc = encodeURIComponent(str);
+  const out = [];
+  for (let i = 0; i < enc.length; i++) {
+    if (enc[i] === "%") {
+      out.push(parseInt(enc.substr(i + 1, 2), 16));
+      i += 2;
+    } else {
+      out.push(enc.charCodeAt(i));
+    }
+  }
+  return new Uint8Array(out);
+}
+
+// cyrb53 — fast, well-distributed string hash. Deterministic (no Date/random),
+// so identical input always yields the identical hash.
+function cyrb53(str, seed) {
+  let h1 = 0xdeadbeef ^ (seed || 0);
+  let h2 = 0x41c6ce57 ^ (seed || 0);
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const out = 4294967296 * (2097151 & h2) + (h1 >>> 0);
+  return out.toString(16);
+}
+
+// Stable structural hash of a node's subtree: child structure/order, text
+// characters, bound variable ids, and rounded SIZE (not absolute position, so
+// relocating the whole frame doesn't change it). Same content -> same hash.
+function computeSubtreeHash(node) {
+  const lines = [];
+  function walk(n, depth) {
+    let line = depth + ":" + n.type;
+    try {
+      if (n.type === "TEXT" && typeof n.characters === "string")
+        line += "|t=" + n.characters;
+    } catch (e) {}
+    try {
+      const bv = n.boundVariables;
+      if (bv && typeof bv === "object") {
+        const keys = Object.keys(bv).sort();
+        for (const k of keys) {
+          const val = bv[k];
+          const arr = Array.isArray(val) ? val : [val];
+          line += "|" + k + "=" + arr.map((a) => (a && a.id) || "").join(",");
+        }
+      }
+    } catch (e) {}
+    try {
+      line += "|s=" + Math.round(n.width || 0) + "x" + Math.round(n.height || 0);
+    } catch (e) {}
+    if (n.visible === false) line += "|hidden";
+    lines.push(line);
+    let kids = null;
+    try { kids = n.children; } catch (e) {}
+    if (kids) for (const c of kids) walk(c, depth + 1);
+  }
+  walk(node, 0);
+  return cyrb53(lines.join("\n"));
+}
+
+async function exportNodeAsImage(params) {
+  const { nodeId, scale = 1, tokenizeColors = false } = params || {};
+  let format = ((params && params.format) || "PNG").toString().toUpperCase();
 
   if (!nodeId) {
     throw new Error("Missing nodeId parameter");
@@ -1988,42 +2333,51 @@ async function exportNodeAsImage(params) {
   }
 
   try {
+    const base = { nodeId, nodeName: node.name, format, scale };
+
+    // SVG path: export as a string so we can (optionally) re-tokenize colors.
+    if (format === "SVG") {
+      let svg = await node.exportAsync({ format: "SVG_STRING" });
+      let usedTokens = [];
+      if (tokenizeColors) {
+        const resolver = makeDsResolver(true);
+        const map = {};
+        await collectColorTokenMap(node, resolver, map);
+        svg = normalizeSvgColors(svg); // CSS keywords / rgb() -> #rrggbb
+        const t = applySvgColorTokens(svg, map);
+        svg = t.svg;
+        usedTokens = t.usedTokens;
+      }
+      return Object.assign(base, {
+        mimeType: "image/svg+xml",
+        svg: svg,
+        imageData: customBase64Encode(utf8ToUint8(svg)),
+        usedTokens: usedTokens,
+      });
+    }
+
+    // Raster / PDF path.
     const settings = {
       format: format,
       constraint: { type: "SCALE", value: scale },
     };
-
     const bytes = await node.exportAsync(settings);
+    const mimeType =
+      format === "JPG"
+        ? "image/jpeg"
+        : format === "PDF"
+        ? "application/pdf"
+        : "image/png";
 
-    let mimeType;
-    switch (format) {
-      case "PNG":
-        mimeType = "image/png";
-        break;
-      case "JPG":
-        mimeType = "image/jpeg";
-        break;
-      case "SVG":
-        mimeType = "image/svg+xml";
-        break;
-      case "PDF":
-        mimeType = "application/pdf";
-        break;
-      default:
-        mimeType = "application/octet-stream";
-    }
-
-    // Proper way to convert Uint8Array to base64
-    const base64 = customBase64Encode(bytes);
-    // const imageData = `data:${mimeType};base64,${base64}`;
-
-    return {
-      nodeId,
-      format,
-      scale,
+    const out = Object.assign(base, {
       mimeType,
-      imageData: base64,
-    };
+      imageData: customBase64Encode(bytes),
+    });
+    if (format !== "PDF" && typeof node.width === "number") {
+      out.width = Math.round(node.width * scale);
+      out.height = Math.round(node.height * scale);
+    }
+    return out;
   } catch (error) {
     throw new Error(`Error exporting node as image: ${error.message}`);
   }
