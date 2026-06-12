@@ -670,19 +670,28 @@ async function getDocumentInfo(params) {
     }
   }
   await page.loadAsync();
+  // Reading .children can throw ("Unknown node type ... getPublicNodeType") if
+  // the page contains a node type this plugin API version can't classify;
+  // degrade gracefully instead of failing the whole call.
+  let children = [];
+  let childCount = null;
+  try {
+    children = page.children.map((node) => ({
+      id: node.id,
+      name: node.name,
+      type: node.type,
+    }));
+    childCount = children.length;
+  } catch (e) {}
   return {
     name: page.name,
     id: page.id,
     type: page.type,
-    children: page.children.map((node) => ({
-      id: node.id,
-      name: node.name,
-      type: node.type,
-    })),
+    children: children,
     currentPage: {
       id: page.id,
       name: page.name,
-      childCount: page.children.length,
+      childCount: childCount,
     },
     // All pages in the file (names/ids) so other pages are discoverable.
     pages: figma.root.children.map((p) => ({ id: p.id, name: p.name })),
@@ -694,11 +703,18 @@ async function listPages() {
   await figma.loadAllPagesAsync();
   return {
     currentPageId: figma.currentPage.id,
-    pages: figma.root.children.map((p) => ({
-      id: p.id,
-      name: p.name,
-      childCount: p.children.length,
-    })),
+    pages: figma.root.children.map((p) => {
+      const entry = { id: p.id, name: p.name };
+      // Reading .children can throw ("Unknown node type ... getPublicNodeType")
+      // when a page contains a node type this plugin API version can't classify
+      // (e.g. a widget). childCount is best-effort.
+      try {
+        entry.childCount = p.children.length;
+      } catch (e) {
+        entry.childCount = null;
+      }
+      return entry;
+    }),
   };
 }
 
