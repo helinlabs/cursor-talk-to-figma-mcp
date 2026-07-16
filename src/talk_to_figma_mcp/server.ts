@@ -265,20 +265,22 @@ server.tool(
 // Frame Context Tool — one-shot, RN-ready digest of a screen subtree
 server.tool(
   "get_frame_context",
-  "Get a single, pruned, RN-ready digest of a frame's subtree — replaces the get_node_info + scan_text_nodes + get_nodes_design_info round-trips. OS chrome (Status Bar / Home Indicator / Keyboard / Notch / Dynamic Island) and hidden nodes are dropped; each remaining node carries only relative bounds, text + typography, flex-friendly layout (flexDirection/gap/padding/justify/align), resolved semantic tokens (fill/stroke/radius/textStyle…), and a hasImageFill flag. Call it on a screen frame and write the spec from the one response.",
+  "Get a single, pruned, RN-ready digest of a frame's subtree — replaces the get_node_info + scan_text_nodes + get_nodes_design_info round-trips. OS chrome (Status Bar / Home Indicator / Keyboard / Notch / Dynamic Island) and hidden nodes are dropped; each remaining node carries only relative bounds, text + typography, flex-friendly layout (flexDirection/gap/padding/justify/align), resolved semantic tokens (fill/stroke/radius/textStyle…), and a hasImageFill flag. Call it on a screen frame and write the spec from the one response. For very deep/large screens, pass `maxDepth` to cap traversal — nodes cut off by the limit still appear but carry `childCount` + `truncated: true` so you can drill into them with a follow-up call.",
   {
     nodeId: z.string().describe("The ID of the frame/screen node to digest"),
     excludeChrome: z.boolean().optional().describe("Drop OS chrome + hidden nodes (default true). Set false to keep everything."),
     chromeNames: z.array(z.string()).optional().describe("Override the default chrome name list (case-insensitive substring match)."),
     includeHash: z.boolean().optional().describe("Also include a stable `subtreeHash` at the root for change detection."),
+    maxDepth: z.number().int().min(0).optional().describe("Max levels of children to digest. 0 = root only, 1 = direct children, etc. Omit for the full subtree. Use this when a deep screen makes the response too large or times out."),
   },
-  async ({ nodeId, excludeChrome, chromeNames, includeHash }: any) => {
+  async ({ nodeId, excludeChrome, chromeNames, includeHash, maxDepth }: any) => {
     try {
       const result = await sendCommandToFigma("get_frame_context", {
         nodeId,
         excludeChrome: excludeChrome === undefined ? true : excludeChrome,
         chromeNames,
         includeHash: !!includeHash,
+        maxDepth,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
@@ -2321,13 +2323,14 @@ server.tool(
 // A tool to get Figma Prototyping Reactions from multiple nodes
 server.tool(
   "get_reactions",
-  "Get Figma Prototyping Reactions from multiple nodes. CRITICAL: The output MUST be processed using the 'reaction_to_connector_strategy' prompt IMMEDIATELY to generate parameters for connector lines via the 'create_connections' tool.",
+  "Get Figma Prototyping Reactions from multiple nodes. Searches each node and its descendants. For deeply nested nodes, pass `maxDepth` to cap how far the search recurses (an unbounded deep scan can time out). CRITICAL: The output MUST be processed using the 'reaction_to_connector_strategy' prompt IMMEDIATELY to generate parameters for connector lines via the 'create_connections' tool.",
   {
     nodeIds: z.array(z.string()).describe("Array of node IDs to get reactions from"),
+    maxDepth: z.number().int().min(0).optional().describe("Max levels below each given node to search for reactions. 0 = the given node only, 1 = its direct children, etc. Omit to search the full subtree. Use this when a deep node makes the scan time out."),
   },
-  async ({ nodeIds }: any) => {
+  async ({ nodeIds, maxDepth }: any) => {
     try {
-      const result = await sendCommandToFigma("get_reactions", { nodeIds });
+      const result = await sendCommandToFigma("get_reactions", { nodeIds, maxDepth });
       return {
         content: [
           {
@@ -2646,6 +2649,13 @@ type CommandParams = {
   get_selection: Record<string, never>;
   get_node_info: { nodeId: string };
   get_nodes_info: { nodeIds: string[] };
+  get_frame_context: {
+    nodeId: string;
+    excludeChrome?: boolean;
+    chromeNames?: string[];
+    includeHash?: boolean;
+    maxDepth?: number;
+  };
   create_rectangle: {
     x: number;
     y: number;
@@ -2771,7 +2781,7 @@ type CommandParams = {
     nodeId: string;
     types: Array<string>;
   };
-  get_reactions: { nodeIds: string[] };
+  get_reactions: { nodeIds: string[]; maxDepth?: number };
   set_default_connector: {
     connectorId?: string | undefined;
   };

@@ -291,7 +291,7 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
-      return await getReactions(params.nodeIds);  
+      return await getReactions(params.nodeIds, params.maxDepth);
     case "set_default_connector":
       return await setDefaultConnector(params);
     case "create_connections":
@@ -1223,6 +1223,14 @@ async function getFrameContext(params) {
   const root = await figma.getNodeByIdAsync(nodeId);
   if (!root) throw new Error(`Node not found with ID: ${nodeId}`);
 
+  // Max levels of children to expand (undefined = unlimited). Matches the
+  // filterFigmaNode / get_node_info convention: expand while depth < maxDepth.
+  // Nodes cut off by the limit still appear, tagged with childCount + truncated.
+  const maxDepth =
+    params && Number.isFinite(params.maxDepth)
+      ? Math.max(0, Math.floor(params.maxDepth))
+      : undefined;
+
   const commandId = (params && params.commandId) || generateCommandId();
   const resolver = makeDsResolver(true);
   // Exact (normalized) chrome match — see normalizeName.
@@ -1250,7 +1258,7 @@ async function getFrameContext(params) {
   // Per-node work is fully guarded: a single unclassifiable node (widget / a
   // newer Figma node type whose props throw) is skipped instead of failing the
   // whole digest.
-  async function walk(node) {
+  async function walk(node, depth) {
     // visibility + chrome filters
     try {
       if (node.visible === false) return null;
@@ -1342,26 +1350,42 @@ async function getFrameContext(params) {
     let kids = null;
     try { kids = node.children; } catch (e) {}
     if (kids && kids.length) {
-      const arr = [];
-      for (const c of kids) {
-        let r = null;
-        try { r = await walk(c); } catch (e) {}
-        if (r) arr.push(r);
+      if (maxDepth !== undefined && depth >= maxDepth) {
+        // Depth limit reached: don't descend. Surface the raw child count and a
+        // truncated flag so the caller knows to re-digest this node deeper.
+        rec.childCount = kids.length;
+        rec.truncated = true;
+      } else {
+        const arr = [];
+        for (const c of kids) {
+          let r = null;
+          try { r = await walk(c, depth + 1); } catch (e) {}
+          if (r) arr.push(r);
+        }
+        if (arr.length) rec.children = arr;
       }
-      if (arr.length) rec.children = arr;
     }
     return rec;
   }
 
-  const tree = await walk(root);
+  const tree = await walk(root, 0);
   if (tree && includeHash) tree.subtreeHash = computeSubtreeHash(root);
   await sendProgressUpdate(commandId, "get_frame_context", "completed", 100, total, processed, "Frame digested", null);
   return tree;
 }
 
-async function getReactions(nodeIds) {
+async function getReactions(nodeIds, maxDepthParam) {
   try {
     const commandId = generateCommandId();
+    // Max levels below each given node to search (undefined = unlimited).
+    // Same convention as get_node_info: recurse while depth < maxDepth.
+    const maxDepth = Number.isFinite(maxDepthParam)
+      ? Math.max(0, Math.floor(maxDepthParam))
+      : undefined;
+    // Count of nodes visited across the whole scan — used to emit periodic
+    // progress updates so a single deep node doesn't starve the inactivity
+    // timer (which otherwise fires only once per top-level nodeId).
+    let visited = 0;
     sendProgressUpdate(
       commandId,
       "get_reactions",
@@ -1369,7 +1393,8 @@ async function getReactions(nodeIds) {
       0,
       nodeIds.length,
       0,
-      `Starting deep search for reactions in ${nodeIds.length} nodes and their children`
+      `Starting deep search for reactions in ${nodeIds.length} nodes and their children` +
+        (maxDepth !== undefined ? ` (maxDepth ${maxDepth})` : "")
     );
 
     // Function to find nodes with reactions from the node and all its children
@@ -1378,9 +1403,23 @@ async function getReactions(nodeIds) {
       if (processedNodes.has(node.id)) {
         return results;
       }
-      
+
       processedNodes.add(node.id);
-      
+
+      // Keep the inactivity timer alive during a long deep scan.
+      visited++;
+      if (visited % 500 === 0) {
+        await sendProgressUpdate(
+          commandId,
+          "get_reactions",
+          "in_progress",
+          0,
+          nodeIds.length,
+          0,
+          `Scanning… visited ${visited} nodes, found ${results.length} with reactions`
+        );
+      }
+
       // Check if the current node has reactions
       let filteredReactions = [];
       if (node.reactions && node.reactions.length > 0) {
@@ -1412,13 +1451,14 @@ async function getReactions(nodeIds) {
         await highlightNodeWithAnimation(node);
       }
       
-      // If node has children, recursively search them
-      if (node.children) {
+      // If node has children, recursively search them — but stop descending once
+      // the depth limit is reached (undefined = unlimited).
+      if (node.children && (maxDepth === undefined || depth < maxDepth)) {
         for (const child of node.children) {
           await findNodesWithReactions(child, processedNodes, depth + 1, results);
         }
       }
-      
+
       return results;
     }
     
