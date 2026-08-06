@@ -470,6 +470,44 @@ server.tool(
   }
 );
 server.tool(
+  "set_image_fill_from_node",
+  "Bake one node into another node's IMAGE fill: exports `sourceNodeId` as PNG and sets it as the fill of `targetNodeId`. Both steps run inside the plugin, so no image bytes cross the socket (a screenshot is megabytes \u2014 base64 over the relay hits message limits). **The target's transform is preserved** \u2014 only `fills` changes, so a rotated/masked mockup keeps its angle and clipping. That is the point: use it to drop a live app-screen frame into the `Screen` rectangle of an angled device mockup, which cannot be done by moving/rotating a frame into place (the API exposes no rotation read or write).",
+  {
+    sourceNodeId: import_zod.z.string().describe("Node to render (e.g. a live app-screen frame)"),
+    targetNodeId: import_zod.z.string().describe("Node whose fill is replaced (must support fills, e.g. the mockup's Screen rectangle)"),
+    scale: import_zod.z.number().positive().optional().describe("Export scale for the source render (default 2). Raise it if the target is large on screen."),
+    scaleMode: import_zod.z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("How the image sits in the target (default FILL)")
+  },
+  async ({ sourceNodeId, targetNodeId, scale, scaleMode }) => {
+    try {
+      const result = await sendCommandToFigma("set_image_fill_from_node", {
+        sourceNodeId,
+        targetNodeId,
+        scale: scale || 2,
+        scaleMode: scaleMode || "FILL"
+      });
+      const typed = result;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Baked "${typed.sourceName}" into "${typed.targetName}" as ${typed.scaleMode} image fill (${typed.bytes} bytes). Target transform unchanged.`
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error setting image fill: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+server.tool(
   "set_stroke_color",
   "Set the stroke color of a node in Figma",
   {

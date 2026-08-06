@@ -196,6 +196,8 @@ async function handleCommand(command, params) {
       return await createText(params);
     case "set_fill_color":
       return await setFillColor(params);
+    case "set_image_fill_from_node":
+      return await setImageFillFromNode(params);
     case "set_stroke_color":
       return await setStrokeColor(params);
     case "move_node":
@@ -1914,6 +1916,74 @@ async function setFillColor(params) {
     id: node.id,
     name: node.name,
     fills: [paintStyle],
+  };
+}
+
+/**
+ * 소스 노드를 PNG 로 구워 타깃 노드의 **이미지 fill** 로 넣는다.
+ *
+ * 왜 "노드 → 노드" 인가:
+ *  - 바이트가 소켓을 건너지 않는다. 스크린샷 한 장이 수 MB 라 base64 로 실어 나르면
+ *    릴레이 메시지 상한에 걸리기 쉽다. export 와 createImage 를 **둘 다 플러그인 안에서** 한다.
+ *  - **타깃의 변형(회전·마스크)이 그대로 보존된다.** fills 만 바꾸므로 rotation /
+ *    relativeTransform 을 읽거나 쓸 필요가 없다 — 플러그인 API 밖에 있는 그 값들을
+ *    건드리지 않고도 목업 안의 화면을 교체할 수 있다.
+ *
+ * 목업(기울어진 폰) 안의 `Screen` 사각형에 앱 화면 프레임을 넣는 용도로 만들었다.
+ */
+async function setImageFillFromNode(params) {
+  const {
+    sourceNodeId,
+    targetNodeId,
+    scale = 2,
+    scaleMode = "FILL",
+  } = params || {};
+
+  if (!sourceNodeId) throw new Error("Missing sourceNodeId parameter");
+  if (!targetNodeId) throw new Error("Missing targetNodeId parameter");
+
+  const source = await figma.getNodeByIdAsync(sourceNodeId);
+  if (!source) throw new Error(`Source node not found: ${sourceNodeId}`);
+  if (!("exportAsync" in source)) {
+    throw new Error(`Source node does not support exporting: ${sourceNodeId}`);
+  }
+
+  const target = await figma.getNodeByIdAsync(targetNodeId);
+  if (!target) throw new Error(`Target node not found: ${targetNodeId}`);
+  if (!("fills" in target)) {
+    throw new Error(`Target node does not support fills: ${targetNodeId}`);
+  }
+
+  const validModes = ["FILL", "FIT", "CROP", "TILE"];
+  if (validModes.indexOf(scaleMode) === -1) {
+    throw new Error(`Invalid scaleMode: ${scaleMode} (${validModes.join(" | ")})`);
+  }
+
+  const bytes = await source.exportAsync({
+    format: "PNG",
+    constraint: { type: "SCALE", value: scale },
+  });
+
+  const image = figma.createImage(bytes);
+
+  // 기존 fill 을 통째로 갈아끼운다 — 이미지 fill 이 이미 있으면 그게 화면이었다.
+  target.fills = [
+    {
+      type: "IMAGE",
+      scaleMode: scaleMode,
+      imageHash: image.hash,
+    },
+  ];
+
+  return {
+    sourceId: source.id,
+    sourceName: source.name,
+    targetId: target.id,
+    targetName: target.name,
+    imageHash: image.hash,
+    bytes: bytes.length,
+    scale: scale,
+    scaleMode: scaleMode,
   };
 }
 
