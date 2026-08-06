@@ -590,33 +590,41 @@ server.tool(
 // Set Image Fill From Node Tool
 server.tool(
   "set_image_fill_from_node",
-  "Bake one node into another node's IMAGE fill: exports `sourceNodeId` as PNG and sets it as the fill of `targetNodeId`. " +
+  "Swap the picture inside another node: exports `sourceNodeId` as PNG and puts it in `targetNodeId`'s IMAGE fill. " +
   "Both steps run inside the plugin, so no image bytes cross the socket (a screenshot is megabytes — base64 over the relay hits message limits). " +
-  "**The target's transform is preserved** — only `fills` changes, so a rotated/masked mockup keeps its angle and clipping. " +
-  "That is the point: use it to drop a live app-screen frame into the `Screen` rectangle of an angled device mockup, " +
-  "which cannot be done by moving/rotating a frame into place (the API exposes no rotation read or write).",
+  "**Geometry is inherited, not rebuilt.** If the target already has an IMAGE fill, only its `imageHash` changes — `scaleMode`, `imageTransform`, rotation and filters are kept. " +
+  "That matters for device mockups: the screen slot is an axis-aligned node whose tilt lives in the paint's `imageTransform`, so building a fresh paint would leave an upright screenshot merely cropped to a slanted path, not matching the device angle. " +
+  "The target's own transform (rotation, masks) is untouched either way, since only `fills` is written. " +
+  "Typical use: drop a localized app-screen frame into a mockup's `Paste content here` slot. " +
+  "⚠️ Enumerate a mockup's children with `scan_nodes_by_types`, not `get_node_info` — mask layers are omitted from `children`, so the real content slot can be invisible there.",
   {
     sourceNodeId: z.string().describe("Node to render (e.g. a live app-screen frame)"),
-    targetNodeId: z.string().describe("Node whose fill is replaced (must support fills, e.g. the mockup's Screen rectangle)"),
-    scale: z.number().positive().optional().describe("Export scale for the source render (default 2). Raise it if the target is large on screen."),
-    scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("How the image sits in the target (default FILL)"),
+    targetNodeId: z.string().describe("Node whose picture is replaced — the mockup's content slot, NOT its mask"),
+    scale: z.number().positive().optional().describe("Export scale for the source render (default 2). Figma rejects images over 4096px on a side, so keep width*scale and height*scale under that."),
+    scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("Override the fill mode. Omit to keep the target's existing mode — required for mockups, whose slots use CROP with an imageTransform."),
+    replacePaint: z.boolean().optional().describe("Discard the existing paint instead of inheriting it. Drops imageTransform — only for slots that have no geometry to keep."),
   },
-  async ({ sourceNodeId, targetNodeId, scale, scaleMode }: any) => {
+  async ({ sourceNodeId, targetNodeId, scale, scaleMode, replacePaint }: any) => {
     try {
       const result = await sendCommandToFigma("set_image_fill_from_node", {
         sourceNodeId,
         targetNodeId,
         scale: scale || 2,
-        scaleMode: scaleMode || "FILL",
+        scaleMode,
+        replacePaint: replacePaint || false,
       });
       const typed = result as {
         sourceName: string; targetName: string; bytes: number; scaleMode: string;
+        inheritedGeometry: { scaleMode: string; hasImageTransform: boolean } | null;
       };
+      const geom = typed.inheritedGeometry
+        ? `inherited ${typed.inheritedGeometry.scaleMode}${typed.inheritedGeometry.hasImageTransform ? " + imageTransform" : ""}`
+        : "new paint (no geometry inherited — check the device angle)";
       return {
         content: [
           {
             type: "text",
-            text: `Baked "${typed.sourceName}" into "${typed.targetName}" as ${typed.scaleMode} image fill (${typed.bytes} bytes). Target transform unchanged.`,
+            text: `Swapped "${typed.sourceName}" into "${typed.targetName}" (${typed.bytes} bytes, ${typed.scaleMode}, ${geom}).`,
           },
         ],
       };

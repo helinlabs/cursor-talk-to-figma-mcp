@@ -1936,7 +1936,8 @@ async function setImageFillFromNode(params) {
     sourceNodeId,
     targetNodeId,
     scale = 2,
-    scaleMode = "FILL",
+    scaleMode,
+    replacePaint = false,
   } = params || {};
 
   if (!sourceNodeId) throw new Error("Missing sourceNodeId parameter");
@@ -1955,7 +1956,7 @@ async function setImageFillFromNode(params) {
   }
 
   const validModes = ["FILL", "FIT", "CROP", "TILE"];
-  if (validModes.indexOf(scaleMode) === -1) {
+  if (scaleMode && validModes.indexOf(scaleMode) === -1) {
     throw new Error(`Invalid scaleMode: ${scaleMode} (${validModes.join(" | ")})`);
   }
 
@@ -1966,14 +1967,42 @@ async function setImageFillFromNode(params) {
 
   const image = figma.createImage(bytes);
 
-  // 기존 fill 을 통째로 갈아끼운다 — 이미지 fill 이 이미 있으면 그게 화면이었다.
-  target.fills = [
-    {
+  const fills = Array.isArray(target.fills) ? target.fills.slice() : [];
+  const index = fills.findIndex((f) => f && f.type === "IMAGE");
+  const existing = index !== -1 ? fills[index] : null;
+
+  let paint;
+  let preserved;
+  if (existing && !replacePaint) {
+    // ⚠️ 기존 paint 의 **기하를 그대로 물려받고 픽셀만 갈아끼운다.**
+    //
+    // 목업의 화면 자리(보통 "Paste content here" 라는 벡터)는 축에 정렬된 노드이고,
+    // 기기 기울기는 `scaleMode:"CROP"` + `imageTransform`(2×3 아핀) 으로 표현돼 있다.
+    // paint 를 통째로 새로 만들면 그 행렬이 날아가서, 똑바른 이미지가 기울어진 패스로
+    // **크롭만** 된 그림이 나온다(기기 각도와 안 맞는다).
+    //
+    // 우리는 같은 자리에 다른 스크린샷을 넣을 뿐이므로 기하는 바뀔 이유가 없다.
+    // imageHash 만 바꾸면 회전·기울기·크롭·필터가 전부 유지된다.
+    paint = Object.assign({}, existing, { imageHash: image.hash });
+    if (scaleMode) paint.scaleMode = scaleMode;
+    preserved = {
+      scaleMode: existing.scaleMode,
+      hasImageTransform: !!existing.imageTransform,
+      rotation: existing.rotation,
+    };
+    fills[index] = paint;
+  } else {
+    paint = {
       type: "IMAGE",
-      scaleMode: scaleMode,
+      scaleMode: scaleMode || "FILL",
       imageHash: image.hash,
-    },
-  ];
+    };
+    preserved = null;
+    if (index !== -1) fills[index] = paint;
+    else fills.push(paint);
+  }
+
+  target.fills = fills;
 
   return {
     sourceId: source.id,
@@ -1983,7 +2012,9 @@ async function setImageFillFromNode(params) {
     imageHash: image.hash,
     bytes: bytes.length,
     scale: scale,
-    scaleMode: scaleMode,
+    scaleMode: paint.scaleMode,
+    // 기존 paint 를 물려받았는지 — 물려받지 못했다면 기기 각도와 안 맞을 수 있다.
+    inheritedGeometry: preserved,
   };
 }
 
