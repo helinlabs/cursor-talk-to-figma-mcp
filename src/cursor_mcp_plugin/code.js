@@ -198,6 +198,10 @@ async function handleCommand(command, params) {
       return await setFillColor(params);
     case "set_image_fill_from_node":
       return await setImageFillFromNode(params);
+    case "get_node_geometry":
+      return await getNodeGeometry(params);
+    case "set_image_fill_from_bytes":
+      return await setImageFillFromBytes(params);
     case "set_stroke_color":
       return await setStrokeColor(params);
     case "move_node":
@@ -1983,8 +1987,10 @@ async function setImageFillFromNode(params) {
     //
     // 우리는 같은 자리에 다른 스크린샷을 넣을 뿐이므로 기하는 바뀔 이유가 없다.
     // imageHash 만 바꾸면 회전·기울기·크롭·필터가 전부 유지된다.
+    // ⚠️ scaleMode 는 **일부러 무시한다.** 물려받기의 요점이 "픽셀만 바꾼다" 인데,
+    // FILL/FIT 로 덮으면 Figma 가 imageTransform 을 무시해 기울기가 날아간다.
+    // 모드를 정말 바꿔야 하면 replacePaint 로 새 paint 를 만들 것.
     paint = Object.assign({}, existing, { imageHash: image.hash });
-    if (scaleMode) paint.scaleMode = scaleMode;
     preserved = {
       scaleMode: existing.scaleMode,
       hasImageTransform: !!existing.imageTransform,
@@ -2015,6 +2021,115 @@ async function setImageFillFromNode(params) {
     scaleMode: paint.scaleMode,
     // 기존 paint 를 물려받았는지 — 물려받지 못했다면 기기 각도와 안 맞을 수 있다.
     inheritedGeometry: preserved,
+  };
+}
+
+function base64ToUint8Array(base64) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = String(base64).replace(/[^A-Za-z0-9+/]/g, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let p = 0;
+  for (let i = 0; i < clean.length; i += 4) {
+    const n =
+      (chars.indexOf(clean[i]) << 18) |
+      (chars.indexOf(clean[i + 1]) << 12) |
+      ((clean[i + 2] ? chars.indexOf(clean[i + 2]) : 0) << 6) |
+      (clean[i + 3] ? chars.indexOf(clean[i + 3]) : 0);
+    out[p++] = (n >> 16) & 255;
+    if (clean[i + 2]) out[p++] = (n >> 8) & 255;
+    if (clean[i + 3]) out[p++] = n & 255;
+  }
+  return out.subarray(0, p);
+}
+
+/**
+ * 노드의 기하 — **기울어진 목업 슬롯의 네 꼭짓점**을 얻는 용도.
+ *
+ * Figma 는 skew 를 지원하지 않는다. 그래서 기기 각도에 맞춘 화면은 전부 목업 플러그인이
+ * "레이어를 이미지로 뽑아 4포인트 벡터에 맞게 뒤틀어서" 만든 결과물이다. 우리도 같은 걸
+ * 하려면 그 사각형의 꼭짓점이 필요한데, `get_node_info` 는 벡터 패스를 주지 않는다.
+ *
+ * 좌표는 **노드 로컬**(0..width, 0..height)로 돌려준다 — 이미지 fill 이 칠해지는 좌표계와
+ * 같아서, 워프 결과를 그대로 채우면 맞는다.
+ */
+async function getNodeGeometry(params) {
+  const { nodeId } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+
+  const out = {
+    id: node.id,
+    name: node.name,
+    type: node.type,
+    width: "width" in node ? node.width : null,
+    height: "height" in node ? node.height : null,
+    rotation: "rotation" in node ? node.rotation : null,
+  };
+
+  if (node.type === "VECTOR" && node.vectorNetwork) {
+    out.vertices = (node.vectorNetwork.vertices || []).map((v) => ({
+      x: v.x,
+      y: v.y,
+    }));
+  }
+  if ("absoluteTransform" in node) out.absoluteTransform = node.absoluteTransform;
+
+  const fills = "fills" in node && Array.isArray(node.fills) ? node.fills : [];
+  const img = fills.find((f) => f && f.type === "IMAGE");
+  if (img) {
+    out.imageFill = {
+      scaleMode: img.scaleMode,
+      imageTransform: img.imageTransform || null,
+      rotation: img.rotation != null ? img.rotation : null,
+    };
+  }
+  return out;
+}
+
+/**
+ * 이미 워프된 PNG 를 base64 로 받아 노드의 이미지 fill 로 넣는다.
+ *
+ * `set_image_fill_from_node` 는 Figma 안에서 굽기 때문에 **뒤틀 수가 없다**. 원근 워프는
+ * Figma 밖(PIL 등)에서 해야 하므로, 그 결과를 되돌려 받을 통로가 이것이다.
+ * 바이트가 릴레이를 타므로 **워프된 결과 한 장만** 보낼 것 — 원본 대량 전송용이 아니다.
+ *
+ * paint 기하는 `set_image_fill_from_node` 와 같은 규칙으로 물려받는다.
+ */
+async function setImageFillFromBytes(params) {
+  const { nodeId, imageBase64, scaleMode, replacePaint = false } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  if (!imageBase64) throw new Error("Missing imageBase64 parameter");
+
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (!("fills" in node)) throw new Error(`Node does not support fills: ${nodeId}`);
+
+  const bytes = base64ToUint8Array(imageBase64);
+  const image = figma.createImage(bytes);
+
+  const fills = Array.isArray(node.fills) ? node.fills.slice() : [];
+  const index = fills.findIndex((f) => f && f.type === "IMAGE");
+  const existing = index !== -1 ? fills[index] : null;
+
+  let paint;
+  if (existing && !replacePaint) {
+    paint = Object.assign({}, existing, { imageHash: image.hash });
+  } else {
+    paint = { type: "IMAGE", scaleMode: scaleMode || "FILL", imageHash: image.hash };
+  }
+  if (index !== -1) fills[index] = paint;
+  else fills.push(paint);
+  node.fills = fills;
+
+  return {
+    id: node.id,
+    name: node.name,
+    imageHash: image.hash,
+    bytes: bytes.length,
+    scaleMode: paint.scaleMode,
+    inherited: !!(existing && !replacePaint),
   };
 }
 

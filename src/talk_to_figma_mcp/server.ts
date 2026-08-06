@@ -601,7 +601,7 @@ server.tool(
     sourceNodeId: z.string().describe("Node to render (e.g. a live app-screen frame)"),
     targetNodeId: z.string().describe("Node whose picture is replaced — the mockup's content slot, NOT its mask"),
     scale: z.number().positive().optional().describe("Export scale for the source render (default 2). Figma rejects images over 4096px on a side, so keep width*scale and height*scale under that."),
-    scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("Override the fill mode. Omit to keep the target's existing mode — required for mockups, whose slots use CROP with an imageTransform."),
+    scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("Fill mode for a NEW paint. Ignored when inheriting — overriding it would make Figma drop the imageTransform and flatten a mockup's tilt. Pair with replacePaint to force it."),
     replacePaint: z.boolean().optional().describe("Discard the existing paint instead of inheriting it. Drops imageTransform — only for slots that have no geometry to keep."),
   },
   async ({ sourceNodeId, targetNodeId, scale, scaleMode, replacePaint }: any) => {
@@ -636,6 +636,59 @@ server.tool(
             text: `Error setting image fill: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
+      };
+    }
+  }
+);
+
+// Get Node Geometry Tool
+server.tool(
+  "get_node_geometry",
+  "Read a node's size, rotation, vector vertices and existing image-fill geometry. " +
+  "Use it to get the four corners of a device mockup's slanted screen slot (a 4-point VECTOR, often named 'Paste content here') — " +
+  "`get_node_info` does not return vector paths. Coordinates come back in NODE-LOCAL space (0..width, 0..height), the same space an image fill is painted into, " +
+  "so a quad warped to those points drops straight in.",
+  {
+    nodeId: z.string().describe("Node to measure — usually the mockup's screen slot vector"),
+  },
+  async ({ nodeId }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_node_geometry", { nodeId });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reading geometry: ${error instanceof Error ? error.message : String(error)}` }],
+      };
+    }
+  }
+);
+
+// Set Image Fill From Bytes Tool
+server.tool(
+  "set_image_fill_from_bytes",
+  "Put an already-prepared PNG (base64) into a node's IMAGE fill. " +
+  "**Figma cannot skew**, so a screenshot that has to match a tilted device must be perspective-warped OUTSIDE Figma (PIL/OpenCV) — this is how the result gets back in. " +
+  "`set_image_fill_from_node` bakes inside the plugin and therefore cannot warp; use that one for upright slots and this one for slanted mockups. " +
+  "Existing paint geometry is inherited (only `imageHash` changes) unless `replacePaint` is set. " +
+  "⚠️ Bytes travel over the relay — send one warped image per call, not a batch. Figma rejects images over 4096px on a side.",
+  {
+    nodeId: z.string().describe("Node whose image fill is replaced"),
+    imageBase64: z.string().describe("PNG bytes, base64-encoded, already warped to the target quad"),
+    scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("Only used when creating a new paint (no existing image fill, or replacePaint)"),
+    replacePaint: z.boolean().optional().describe("Discard the existing paint instead of inheriting it"),
+  },
+  async ({ nodeId, imageBase64, scaleMode, replacePaint }: any) => {
+    try {
+      const result = await sendCommandToFigma("set_image_fill_from_bytes", {
+        nodeId, imageBase64, scaleMode, replacePaint: replacePaint || false,
+      });
+      const typed = result as { name: string; bytes: number; scaleMode: string; inherited: boolean };
+      return {
+        content: [{ type: "text", text: `Filled "${typed.name}" with ${typed.bytes} bytes (${typed.scaleMode}, ${typed.inherited ? "inherited paint" : "new paint"}).` }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting image fill: ${error instanceof Error ? error.message : String(error)}` }],
       };
     }
   }
@@ -2660,6 +2713,8 @@ type FigmaCommand =
   | "create_text"
   | "set_fill_color"
   | "set_image_fill_from_node"
+  | "get_node_geometry"
+  | "set_image_fill_from_bytes"
   | "set_stroke_color"
   | "move_node"
   | "resize_node"
