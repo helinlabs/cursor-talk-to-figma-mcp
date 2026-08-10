@@ -62,6 +62,24 @@ Lightweight Bun WebSocket server on port 3055 (configurable via `PORT` env). Rou
 ### Figma Plugin (`src/cursor_mcp_plugin/`)
 Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via a dispatcher. `ui.html` is the plugin UI for WebSocket connection management. `manifest.json` declares permissions (dynamic-page access, localhost network). The plugin is **not built/bundled** — `code.js` is written directly as the runtime artifact.
 
+## 디자인 파일을 자동으로 고칠 때 (필독)
+
+**쓰기 도구는 아무 일도 안 일어나도 성공을 응답한다.** 가려진 사본을 건드렸거나, 오토레이아웃에
+좌표를 썼거나, 자식이 부모와 같은 폭이면 전부 "성공"이다. 그래서 **한 번에 여러 개를 적용하지
+말고 적용 → 재조회 → 확인을 반복**한다. 실제로 21개를 몰아 적용했다가 어느 게 먹었는지 몰라
+전부 되돌린 적이 있다.
+
+밟았던 함정 전체는 [docs/figma-automation-pitfalls.md](docs/figma-automation-pitfalls.md) 에
+있다. 디자인 파일을 스크립트로 고치기 전에 읽을 것. 요약:
+
+- 같은 좌표에 **가려진 사본**이 여러 벌 쌓여 있다. 이름이 아니라 "바꿨을 때 렌더가 변하는가" 로 찾는다
+- 가로 오토레이아웃은 좌표가 아니라 **자식 순서**다. 넘치는 행은 정렬·폭까지 같이 바꿔야 한다
+- **인스턴스 내부는 순서도 좌표도 못 바꾼다** → `detach_instance`
+- 중첩 컨테이너를 둘 다 뒤집으면 안쪽이 두 번 뒤집힌다 → **최상위만**
+- `clone_node` 에 `parentId` 를 주면 **x/y 가 부모 기준 상대좌표**다
+- `characters` 대입은 구간별 폰트 크기를 뭉갠다 → `get/set_text_segments`
+- export 가 1×1 이면 노드가 **다른 프레임 안으로 들어가 클리핑**된 것이다
+
 ## Key Patterns
 
 - **Colors**: Figma uses RGBA 0-1 range. The MCP tools accept 0-1 floats and the filter converts to hex for display.

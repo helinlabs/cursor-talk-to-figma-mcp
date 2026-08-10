@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "TalkToFigma": {
-      "command": "bunx",
+      "command": "/Users/gymwork-garen/.bun/bin/bun",
       "args": [
-        "cursor-talk-to-figma-mcp@latest"
+        "/Users/gymwork-garen/work/util/cursor-talk-to-figma-mcp/src/talk_to_figma_mcp/server.ts"
       ]
     }
   }
