@@ -775,15 +775,17 @@ server.tool(
 // Clone Node Tool
 server.tool(
   "clone_node",
-  "Clone an existing node in Figma",
+  "Clone an existing node in Figma. Pass `name` to rename the clone in the same call — a clone inherits the original's name, so cloning a whole language row (DE_01..08 → IT_01..08) otherwise leaves every frame called DE_*.",
   {
     nodeId: z.string().describe("The ID of the node to clone"),
     x: z.number().optional().describe("New X position for the clone"),
-    y: z.number().optional().describe("New Y position for the clone")
+    y: z.number().optional().describe("New Y position for the clone"),
+    name: z.string().optional().describe("Name for the clone (defaults to the original's name)"),
+    parentId: z.string().optional().describe("Container to append the clone to. Without it the clone lands beside the ORIGINAL — which drops a stray copy into another page/section when cloning across containers.")
   },
-  async ({ nodeId, x, y }: any) => {
+  async ({ nodeId, x, y, name, parentId }: any) => {
     try {
-      const result = await sendCommandToFigma('clone_node', { nodeId, x, y });
+      const result = await sendCommandToFigma('clone_node', { nodeId, x, y, name, parentId });
       const typedResult = result as { name: string, id: string };
       return {
         content: [
@@ -802,6 +804,212 @@ server.tool(
           }
         ]
       };
+    }
+  }
+);
+
+// Rename nodes. Layer names are how downstream scripts pick assets out of a file
+// (the store uploader looks for `IT_03`), and FRAME/GROUP names do not follow their
+// contents the way TEXT names do — so a cloned row needs an explicit rename pass.
+server.tool(
+  "set_node_names",
+  "Rename one or more nodes. Use after cloning a language row so the copies stop carrying the source language's names.",
+  {
+    names: z
+      .array(
+        z.object({
+          nodeId: z.string().describe("The ID of the node to rename"),
+          name: z.string().describe("The new layer name"),
+        })
+      )
+      .describe("Nodes to rename")
+  },
+  async ({ names }: any) => {
+    try {
+      const result = await sendCommandToFigma('set_node_names', { names });
+      const typedResult = result as { renamed: number; results: any[] };
+      const failures = typedResult.results.filter((r) => !r.success);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Renamed ${typedResult.renamed}/${typedResult.results.length} nodes` +
+              (failures.length ? `\nFailed: ${JSON.stringify(failures)}` : '')
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error renaming nodes: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+
+// Copy an IMAGE fill (hash + paint geometry) between nodes. Mask nodes export as a
+// 1x1 transparent PNG, so a device mockup's rounded-corner screen mask cannot be
+// pulled out as bytes — the only way to restore one is to carry the hash across.
+server.tool(
+  "copy_image_fill",
+  "Copy an IMAGE fill from one node to another, preserving imageHash and paint geometry. Use when the fill cannot be re-exported (e.g. a mask node, which exports as 1x1 transparent).",
+  {
+    sourceNodeId: z.string().describe("Node to copy the IMAGE fill from"),
+    targetNodeId: z.string().describe("Node whose fills are replaced"),
+    fillIndex: z.number().optional().describe("Which IMAGE fill to take when the source has several (default 0)")
+  },
+  async ({ sourceNodeId, targetNodeId, fillIndex }: any) => {
+    try {
+      const result = await sendCommandToFigma('copy_image_fill', { sourceNodeId, targetNodeId, fillIndex });
+      const t = result as { imageHash: string; scaleMode: string };
+      return { content: [{ type: "text", text: `Copied image fill ${t.imageHash} (${t.scaleMode}) to ${targetNodeId}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error copying image fill: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// Sections are the only way to declare "this block belongs together" on the canvas.
+// Unlike a frame they neither reparent-shift child coordinates nor paint a background,
+// so existing artwork can be grouped without being visually altered.
+server.tool(
+  "create_section",
+  "Create a SECTION on the current page. Use to group a block of work without the clipping/background a FRAME would impose.",
+  {
+    name: z.string().describe("Section name"),
+    x: z.number().describe("X position"),
+    y: z.number().describe("Y position"),
+    width: z.number().describe("Section width"),
+    height: z.number().describe("Section height")
+  },
+  async ({ name, x, y, width, height }: any) => {
+    try {
+      const r = await sendCommandToFigma('create_section', { name, x, y, width, height }) as { id: string };
+      return { content: [{ type: "text", text: `Created section "${name}" (${r.id}) at (${x}, ${y}) ${width}x${height}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error creating section: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// Promote a node to a COMPONENT so edits to it propagate to every instance.
+// Only worth it when the same layout is stamped many times and must stay in sync;
+// a plain clone is simpler when each copy is meant to drift.
+server.tool(
+  "create_component_from_node",
+  "Turn an existing node into a COMPONENT in place. Instances of it then follow edits to the master while keeping their own text overrides.",
+  {
+    nodeId: z.string().describe("Node to promote"),
+    name: z.string().optional().describe("Name for the component")
+  },
+  async ({ nodeId, name }: any) => {
+    try {
+      const r = await sendCommandToFigma('create_component_from_node', { nodeId, name }) as { id: string; name: string; alreadyComponent?: boolean };
+      return { content: [{ type: "text", text: r.alreadyComponent ? `Node ${nodeId} is already a component (${r.name})` : `Created component "${r.name}" (${r.id})` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error creating component: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// Per-range text styling. Assigning `node.characters` smears the FIRST character's style
+// over the whole string, so any title that mixes sizes (a big headline plus a small hashtag
+// in one node) silently flattens when its text is replaced. Read segments before, write after.
+server.tool(
+  "get_text_segments",
+  "Read a text node's per-range styles (fontSize, fontName, fills, ...). Use before replacing text that mixes styles within one node.",
+  { nodeId: z.string().describe("Text node to read") },
+  async ({ nodeId }: any) => {
+    try {
+      const r = await sendCommandToFigma('get_text_segments', { nodeId });
+      return { content: [{ type: "text", text: JSON.stringify(r) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error reading text segments: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "set_text_segments",
+  "Replace a text node's content while restoring per-range styles. Pass segments in order; each carries its own characters plus the style to apply.",
+  {
+    nodeId: z.string().describe("Text node to write"),
+    segments: z.array(z.object({
+      characters: z.string(),
+      fontSize: z.number().optional(),
+      fontName: z.object({ family: z.string(), style: z.string() }).optional(),
+      fills: z.array(z.any()).optional(),
+      lineHeight: z.any().optional(),
+      letterSpacing: z.any().optional(),
+      textCase: z.string().optional(),
+      textDecoration: z.string().optional(),
+    })).describe("Ordered runs; concatenated characters become the new content")
+  },
+  async ({ nodeId, segments }: any) => {
+    try {
+      const r = await sendCommandToFigma('set_text_segments', { nodeId, segments }) as { segments: number };
+      return { content: [{ type: "text", text: `Set ${r.segments} styled segment(s) on ${nodeId}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error setting text segments: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// RTL locales (Arabic, Hebrew) need the horizontal reading order flipped, not just the text.
+// Auto-layout rows are ordered by child order; absolutely-positioned containers by x —
+// mirroring the wrong one silently does nothing, so the tool picks per container by default.
+server.tool(
+  "mirror_horizontal",
+  "Mirror a container's horizontal arrangement for RTL. Reverses child order in a horizontal auto-layout, or mirrors child x positions in an absolute container.",
+  {
+    nodeId: z.string().describe("Container to mirror"),
+    mode: z.enum(["auto", "order", "position"]).optional().describe("auto (default) picks by layoutMode")
+  },
+  async ({ nodeId, mode }: any) => {
+    try {
+      const r = await sendCommandToFigma('mirror_horizontal', { nodeId, mode }) as { mode: string; count: number };
+      return { content: [{ type: "text", text: `Mirrored ${nodeId} by ${r.mode} (${r.count} children)` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error mirroring: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "set_text_align",
+  "Set a text node's horizontal/vertical alignment. Use to flip LEFT-aligned copy to RIGHT for RTL locales.",
+  {
+    nodeId: z.string().describe("Text node"),
+    horizontal: z.enum(["LEFT", "CENTER", "RIGHT", "JUSTIFIED"]).optional(),
+    vertical: z.enum(["TOP", "CENTER", "BOTTOM"]).optional()
+  },
+  async ({ nodeId, horizontal, vertical }: any) => {
+    try {
+      const r = await sendCommandToFigma('set_text_align', { nodeId, horizontal, vertical }) as any;
+      return { content: [{ type: "text", text: `Aligned ${nodeId}: ${r.textAlignHorizontal}/${r.textAlignVertical}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error aligning text: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// Figma refuses both reordering and repositioning of an instance's children, so RTL work
+// on an instance is impossible without detaching. Editing the main component instead would
+// change every language at once, which is not what a single-locale asset wants.
+server.tool(
+  "detach_instance",
+  "Detach an INSTANCE into a plain frame so its children can be reordered or repositioned (e.g. for RTL mirroring).",
+  { nodeId: z.string().describe("Instance to detach") },
+  async ({ nodeId }: any) => {
+    try {
+      const r = await sendCommandToFigma('detach_instance', { nodeId }) as { id: string; detached: boolean; type: string };
+      return { content: [{ type: "text", text: r.detached ? `Detached ${nodeId} -> ${r.id}` : `${nodeId} is ${r.type}, not an instance` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error detaching: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
@@ -2745,6 +2953,15 @@ type FigmaCommand =
   | "set_default_connector"
   | "create_connections"
   | "set_focus"
+  | "set_node_names"
+  | "copy_image_fill"
+  | "create_section"
+  | "detach_instance"
+  | "mirror_horizontal"
+  | "set_text_align"
+  | "get_text_segments"
+  | "set_text_segments"
+  | "create_component_from_node"
   | "set_selections"
   | "list_pages"
   | "set_current_page"

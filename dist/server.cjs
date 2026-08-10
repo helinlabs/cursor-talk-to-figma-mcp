@@ -471,27 +471,30 @@ server.tool(
 );
 server.tool(
   "set_image_fill_from_node",
-  "Bake one node into another node's IMAGE fill: exports `sourceNodeId` as PNG and sets it as the fill of `targetNodeId`. Both steps run inside the plugin, so no image bytes cross the socket (a screenshot is megabytes \u2014 base64 over the relay hits message limits). **The target's transform is preserved** \u2014 only `fills` changes, so a rotated/masked mockup keeps its angle and clipping. That is the point: use it to drop a live app-screen frame into the `Screen` rectangle of an angled device mockup, which cannot be done by moving/rotating a frame into place (the API exposes no rotation read or write).",
+  "Swap the picture inside another node: exports `sourceNodeId` as PNG and puts it in `targetNodeId`'s IMAGE fill. Both steps run inside the plugin, so no image bytes cross the socket (a screenshot is megabytes \u2014 base64 over the relay hits message limits). **Geometry is inherited, not rebuilt.** If the target already has an IMAGE fill, only its `imageHash` changes \u2014 `scaleMode`, `imageTransform`, rotation and filters are kept. That matters for device mockups: the screen slot is an axis-aligned node whose tilt lives in the paint's `imageTransform`, so building a fresh paint would leave an upright screenshot merely cropped to a slanted path, not matching the device angle. The target's own transform (rotation, masks) is untouched either way, since only `fills` is written. Typical use: drop a localized app-screen frame into a mockup's `Paste content here` slot. \u26A0\uFE0F Enumerate a mockup's children with `scan_nodes_by_types`, not `get_node_info` \u2014 mask layers are omitted from `children`, so the real content slot can be invisible there.",
   {
     sourceNodeId: import_zod.z.string().describe("Node to render (e.g. a live app-screen frame)"),
-    targetNodeId: import_zod.z.string().describe("Node whose fill is replaced (must support fills, e.g. the mockup's Screen rectangle)"),
-    scale: import_zod.z.number().positive().optional().describe("Export scale for the source render (default 2). Raise it if the target is large on screen."),
-    scaleMode: import_zod.z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("How the image sits in the target (default FILL)")
+    targetNodeId: import_zod.z.string().describe("Node whose picture is replaced \u2014 the mockup's content slot, NOT its mask"),
+    scale: import_zod.z.number().positive().optional().describe("Export scale for the source render (default 2). Figma rejects images over 4096px on a side, so keep width*scale and height*scale under that."),
+    scaleMode: import_zod.z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("Fill mode for a NEW paint. Ignored when inheriting \u2014 overriding it would make Figma drop the imageTransform and flatten a mockup's tilt. Pair with replacePaint to force it."),
+    replacePaint: import_zod.z.boolean().optional().describe("Discard the existing paint instead of inheriting it. Drops imageTransform \u2014 only for slots that have no geometry to keep.")
   },
-  async ({ sourceNodeId, targetNodeId, scale, scaleMode }) => {
+  async ({ sourceNodeId, targetNodeId, scale, scaleMode, replacePaint }) => {
     try {
       const result = await sendCommandToFigma("set_image_fill_from_node", {
         sourceNodeId,
         targetNodeId,
         scale: scale || 2,
-        scaleMode: scaleMode || "FILL"
+        scaleMode,
+        replacePaint: replacePaint || false
       });
       const typed = result;
+      const geom = typed.inheritedGeometry ? `inherited ${typed.inheritedGeometry.scaleMode}${typed.inheritedGeometry.hasImageTransform ? " + imageTransform" : ""}` : "new paint (no geometry inherited \u2014 check the device angle)";
       return {
         content: [
           {
             type: "text",
-            text: `Baked "${typed.sourceName}" into "${typed.targetName}" as ${typed.scaleMode} image fill (${typed.bytes} bytes). Target transform unchanged.`
+            text: `Swapped "${typed.sourceName}" into "${typed.targetName}" (${typed.bytes} bytes, ${typed.scaleMode}, ${geom}).`
           }
         ]
       };
@@ -503,6 +506,51 @@ server.tool(
             text: `Error setting image fill: ${error instanceof Error ? error.message : String(error)}`
           }
         ]
+      };
+    }
+  }
+);
+server.tool(
+  "get_node_geometry",
+  "Read a node's size, rotation, vector vertices and existing image-fill geometry. Use it to get the four corners of a device mockup's slanted screen slot (a 4-point VECTOR, often named 'Paste content here') \u2014 `get_node_info` does not return vector paths. Coordinates come back in NODE-LOCAL space (0..width, 0..height), the same space an image fill is painted into, so a quad warped to those points drops straight in.",
+  {
+    nodeId: import_zod.z.string().describe("Node to measure \u2014 usually the mockup's screen slot vector")
+  },
+  async ({ nodeId }) => {
+    try {
+      const result = await sendCommandToFigma("get_node_geometry", { nodeId });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error reading geometry: ${error instanceof Error ? error.message : String(error)}` }]
+      };
+    }
+  }
+);
+server.tool(
+  "set_image_fill_from_bytes",
+  "Put an already-prepared PNG (base64) into a node's IMAGE fill. **Figma cannot skew**, so a screenshot that has to match a tilted device must be perspective-warped OUTSIDE Figma (PIL/OpenCV) \u2014 this is how the result gets back in. `set_image_fill_from_node` bakes inside the plugin and therefore cannot warp; use that one for upright slots and this one for slanted mockups. Existing paint geometry is inherited (only `imageHash` changes) unless `replacePaint` is set. \u26A0\uFE0F Bytes travel over the relay \u2014 send one warped image per call, not a batch. Figma rejects images over 4096px on a side.",
+  {
+    nodeId: import_zod.z.string().describe("Node whose image fill is replaced"),
+    imageBase64: import_zod.z.string().describe("PNG bytes, base64-encoded, already warped to the target quad"),
+    scaleMode: import_zod.z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("Only used when creating a new paint (no existing image fill, or replacePaint)"),
+    replacePaint: import_zod.z.boolean().optional().describe("Discard the existing paint instead of inheriting it")
+  },
+  async ({ nodeId, imageBase64, scaleMode, replacePaint }) => {
+    try {
+      const result = await sendCommandToFigma("set_image_fill_from_bytes", {
+        nodeId,
+        imageBase64,
+        scaleMode,
+        replacePaint: replacePaint || false
+      });
+      const typed = result;
+      return {
+        content: [{ type: "text", text: `Filled "${typed.name}" with ${typed.bytes} bytes (${typed.scaleMode}, ${typed.inherited ? "inherited paint" : "new paint"}).` }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error setting image fill: ${error instanceof Error ? error.message : String(error)}` }]
       };
     }
   }
@@ -580,15 +628,17 @@ server.tool(
 );
 server.tool(
   "clone_node",
-  "Clone an existing node in Figma",
+  "Clone an existing node in Figma. Pass `name` to rename the clone in the same call \u2014 a clone inherits the original's name, so cloning a whole language row (DE_01..08 \u2192 IT_01..08) otherwise leaves every frame called DE_*.",
   {
     nodeId: import_zod.z.string().describe("The ID of the node to clone"),
     x: import_zod.z.number().optional().describe("New X position for the clone"),
-    y: import_zod.z.number().optional().describe("New Y position for the clone")
+    y: import_zod.z.number().optional().describe("New Y position for the clone"),
+    name: import_zod.z.string().optional().describe("Name for the clone (defaults to the original's name)"),
+    parentId: import_zod.z.string().optional().describe("Container to append the clone to. Without it the clone lands beside the ORIGINAL \u2014 which drops a stray copy into another page/section when cloning across containers.")
   },
-  async ({ nodeId, x, y }) => {
+  async ({ nodeId, x, y, name, parentId }) => {
     try {
-      const result = await sendCommandToFigma("clone_node", { nodeId, x, y });
+      const result = await sendCommandToFigma("clone_node", { nodeId, x, y, name, parentId });
       const typedResult = result;
       return {
         content: [
@@ -607,6 +657,180 @@ server.tool(
           }
         ]
       };
+    }
+  }
+);
+server.tool(
+  "set_node_names",
+  "Rename one or more nodes. Use after cloning a language row so the copies stop carrying the source language's names.",
+  {
+    names: import_zod.z.array(
+      import_zod.z.object({
+        nodeId: import_zod.z.string().describe("The ID of the node to rename"),
+        name: import_zod.z.string().describe("The new layer name")
+      })
+    ).describe("Nodes to rename")
+  },
+  async ({ names }) => {
+    try {
+      const result = await sendCommandToFigma("set_node_names", { names });
+      const typedResult = result;
+      const failures = typedResult.results.filter((r) => !r.success);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Renamed ${typedResult.renamed}/${typedResult.results.length} nodes` + (failures.length ? `
+Failed: ${JSON.stringify(failures)}` : "")
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error renaming nodes: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+server.tool(
+  "copy_image_fill",
+  "Copy an IMAGE fill from one node to another, preserving imageHash and paint geometry. Use when the fill cannot be re-exported (e.g. a mask node, which exports as 1x1 transparent).",
+  {
+    sourceNodeId: import_zod.z.string().describe("Node to copy the IMAGE fill from"),
+    targetNodeId: import_zod.z.string().describe("Node whose fills are replaced"),
+    fillIndex: import_zod.z.number().optional().describe("Which IMAGE fill to take when the source has several (default 0)")
+  },
+  async ({ sourceNodeId, targetNodeId, fillIndex }) => {
+    try {
+      const result = await sendCommandToFigma("copy_image_fill", { sourceNodeId, targetNodeId, fillIndex });
+      const t = result;
+      return { content: [{ type: "text", text: `Copied image fill ${t.imageHash} (${t.scaleMode}) to ${targetNodeId}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error copying image fill: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "create_section",
+  "Create a SECTION on the current page. Use to group a block of work without the clipping/background a FRAME would impose.",
+  {
+    name: import_zod.z.string().describe("Section name"),
+    x: import_zod.z.number().describe("X position"),
+    y: import_zod.z.number().describe("Y position"),
+    width: import_zod.z.number().describe("Section width"),
+    height: import_zod.z.number().describe("Section height")
+  },
+  async ({ name, x, y, width, height }) => {
+    try {
+      const r = await sendCommandToFigma("create_section", { name, x, y, width, height });
+      return { content: [{ type: "text", text: `Created section "${name}" (${r.id}) at (${x}, ${y}) ${width}x${height}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error creating section: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "create_component_from_node",
+  "Turn an existing node into a COMPONENT in place. Instances of it then follow edits to the master while keeping their own text overrides.",
+  {
+    nodeId: import_zod.z.string().describe("Node to promote"),
+    name: import_zod.z.string().optional().describe("Name for the component")
+  },
+  async ({ nodeId, name }) => {
+    try {
+      const r = await sendCommandToFigma("create_component_from_node", { nodeId, name });
+      return { content: [{ type: "text", text: r.alreadyComponent ? `Node ${nodeId} is already a component (${r.name})` : `Created component "${r.name}" (${r.id})` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error creating component: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "get_text_segments",
+  "Read a text node's per-range styles (fontSize, fontName, fills, ...). Use before replacing text that mixes styles within one node.",
+  { nodeId: import_zod.z.string().describe("Text node to read") },
+  async ({ nodeId }) => {
+    try {
+      const r = await sendCommandToFigma("get_text_segments", { nodeId });
+      return { content: [{ type: "text", text: JSON.stringify(r) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error reading text segments: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "set_text_segments",
+  "Replace a text node's content while restoring per-range styles. Pass segments in order; each carries its own characters plus the style to apply.",
+  {
+    nodeId: import_zod.z.string().describe("Text node to write"),
+    segments: import_zod.z.array(import_zod.z.object({
+      characters: import_zod.z.string(),
+      fontSize: import_zod.z.number().optional(),
+      fontName: import_zod.z.object({ family: import_zod.z.string(), style: import_zod.z.string() }).optional(),
+      fills: import_zod.z.array(import_zod.z.any()).optional(),
+      lineHeight: import_zod.z.any().optional(),
+      letterSpacing: import_zod.z.any().optional(),
+      textCase: import_zod.z.string().optional(),
+      textDecoration: import_zod.z.string().optional()
+    })).describe("Ordered runs; concatenated characters become the new content")
+  },
+  async ({ nodeId, segments }) => {
+    try {
+      const r = await sendCommandToFigma("set_text_segments", { nodeId, segments });
+      return { content: [{ type: "text", text: `Set ${r.segments} styled segment(s) on ${nodeId}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error setting text segments: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "mirror_horizontal",
+  "Mirror a container's horizontal arrangement for RTL. Reverses child order in a horizontal auto-layout, or mirrors child x positions in an absolute container.",
+  {
+    nodeId: import_zod.z.string().describe("Container to mirror"),
+    mode: import_zod.z.enum(["auto", "order", "position"]).optional().describe("auto (default) picks by layoutMode")
+  },
+  async ({ nodeId, mode }) => {
+    try {
+      const r = await sendCommandToFigma("mirror_horizontal", { nodeId, mode });
+      return { content: [{ type: "text", text: `Mirrored ${nodeId} by ${r.mode} (${r.count} children)` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error mirroring: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "set_text_align",
+  "Set a text node's horizontal/vertical alignment. Use to flip LEFT-aligned copy to RIGHT for RTL locales.",
+  {
+    nodeId: import_zod.z.string().describe("Text node"),
+    horizontal: import_zod.z.enum(["LEFT", "CENTER", "RIGHT", "JUSTIFIED"]).optional(),
+    vertical: import_zod.z.enum(["TOP", "CENTER", "BOTTOM"]).optional()
+  },
+  async ({ nodeId, horizontal, vertical }) => {
+    try {
+      const r = await sendCommandToFigma("set_text_align", { nodeId, horizontal, vertical });
+      return { content: [{ type: "text", text: `Aligned ${nodeId}: ${r.textAlignHorizontal}/${r.textAlignVertical}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error aligning text: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "detach_instance",
+  "Detach an INSTANCE into a plain frame so its children can be reordered or repositioned (e.g. for RTL mirroring).",
+  { nodeId: import_zod.z.string().describe("Instance to detach") },
+  async ({ nodeId }) => {
+    try {
+      const r = await sendCommandToFigma("detach_instance", { nodeId });
+      return { content: [{ type: "text", text: r.detached ? `Detached ${nodeId} -> ${r.id}` : `${nodeId} is ${r.type}, not an instance` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error detaching: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );

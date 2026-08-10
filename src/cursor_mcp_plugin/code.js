@@ -302,6 +302,24 @@ async function handleCommand(command, params) {
       return await setDefaultConnector(params);
     case "create_connections":
       return await createConnections(params);
+    case "set_node_names":
+      return await setNodeNames(params);
+    case "copy_image_fill":
+      return await copyImageFill(params);
+    case "detach_instance":
+      return await detachInstance(params);
+    case "mirror_horizontal":
+      return await mirrorHorizontal(params);
+    case "set_text_align":
+      return await setTextAlign(params);
+    case "get_text_segments":
+      return await getTextSegments(params);
+    case "set_text_segments":
+      return await setTextSegments(params);
+    case "create_section":
+      return await createSection(params);
+    case "create_component_from_node":
+      return await createComponentFromNode(params);
     case "set_focus":
       return await setFocus(params);
     case "set_selections":
@@ -3047,7 +3065,7 @@ const setCharactersWithSmartMatchFont = async (
 
 // Add the cloneNode function implementation
 async function cloneNode(params) {
-  const { nodeId, x, y } = params || {};
+  const { nodeId, x, y, name, parentId } = params || {};
 
   if (!nodeId) {
     throw new Error("Missing nodeId parameter");
@@ -3061,6 +3079,13 @@ async function cloneNode(params) {
   // Clone the node
   const clone = node.clone();
 
+  // 복제본은 원본 이름을 그대로 물려받는다. 언어 행을 통째로 복제할 때
+  // (DE_01..08 → IT_01..08) 이름이 안 바뀌면 어느 게 어느 언어인지 구분이 안 되므로,
+  // 복제 시점에 바로 붙일 수 있게 해 둔다.
+  if (name !== undefined) {
+    clone.name = name;
+  }
+
   // If x and y are provided, move the clone to that position
   if (x !== undefined && y !== undefined) {
     if (!("x" in clone) || !("y" in clone)) {
@@ -3070,8 +3095,19 @@ async function cloneNode(params) {
     clone.y = y;
   }
 
-  // Add the clone to the same parent as the original node
-  if (node.parent) {
+  // 복제본을 어디에 붙일지. `parentId` 가 없으면 원본 옆에 붙는데, 다른 페이지·섹션의
+  // 노드를 가져올 때는 그게 곧 "남의 자리에 쓰레기를 남기는" 짓이 된다. 그래서 명시할 수 있게 뒀다.
+  if (parentId) {
+    const parent = await figma.getNodeByIdAsync(parentId);
+    if (!parent) throw new Error(`Parent node not found: ${parentId}`);
+    if (!("appendChild" in parent)) throw new Error(`Parent cannot hold children: ${parentId}`);
+    parent.appendChild(clone);
+    // 섹션/프레임에 넣으면 x,y 가 부모 기준으로 재해석된다 — 넣은 뒤 다시 찍어 준다.
+    if (x !== undefined && y !== undefined) {
+      clone.x = x;
+      clone.y = y;
+    }
+  } else if (node.parent) {
     node.parent.appendChild(clone);
   } else {
     figma.currentPage.appendChild(clone);
@@ -5442,6 +5478,234 @@ async function createConnections(params) {
     success: true,
     count: results.length,
     connections: results
+  };
+}
+
+// 인스턴스를 일반 프레임으로 분리한다.
+//
+// **왜 필요한가** — Figma 는 인스턴스 내부 자식의 순서도 x 좌표도 못 바꾸게 막는다
+// ("This property cannot be overridden in an instance"). RTL 로 뒤집으려면 그 벽을 넘어야 하는데,
+// 마스터를 고치면 모든 언어가 같이 바뀌므로 이 행만 분리하는 게 맞다.
+// ASO 자산은 일회성 산출물이라 컴포넌트 연결이 사라져도 잃는 게 없다.
+async function detachInstance(params) {
+  const { nodeId } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (node.type !== "INSTANCE") return { id: node.id, type: node.type, detached: false };
+  const frame = node.detachInstance();
+  return { id: frame.id, name: frame.name, type: frame.type, detached: true };
+}
+
+// 아랍어처럼 오른쪽에서 왼쪽으로 읽는 언어를 위해 가로 배치를 뒤집는다.
+//
+// **왜 자식 순서인가** — 오토레이아웃 행은 자식 순서가 곧 화면 순서다. 좌표를 옮겨 봐야
+// 레이아웃이 다시 계산하며 원래대로 돌아간다. 절대배치 컨테이너는 반대로 순서가 무의미하므로
+// x 를 거울처럼 뒤집어야 한다 — 그래서 둘 다 지원한다.
+async function mirrorHorizontal(params) {
+  const { nodeId, mode = "auto" } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (!("children" in node)) throw new Error(`Node has no children: ${nodeId}`);
+
+  const isAuto = "layoutMode" in node && node.layoutMode === "HORIZONTAL";
+  const use = mode === "auto" ? (isAuto ? "order" : "position") : mode;
+
+  if (use === "order") {
+    // 뒤에서부터 다시 append 하면 순서가 뒤집힌다.
+    const kids = [...node.children];
+    for (let i = kids.length - 1; i >= 0; i -= 1) node.appendChild(kids[i]);
+    return { id: node.id, mode: "order", count: kids.length, layoutMode: node.layoutMode };
+  }
+
+  const W = node.width;
+  const moved = [];
+  for (const c of node.children) {
+    if (!("x" in c)) continue;
+    const nx = W - c.x - c.width;
+    c.x = nx;
+    moved.push({ id: c.id, from: c.x, to: nx });
+  }
+  return { id: node.id, mode: "position", count: moved.length, width: W };
+}
+
+// 텍스트 정렬. RTL 로 뒤집을 때 좌정렬 문구는 우정렬로 가야 읽는 방향과 맞는다.
+async function setTextAlign(params) {
+  const { nodeId, horizontal, vertical } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (node.type !== "TEXT") throw new Error(`Not a text node: ${nodeId}`);
+  if (horizontal) node.textAlignHorizontal = horizontal;
+  if (vertical) node.textAlignVertical = vertical;
+  return { id: node.id, textAlignHorizontal: node.textAlignHorizontal, textAlignVertical: node.textAlignVertical };
+}
+
+const TEXT_SEGMENT_PROPS = [
+  "fontSize", "fontName", "fills", "fontWeight",
+  "lineHeight", "letterSpacing", "textCase", "textDecoration",
+];
+
+// 한 텍스트 노드 안의 구간별 스타일을 읽는다.
+//
+// **왜 필요한가** — `node.characters = "..."` 는 첫 글자의 스타일을 문자열 전체에 발라 버린다.
+// ASO 타이틀은 "Share Your Win"(큼) + "#WorkoutComplete"(작음) 처럼 한 노드 안에 크기가
+// 섞여 있는 경우가 많아서, 그냥 번역문을 넣으면 크기 차이가 조용히 사라진다.
+async function getTextSegments(params) {
+  const { nodeId } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (node.type !== "TEXT") throw new Error(`Not a text node: ${nodeId}`);
+
+  const segments = node.getStyledTextSegments(TEXT_SEGMENT_PROPS);
+  return {
+    id: node.id,
+    characters: node.characters,
+    mixed: segments.length > 1,
+    segments: segments.map((s) => ({
+      characters: s.characters, start: s.start, end: s.end,
+      fontSize: s.fontSize, fontName: s.fontName, fills: s.fills,
+      lineHeight: s.lineHeight, letterSpacing: s.letterSpacing,
+      textCase: s.textCase, textDecoration: s.textDecoration,
+    })),
+  };
+}
+
+// 구간 스타일을 유지한 채 텍스트를 갈아 끼운다. segments = [{characters, fontSize, fontName, ...}].
+// 전체 문자열을 한 번에 쓴 뒤 구간마다 스타일을 다시 발라 준다 — 순서를 뒤집으면
+// characters 대입이 방금 칠한 스타일을 도로 지운다.
+async function setTextSegments(params) {
+  const { nodeId, segments } = params || {};
+  if (!nodeId || !Array.isArray(segments) || segments.length === 0) {
+    throw new Error("Missing nodeId or segments");
+  }
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (node.type !== "TEXT") throw new Error(`Not a text node: ${nodeId}`);
+
+  const fonts = [];
+  for (const s of segments) if (s.fontName) fonts.push(s.fontName);
+  if (fonts.length === 0) fonts.push(node.fontName === figma.mixed ? { family: "Inter", style: "Regular" } : node.fontName);
+  for (const f of fonts) await figma.loadFontAsync(f);
+
+  node.characters = segments.map((s) => s.characters).join("");
+
+  let pos = 0;
+  for (const s of segments) {
+    const start = pos, end = pos + s.characters.length;
+    pos = end;
+    if (end <= start) continue;
+    if (s.fontName) node.setRangeFontName(start, end, s.fontName);
+    if (typeof s.fontSize === "number") node.setRangeFontSize(start, end, s.fontSize);
+    if (s.fills) node.setRangeFills(start, end, s.fills);
+    if (s.lineHeight) node.setRangeLineHeight(start, end, s.lineHeight);
+    if (s.letterSpacing) node.setRangeLetterSpacing(start, end, s.letterSpacing);
+    if (s.textCase) node.setRangeTextCase(start, end, s.textCase);
+    if (s.textDecoration) node.setRangeTextDecoration(start, end, s.textDecoration);
+  }
+  return { id: node.id, characters: node.characters, segments: segments.length };
+}
+
+// 섹션을 만든다. 캔버스에서 "여기부터 여기까지는 한 덩어리"를 선언하는 유일한 수단이고,
+// 프레임과 달리 자식 좌표를 건드리지 않고 배경도 깔지 않아 기존 자산을 담기에 안전하다.
+async function createSection(params) {
+  const { name, x = 0, y = 0, width = 1000, height = 1000 } = params || {};
+  const section = figma.createSection();
+  section.name = name || "Section";
+  section.x = x;
+  section.y = y;
+  section.resizeWithoutConstraints(width, height);
+  figma.currentPage.appendChild(section);
+  return { id: section.id, name: section.name, x: section.x, y: section.y, width, height };
+}
+
+// 노드를 COMPONENT 로 승격한다.
+//
+// **왜 필요한가** — "원본을 고치면 찍어낸 것들이 따라온다"는 건 Figma 에서 컴포넌트/인스턴스로만
+// 성립한다. 언어별 행을 복제본으로 만들면 디자인 수정이 행 개수만큼 반복 노동이 된다.
+// 인스턴스는 텍스트 오버라이드를 유지한 채 마스터 변경을 따라오므로, 번역을 다시 붓지 않아도 된다.
+async function createComponentFromNode(params) {
+  const { nodeId, name } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  if (node.type === "COMPONENT") return { id: node.id, name: node.name, alreadyComponent: true };
+
+  const component = figma.createComponentFromNode(node);
+  if (name) component.name = name;
+  return { id: component.id, name: component.name, width: component.width, height: component.height };
+}
+
+// 이미지 fill 을 노드에서 노드로 그대로 옮긴다 (imageHash + paint 기하 전부).
+//
+// **왜 export 로는 안 되나** — 마스크 노드는 단독으로 export 하면 1×1 투명이 나온다.
+// 기기 목업의 화면 슬롯은 모서리가 둥근 알파를 가진 이미지가 마스크 역할을 하는데,
+// 그 알파를 밖으로 꺼낼 방법이 없다. 그래서 바이트를 건드리지 않고 hash 만 옮긴다.
+// 같은 파일 안에서는 imageHash 가 그대로 유효하므로 재업로드도 필요 없다.
+async function copyImageFill(params) {
+  const { sourceNodeId, targetNodeId, fillIndex = 0 } = params || {};
+  if (!sourceNodeId || !targetNodeId) {
+    throw new Error("Missing sourceNodeId or targetNodeId");
+  }
+
+  const source = await figma.getNodeByIdAsync(sourceNodeId);
+  const target = await figma.getNodeByIdAsync(targetNodeId);
+  if (!source) throw new Error(`Source node not found: ${sourceNodeId}`);
+  if (!target) throw new Error(`Target node not found: ${targetNodeId}`);
+  if (!("fills" in source)) throw new Error(`Source has no fills: ${sourceNodeId}`);
+  if (!("fills" in target)) throw new Error(`Target has no fills: ${targetNodeId}`);
+
+  const sourceFills = source.fills;
+  if (sourceFills === figma.mixed) throw new Error("Source has mixed fills");
+  const image = sourceFills.filter((p) => p.type === "IMAGE")[fillIndex];
+  if (!image) throw new Error(`Source has no IMAGE fill at index ${fillIndex}`);
+
+  // paint 를 통째로 복제한다 — scaleMode/imageTransform/rotation/opacity 가 여기 들어 있고,
+  // 하나라도 빠뜨리면 기울기나 크롭이 조용히 어긋난다.
+  target.fills = [JSON.parse(JSON.stringify(image))];
+
+  return {
+    sourceId: source.id,
+    targetId: target.id,
+    imageHash: image.imageHash,
+    scaleMode: image.scaleMode,
+  };
+}
+
+// 노드 이름 바꾸기 — 한 번에 여러 개.
+// 레이어 이름은 자산을 고르는 유일한 단서다(스토어 업로드 스크립트가 `IT_03` 으로 찾는다).
+// TEXT 는 내용이 바뀌면 이름이 따라오지만 FRAME/GROUP 은 안 그래서, 복제한 행의
+// 프레임 이름을 고쳐 줄 수단이 필요하다.
+async function setNodeNames(params) {
+  const { names } = params || {};
+  if (!Array.isArray(names) || names.length === 0) {
+    throw new Error("Missing or empty names parameter (expected [{nodeId, name}])");
+  }
+
+  const results = [];
+  for (const entry of names) {
+    const { nodeId, name } = entry || {};
+    if (!nodeId || typeof name !== "string") {
+      results.push({ nodeId, success: false, error: "each entry needs {nodeId, name}" });
+      continue;
+    }
+    const node = await figma.getNodeByIdAsync(nodeId);
+    if (!node) {
+      results.push({ nodeId, success: false, error: "node not found" });
+      continue;
+    }
+    const previousName = node.name;
+    node.name = name;
+    results.push({ nodeId, success: true, previousName, name: node.name });
+  }
+
+  return {
+    success: results.every((r) => r.success),
+    renamed: results.filter((r) => r.success).length,
+    results,
   };
 }
 
