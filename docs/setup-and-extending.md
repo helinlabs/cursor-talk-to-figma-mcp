@@ -82,6 +82,24 @@ MCP 서버 ──(ws:3055)── 릴레이 ──(ws)── Figma 플러그인
 MCP 서버 등록은 다음 세션부터 반영되지만, 플러그인 명령 자체는 즉시 쓸 수 있다.
 명령이 많으면 `scripts/figma-batch-client.mjs`(결과를 파일로 흘려 쓰고 해시로 재개).
 
+## 2-1. 딸려 오는 스크립트
+
+MCP 명령만으로 안 되는 것들 — 원근 워프, 이미지 규격 손질, 트리 전수 진단 — 은
+`scripts/` 에 있다. **다시 짜지 말고 이걸 쓴다.**
+
+| | 하는 일 |
+|---|---|
+| `figma-batch-client.mjs` | 릴레이에 명령을 순차 실행. 결과를 파일로 흘려 쓰고 **해시로 재개** |
+| `figma-test-client.mjs` | 단일 명령. 큰 base64 는 `@file` 로 (argv 상한 회피) |
+| `figma-text-sync.mjs` | 템플릿 행 ↔ 번역 행 텍스트 `pull`/`apply`. 복제본은 텍스트 순서가 1:1이라는 성질을 쓴다 |
+| `figma-audit.mjs` | `leftovers`(숨은 잔존 문자열) · `hrows`(RTL 뒤집기 후보, 최상위만) |
+| `warp-to-quad.py` | 직사각형 PNG → 기울어진 4점 슬롯 원근 워프 |
+| `composite-watch.py` | 워치 액정에 화면 합성 (슬롯이 없는 목업용) |
+| `image-prep.py` | `flatten`(알파 제거) · `check`(크기·모드) · `diff`(두 디렉토리 픽셀 대조) |
+
+`image-prep.py flatten` 은 **App Store 업로드 전에 반드시** 돌린다. Figma export 는 RGBA 라
+그대로 올리면 전부 `IMAGE_ALPHA_NOT_ALLOWED` 로 실패한다.
+
 ## 3. 부족하면 **직접 고쳐도 된다** (권장)
 
 이 MCP는 우리가 쓰려고 우리가 들고 있는 도구다. 쓰다가 아래에 해당하면
