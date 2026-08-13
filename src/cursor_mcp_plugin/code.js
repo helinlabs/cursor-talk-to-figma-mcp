@@ -311,6 +311,12 @@ async function handleCommand(command, params) {
       return await setNodeNames(params);
     case "copy_image_fill":
       return await copyImageFill(params);
+    case "set_node_data":
+      return await setNodeData(params);
+    case "get_node_data":
+      return await getNodeData(params);
+    case "delete_node_data":
+      return await deleteNodeData(params);
     case "detach_instance":
       return await detachInstance(params);
     case "mirror_horizontal":
@@ -5562,6 +5568,54 @@ async function createConnections(params) {
     count: results.length,
     connections: results
   };
+}
+
+// ── 노드에 붙는 데이터 (SSOT 를 파일이 아니라 문서에 두기 위한 것) ──
+//
+// **왜 sharedPluginData 인가** — `setPluginData` 는 쓴 플러그인만 읽을 수 있다.
+// 위젯이나 다른 플러그인에서도 같은 데이터를 만지려면 네임스페이스를 공유해야 한다.
+//
+// 값은 문자열만 담긴다(JSON 을 직렬화해 넣는다). 키 하나가 너무 커지면 잘리므로
+// 로케일별로 키를 나누는 편이 안전하다 (`listing:it` 처럼).
+async function setNodeData(params) {
+  const { nodeId, namespace = "gymwork_aso", key, value } = params || {};
+  if (!nodeId || !key) throw new Error("Missing nodeId or key");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  node.setSharedPluginData(namespace, key, text);
+  // 실제로 들어갔는지 되읽어 확인한다 — 상한을 넘기면 조용히 잘린다.
+  const back = node.getSharedPluginData(namespace, key);
+  return {
+    id: node.id, namespace, key,
+    bytes: text.length,
+    stored: back.length,
+    truncated: back.length !== text.length,
+  };
+}
+
+async function getNodeData(params) {
+  const { nodeId, namespace = "gymwork_aso", key } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  const keys = node.getSharedPluginDataKeys(namespace);
+  if (key) {
+    const v = node.getSharedPluginData(namespace, key);
+    return { id: node.id, namespace, key, value: v || null, keys };
+  }
+  const out = {};
+  for (const k of keys) out[k] = node.getSharedPluginData(namespace, k);
+  return { id: node.id, namespace, keys, values: out };
+}
+
+async function deleteNodeData(params) {
+  const { nodeId, namespace = "gymwork_aso", key } = params || {};
+  if (!nodeId || !key) throw new Error("Missing nodeId or key");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  node.setSharedPluginData(namespace, key, ""); // 빈 문자열이 곧 삭제다
+  return { id: node.id, namespace, key, deleted: true };
 }
 
 // 인스턴스를 일반 프레임으로 분리한다.

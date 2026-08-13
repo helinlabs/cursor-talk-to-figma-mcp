@@ -813,6 +813,58 @@ server.tool(
   }
 );
 server.tool(
+  "set_node_data",
+  "Store JSON/text on a node as shared plugin data. Use to keep a single source of truth (translations, generation params) inside the Figma document itself.",
+  {
+    nodeId: z.string().describe("Node to attach data to (a SECTION works well)"),
+    key: z.string().describe("Entry key, e.g. 'config' or 'listing:it'"),
+    value: z.string().describe("Serialized value (JSON string)"),
+    namespace: z.string().optional().describe("Shared namespace, default 'gymwork_aso'")
+  },
+  async ({ nodeId, key, value, namespace }) => {
+    try {
+      const r = await sendCommandToFigma("set_node_data", { nodeId, key, value, namespace });
+      return { content: [{ type: "text", text: `${r.key}: ${r.bytes}B \uC800\uC7A5${r.truncated ? " \u26A0\uFE0F \uC798\uB9BC (" + r.stored + "B)" : ""}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "get_node_data",
+  "Read shared plugin data from a node. Omit `key` to list every key and value in the namespace.",
+  {
+    nodeId: z.string().describe("Node to read from"),
+    key: z.string().optional().describe("Entry key; omit to get all"),
+    namespace: z.string().optional().describe("Shared namespace, default 'gymwork_aso'")
+  },
+  async ({ nodeId, key, namespace }) => {
+    try {
+      const r = await sendCommandToFigma("get_node_data", { nodeId, key, namespace });
+      return { content: [{ type: "text", text: JSON.stringify(r) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "delete_node_data",
+  "Remove one shared plugin data entry from a node.",
+  {
+    nodeId: z.string().describe("Node"),
+    key: z.string().describe("Entry key to remove"),
+    namespace: z.string().optional().describe("Shared namespace, default 'gymwork_aso'")
+  },
+  async ({ nodeId, key, namespace }) => {
+    try {
+      await sendCommandToFigma("delete_node_data", { nodeId, key, namespace });
+      return { content: [{ type: "text", text: `\uC0AD\uC81C: ${key}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
   "resize_node",
   "Resize a node in Figma",
   {
