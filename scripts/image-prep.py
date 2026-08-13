@@ -75,6 +75,30 @@ def cmd_check(args):
     return 1 if bad else 0
 
 
+def cmd_fit(args):
+    """긴 변을 상한 안으로 줄인다 (비율 유지).
+
+    Play 는 긴 변이 3840px 을 넘으면 받지 않는다. 파노라마를 이어 붙이면 쉽게 넘는데
+    (짐워크 3852×2778) 그걸 사람이 매번 알아채고 줄이게 하면 언젠가 빠뜨린다.
+    **줄이기만 한다** — 키우면 흐려지고, 스토어가 원하는 건 원본 해상도지 늘린 그림이 아니다.
+    """
+    done = 0
+    for p in walk(args.dir):
+        if args.only and not any(tag in os.path.basename(p) for tag in args.only):
+            continue
+        im = Image.open(p)
+        long_side = max(im.size)
+        if long_side <= args.max:
+            continue
+        ratio = args.max / long_side
+        new = (max(1, round(im.size[0] * ratio)), max(1, round(im.size[1] * ratio)))
+        im.resize(new, Image.LANCZOS).save(p)
+        print(f"  {os.path.relpath(p, args.dir)}: {im.size[0]}x{im.size[1]} → {new[0]}x{new[1]}")
+        done += 1
+    print(f"줄임 {done}장 (상한 {args.max}px)")
+    return 0
+
+
 def cmd_diff(args):
     a_files = {os.path.relpath(p, args.a): p for p in walk(args.a)}
     b_files = {os.path.relpath(p, args.b): p for p in walk(args.b)}
@@ -120,13 +144,19 @@ def main():
     c.add_argument("--skip", action="append", default=[],
                    help="이 문자열이 파일명에 있으면 검사하지 않는다 (예: _play_). 여러 번 가능")
 
+    ft = sub.add_parser("fit", help="긴 변을 상한 안으로 줄인다 (비율 유지)")
+    ft.add_argument("dir")
+    ft.add_argument("--max", type=int, required=True, help="긴 변 상한 (Play 는 3840)")
+    ft.add_argument("--only", action="append", default=[],
+                    help="이 문자열이 파일명에 있는 것만 (예: _play_). 여러 번 가능")
+
     d = sub.add_parser("diff", help="두 디렉토리 픽셀 대조")
     d.add_argument("a")
     d.add_argument("b")
     d.add_argument("--tol", type=float, default=0.01, help="이 MAE 이하는 같다고 본다")
 
     args = ap.parse_args()
-    rc = {"flatten": cmd_flatten, "check": cmd_check, "diff": cmd_diff}[args.cmd](args)
+    rc = {"flatten": cmd_flatten, "check": cmd_check, "fit": cmd_fit, "diff": cmd_diff}[args.cmd](args)
     sys.exit(rc or 0)
 
 
