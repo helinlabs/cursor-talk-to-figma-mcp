@@ -52,7 +52,14 @@ def cmd_check(args):
         allowed.add((int(w), int(h)))
     bad = []
     total = 0
+    skipped = 0
     for p in walk(args.dir):
+        # 규격이 다른 갈래는 건너뛴다. 스토어마다 규칙이 다른데(Play 는 범위·비율, 워치는
+        # 기기별) 그 지식을 여기까지 복제하면 반드시 갈린다 — 그런 파일은 올릴 때
+        # 서버가 본다. 이름으로 골라내는 이유는 그게 이미 「무엇인지」를 담고 있어서다.
+        if any(tag in os.path.basename(p) for tag in args.skip):
+            skipped += 1
+            continue
         im = Image.open(p)
         total += 1
         why = []
@@ -62,7 +69,7 @@ def cmd_check(args):
             why.append(f"size={im.size[0]}x{im.size[1]}")
         if why:
             bad.append((os.path.relpath(p, args.dir), ", ".join(why)))
-    print(f"검사 {total}장 / 위반 {len(bad)}장")
+    print(f"검사 {total}장 / 위반 {len(bad)}장" + (f" / 건너뜀 {skipped}장" if skipped else ""))
     for f, why in bad:
         print(f"  ⚠️ {f}: {why}")
     return 1 if bad else 0
@@ -110,6 +117,8 @@ def main():
     c.add_argument("dir")
     c.add_argument("--size", action="append", default=[],
                    help="허용 크기 (예: 1284x2778). 여러 번 줄 수 있다")
+    c.add_argument("--skip", action="append", default=[],
+                   help="이 문자열이 파일명에 있으면 검사하지 않는다 (예: _play_). 여러 번 가능")
 
     d = sub.add_parser("diff", help="두 디렉토리 픽셀 대조")
     d.add_argument("a")
