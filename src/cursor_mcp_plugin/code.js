@@ -298,6 +298,11 @@ async function handleCommand(command, params) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
       return await getReactions(params.nodeIds, params.maxDepth);
+    case "get_motion":
+      if (!params || !params.nodeId) {
+        throw new Error("Missing nodeId parameter");
+      }
+      return await getMotion(params.nodeId, params.maxDepth);
     case "set_default_connector":
       return await setDefaultConnector(params);
     case "create_connections":
@@ -1398,6 +1403,83 @@ async function getFrameContext(params) {
   return tree;
 }
 
+/**
+ * Read Figma Motion data (animations / manual keyframe tracks / timelines) from a
+ * node subtree. Motion is the Animation panel feature — it is NOT a prototype
+ * reaction, so get_reactions can never see it.
+ *
+ * Beta API: every property access is guarded so an older Figma desktop build
+ * just yields `supported: false` instead of throwing.
+ */
+async function getMotion(nodeId, maxDepthParam) {
+  const root = await figma.getNodeByIdAsync(nodeId);
+  if (!root) throw new Error(`Node not found: ${nodeId}`);
+  const maxDepth = Number.isFinite(maxDepthParam) ? Math.max(0, Math.floor(maxDepthParam)) : 6;
+
+  const safe = (fn) => {
+    try {
+      return fn();
+    } catch (_) {
+      return undefined;
+    }
+  };
+
+  // Motion objects are host objects — spread them into plain JSON.
+  const plain = (value, depth = 0) => {
+    if (value === null || value === undefined) return value;
+    if (depth > 8) return '[deep]';
+    const kind = typeof value;
+    if (kind === 'number' || kind === 'string' || kind === 'boolean') return value;
+    if (kind === 'function') return undefined;
+    if (Array.isArray(value)) return value.map((item) => plain(item, depth + 1));
+    const out = {};
+    for (const key in value) {
+      const child = safe(() => value[key]);
+      const converted = plain(child, depth + 1);
+      if (converted !== undefined) out[key] = converted;
+    }
+    return out;
+  };
+
+  const results = [];
+  const walk = (node, depth) => {
+    const animations = safe(() => node.animations);
+    const tracks = safe(() => node.manualKeyframeTracks);
+    const timelines = safe(() => node.timelines);
+    const styles = safe(() => node.animationStyles);
+    const hasAny =
+      (animations && Object.keys(plain(animations) || {}).length > 0) ||
+      (tracks && tracks.length > 0) ||
+      (timelines && timelines.length > 0) ||
+      (styles && styles.length > 0);
+    if (hasAny) {
+      results.push({
+        id: node.id,
+        name: node.name,
+        type: node.type,
+        depth,
+        animations: plain(animations),
+        manualKeyframeTracks: plain(tracks),
+        timelines: plain(timelines),
+        animationStyles: plain(styles),
+      });
+    }
+    if (depth < maxDepth && 'children' in node) {
+      for (const child of node.children) walk(child, depth + 1);
+    }
+  };
+  walk(root, 0);
+
+  return {
+    // `animations` missing entirely on the root means this Figma build predates Motion.
+    supported: safe(() => root.animations) !== undefined,
+    documentTimelines: plain(safe(() => figma.motion && figma.motion.timelines)),
+    availableAnimationStyles: plain(safe(() => figma.motion && figma.motion.animationStyles)),
+    nodesWithMotion: results.length,
+    nodes: results,
+  };
+}
+
 async function getReactions(nodeIds, maxDepthParam) {
   try {
     const commandId = generateCommandId();
@@ -1445,19 +1527,13 @@ async function getReactions(nodeIds, maxDepthParam) {
       }
 
       // Check if the current node has reactions
-      let filteredReactions = [];
-      if (node.reactions && node.reactions.length > 0) {
-        // Filter out reactions with navigation === 'CHANGE_TO'
-        filteredReactions = node.reactions.filter(r => {
-          // Some reactions may have action or actions array
-          if (r.action && r.action.navigation === 'CHANGE_TO') return false;
-          if (Array.isArray(r.actions)) {
-            // If any action in actions array is CHANGE_TO, exclude
-            return !r.actions.some(a => a.navigation === 'CHANGE_TO');
-          }
-          return true;
-        });
-      }
+      // NOTE: this used to drop reactions whose navigation is 'CHANGE_TO'.
+      // CHANGE_TO is exactly what variant-based (interactive component) loop
+      // animations use — AFTER_DELAY → CHANGE_TO another variant — so filtering
+      // it made timeline-style animations look like "no prototype data at all".
+      // Keep everything; the caller decides what is relevant.
+      const filteredReactions =
+        node.reactions && node.reactions.length > 0 ? node.reactions : [];
       const hasFilteredReactions = filteredReactions.length > 0;
       
       // If the node has filtered reactions, add it to results and apply highlight effect
@@ -3852,15 +3928,22 @@ async function getAnnotations(params) {
 
       // Collect annotations from this node and all its descendants
       const mergedAnnotations = [];
-      const collect = async (n) => {
+      // 방문 상한/깊이 제한 — 애니메이션 프레임처럼 자식이 수백 개인 노드에서
+      // 무제한 재귀가 응답 시한을 넘겨 조회 자체가 실패하던 것을 막는다.
+      const { maxDepth = Infinity, maxNodes = 4000 } = params;
+      let visited = 0;
+      const collect = async (n, depth = 0) => {
+        if (visited >= maxNodes) return;
+        visited++;
         if ("annotations" in n && n.annotations && n.annotations.length > 0) {
           for (const a of n.annotations) {
-            mergedAnnotations.push({ nodeId: n.id, annotation: a });
+            mergedAnnotations.push({ nodeId: n.id, annotation: a, nodeName: n.name });
           }
         }
+        if (depth >= maxDepth) return;
         if ("children" in n) {
           for (const child of n.children) {
-            await collect(child);
+            await collect(child, depth + 1);
           }
         }
       };

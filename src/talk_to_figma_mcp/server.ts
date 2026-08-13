@@ -2635,6 +2635,31 @@ server.tool(
   }
 );
 
+// A tool to read Figma Motion (Animation panel) data — keyframes, tracks, timelines
+server.tool(
+  "get_motion",
+  "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` keyframes per animatable field, `manualKeyframeTracks`, `timelines`, and applied `animationStyles`, plus the document's timelines and available animation styles. This is NOT prototype data — Motion animations are invisible to `get_reactions`. Use this to get exact durations, keyframe positions and easing for looping/ambient animations.",
+  {
+    nodeId: z.string().describe("Node ID to read Motion data from (its subtree is included)"),
+    maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6."),
+  },
+  async ({ nodeId, maxDepth }: any) => {
+    try {
+      const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error reading Motion data: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
 // A tool to get Figma Prototyping Reactions from multiple nodes
 server.tool(
   "get_reactions",
@@ -2950,6 +2975,7 @@ type FigmaCommand =
   | "set_layout_sizing"
   | "set_item_spacing"
   | "get_reactions"
+  | "get_motion"
   | "set_default_connector"
   | "create_connections"
   | "set_focus"
@@ -3109,6 +3135,7 @@ type CommandParams = {
     types: Array<string>;
   };
   get_reactions: { nodeIds: string[]; maxDepth?: number };
+  get_motion: { nodeId: string; maxDepth?: number };
   set_default_connector: {
     connectorId?: string | undefined;
   };

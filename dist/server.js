@@ -2214,6 +2214,29 @@ server.tool(
   }
 );
 server.tool(
+  "get_motion",
+  "Read Figma Motion animation data (Animation panel) for a node and its descendants: `animations` keyframes per animatable field, `manualKeyframeTracks`, `timelines`, and applied `animationStyles`, plus the document's timelines and available animation styles. This is NOT prototype data \u2014 Motion animations are invisible to `get_reactions`. Use this to get exact durations, keyframe positions and easing for looping/ambient animations.",
+  {
+    nodeId: z.string().describe("Node ID to read Motion data from (its subtree is included)"),
+    maxDepth: z.number().int().min(0).optional().describe("How many levels below the node to include. Defaults to 6.")
+  },
+  async ({ nodeId, maxDepth }) => {
+    try {
+      const result = await sendCommandToFigma("get_motion", { nodeId, maxDepth });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error reading Motion data: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+server.tool(
   "get_reactions",
   "Get Figma Prototyping Reactions from multiple nodes. Searches each node and its descendants. For deeply nested nodes, pass `maxDepth` to cap how far the search recurses (an unbounded deep scan can time out). CRITICAL: The output MUST be processed using the 'reaction_to_connector_strategy' prompt IMMEDIATELY to generate parameters for connector lines via the 'create_connections' tool.",
   {
