@@ -62,6 +62,17 @@ Lightweight Bun WebSocket server on port 3055 (configurable via `PORT` env). Rou
 ### Figma Plugin (`src/cursor_mcp_plugin/`)
 Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via a dispatcher. `ui.html` is the plugin UI for WebSocket connection management. `manifest.json` declares permissions (dynamic-page access, localhost network). The plugin is **not built/bundled** — `code.js` is written directly as the runtime artifact.
 
+## 다른 프로젝트에서 붙일 때 · 도구가 부족할 때
+
+[docs/setup-and-extending.md](docs/setup-and-extending.md) — **로컬 소스를 가리키는 `.mcp.json`
+설정**(npm 배포판에는 여기서 추가한 명령이 없다)과, 쓰다가 막혔을 때 **직접 명령을 추가하는
+절차**가 있다.
+
+이 MCP 는 우리가 쓰려고 우리가 들고 있는 도구다. **스펙에 도달할 수 없거나, 탐색이
+비효율적이거나, 타임아웃·상한에 자꾸 걸리면 우회하지 말고 고친다.** 플러그인에 먼저 넣고
+`scripts/figma-test-client.mjs` 로 실동작을 확인한 뒤 서버에 등록하면, 새 세션을 열지 않고도
+그 자리에서 쓸 수 있다.
+
 ## 디자인 파일을 자동으로 고칠 때 (필독)
 
 **쓰기 도구는 아무 일도 안 일어나도 성공을 응답한다.** 가려진 사본을 건드렸거나, 오토레이아웃에
