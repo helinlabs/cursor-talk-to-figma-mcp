@@ -6,6 +6,11 @@ and Figma — it lets the agent read designs and modify them programmatically.
 This fork is run **entirely locally** (no published package, no deployment). The
 sections below are the first-run guide for a fresh machine.
 
+For agent-driven provisioning on another Mac, copy the single Korean prompt in
+[`skills/setup-cursor-talk-to-figma/assets/one-shot-prompt.ko.md`](skills/setup-cursor-talk-to-figma/assets/one-shot-prompt.ko.md).
+Agents with repository skills can use
+[`$setup-cursor-talk-to-figma`](skills/setup-cursor-talk-to-figma/SKILL.md).
+
 ## Architecture
 
 Four pieces talk in a pipeline:

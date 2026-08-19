@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup Talk to Figma MCP"
+  short_description: "Install, connect, verify, and extend the local Figma MCP"
+  default_prompt: "Use $setup-cursor-talk-to-figma to install and verify Talk to Figma MCP on this Mac."
