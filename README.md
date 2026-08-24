@@ -3,20 +3,20 @@
 A Model Context Protocol (MCP) integration between an AI agent (Claude Code, Cursor)
 and Figma — it lets the agent read designs and modify them programmatically.
 
-This fork is run **entirely locally** (no published package, no deployment). The
-sections below are the first-run guide for a fresh machine.
+This fork can run locally over stdio or as a long-lived Streamable HTTP MCP
+service behind a Nexus tunnel. The sections below cover both modes.
 
 ## Architecture
 
 Four pieces talk in a pipeline:
 
 ```
-AI agent ⇄(stdio)⇄ MCP server ⇄(WebSocket)⇄ Relay (:3055) ⇄(WebSocket)⇄ Figma plugin
+AI agent ⇄(stdio or HTTP :3056)⇄ MCP server ⇄(WebSocket)⇄ Relay (:3055) ⇄(WebSocket)⇄ Figma plugin
 ```
 
 | Piece | Where | Role |
 |---|---|---|
-| **MCP server** | `src/talk_to_figma_mcp/server.ts` | Exposes ~50 tools to the AI agent over stdio; talks to the relay. Has filesystem access (e.g. saves exported images). One process **per AI session**. |
+| **MCP server** | `src/talk_to_figma_mcp/server.ts` | Exposes ~50 tools over stdio or Streamable HTTP; talks to the relay. HTTP sessions are isolated and each owns its relay connection. |
 | **Relay** | `src/socket.ts` (port 3055) | Routes messages between MCP server and plugin by channel. Also serves a web console. Runs as a background service (launchd). |
 | **Figma plugin** | `src/cursor_mcp_plugin/` | Runs inside Figma (`code.js` + `ui.html`). Has Figma API access, no filesystem. Not bundled — the source files are the runtime. |
 | **Web console** | served by the relay at `/console` | Live view of channels, documents, and requests. |
@@ -103,6 +103,30 @@ claude mcp add TalkToFigma -- "$(which bun)" "$(pwd)/src/talk_to_figma_mcp/serve
 > reconnect (`/mcp` → reconnect, or start a new session) so the change is picked
 > up — there is no hot reload. See the workflow table below.
 
+### Long-lived HTTP mode (Nexus tunnel)
+
+Run one MCP service on the Figma Mac, bound to loopback only:
+
+```bash
+NEXUS_TUNNEL_PUBLIC_BASE="https://nexus.helinlabs.com/tunnel/svc/<endpoint>/figma-mcp" \
+  bun src/talk_to_figma_mcp/server.ts --http --port=3056
+```
+
+The MCP endpoint is `/mcp`; `/health` is a local health check. Register port
+3056 as a Nexus tunnel service and point clients at:
+
+```text
+https://nexus.helinlabs.com/tunnel/svc/<endpoint>/figma-mcp/mcp
+```
+
+HTTP-mode `export_node_as_image` writes into
+`~/.macfleet/figma-exports/` and returns an authenticated Nexus download URL
+instead of a path on the remote Mac. Random file names and a 24-hour TTL are the
+defaults; `FIGMA_EXPORT_DIR` and `FIGMA_EXPORT_TTL_HOURS` override them. The
+legacy `BROKER_PUBLIC_BASE` variable is accepted only as a compatibility input.
+For security, HTTP clients cannot provide `outputPath`; remote exports are
+confined to this directory.
+
 ### 5. Connect and use
 
 In the AI client:
@@ -159,6 +183,7 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 ### Export
 - `export_node_as_image` — export a node as **PNG / JPG / SVG / PDF**.
   - `outputPath` → the bytes are **saved to that file** (parent dirs auto-created) and the tool returns `{ path, nodeName, width, height, bytes }` — no inline base64 to wrangle.
+  - In HTTP mode, omitting `outputPath` saves to the dedicated export directory and returns `{ url, expiresInHours, ... }`; the file is served from `/files/<random-id>.<ext>`.
   - SVG always carries **real, renderable colors**. Pass `includeColorTokens: true` to also get `colorTokens` (`[{ token, hex, property }]`, document order) — the authoritative list of which color variable each paint is bound to, so the caller can inject its own `{{token}}` placeholders. (The plugin never mutates the SVG.)
 
 ### Creating & modifying
