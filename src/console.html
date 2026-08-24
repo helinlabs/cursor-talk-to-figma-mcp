@@ -197,7 +197,12 @@
       import { createRoot } from "react-dom/client";
       import { FixedSizeList } from "react-window";
 
-      const WS_URL = `ws://${location.host}`;
+      // Reuse the page path so a reverse proxy mounted below a prefix (for example
+      // /tunnel/svc/<endpoint>/figma-relay/console) keeps the WebSocket inside the
+      // same service route. HTTPS pages must use wss: or browsers block the socket
+      // as mixed content. The relay accepts upgrades on every path, so this also
+      // preserves the local http://localhost:3055/console workflow.
+      const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname}`;
       const RING = 5000;          // browser-side ring buffer size
       const FLUSH_MS = 150;       // batch incoming events to avoid render storms
       const ROW_H = 26;
