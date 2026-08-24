@@ -2,11 +2,15 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -63,8 +67,15 @@ const logger = {
   log: (message: string) => process.stderr.write(`[LOG] ${message}\n`)
 };
 
+type McpServerOptions = {
+  remoteExportBase?: string;
+};
+
+function createMcpServer(options: McpServerOptions = {}) {
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
+let disposed = false;
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 const pendingRequests = new Map<string, {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
@@ -1177,7 +1188,7 @@ server.tool(
 // Export Node as Image Tool
 server.tool(
   "export_node_as_image",
-  "Export a node as an image from Figma. If `outputPath` is given, the bytes are written to that file on disk (parent dirs auto-created) and the tool returns the saved path + dimensions — no inline image, no curl/base64 dance. Without `outputPath` it returns the image inline (PNG/JPG/PDF) or the SVG text (SVG). The exported SVG always carries REAL, renderable colors. For SVG, pass `includeColorTokens: true` to ALSO get `colorTokens` — the authoritative list of which color variable each paint is bound to ([{token, hex, property}] in document order) so the caller can inject its own {{token}} placeholders. (The plugin never mutates the SVG: matching hexes in SVG text is lossy — hard-coded colors collide with token colors — so token injection is left to the caller, which has the design-system context.)",
+  "Export a node as an image from Figma. If `outputPath` is given, the bytes are written to that file on disk (parent dirs auto-created) and the tool returns the saved path + dimensions. Without `outputPath`, stdio mode returns the image inline while HTTP mode returns an authenticated tunnel download URL with a finite TTL. The exported SVG always carries REAL, renderable colors. For SVG, pass `includeColorTokens: true` to ALSO get `colorTokens` — the authoritative list of which color variable each paint is bound to ([{token, hex, property}] in document order) so the caller can inject its own {{token}} placeholders. (The plugin never mutates the SVG: matching hexes in SVG text is lossy — hard-coded colors collide with token colors — so token injection is left to the caller, which has the design-system context.)",
   {
     nodeId: z.string().describe("The ID of the node to export"),
     format: z
@@ -1196,6 +1207,9 @@ server.tool(
   },
   async ({ nodeId, format, scale, outputPath, includeColorTokens }: any) => {
     try {
+      if (options.remoteExportBase && outputPath) {
+        throw new Error("outputPath is disabled in HTTP mode; omit it to receive a tunnel download URL");
+      }
       const fmt = (format || "PNG").toUpperCase();
       const result = (await sendCommandToFigma("export_node_as_image", {
         nodeId,
@@ -1212,6 +1226,34 @@ server.tool(
         width?: number;
         height?: number;
       };
+
+      // HTTP mode runs on a remote Mac. Returning its local filesystem path would be useless to
+      // the caller, so persist into the dedicated export directory and return the tunnel URL.
+      if (!outputPath && options.remoteExportBase) {
+        const extension = fmt.toLowerCase();
+        const name = `${uuidv4()}.${extension}`;
+        const resolved = path.join(exportDirectory, name);
+        fs.mkdirSync(exportDirectory, { recursive: true, mode: 0o700 });
+        if (fmt === "SVG" && typeof result.svg === "string") {
+          fs.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 0o600 });
+        } else {
+          fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 0o600 });
+        }
+        const stat = fs.statSync(resolved);
+        const summary: any = {
+          saved: true,
+          url: `${options.remoteExportBase}/files/${name}`,
+          expiresInHours: exportTTL / (60 * 60 * 1000),
+          nodeName: result.nodeName,
+          format: fmt,
+          bytes: stat.size,
+        };
+        if (typeof result.width === "number") summary.width = result.width;
+        if (typeof result.height === "number") summary.height = result.height;
+        if (result.colorTokens) summary.colorTokens = result.colorTokens;
+        if (result.usedTokens) summary.usedTokens = result.usedTokens;
+        return { content: [{ type: "text", text: JSON.stringify(summary) }] };
+      }
 
       // --- Save to disk when an output path is provided ---------------------
       if (outputPath) {
@@ -3245,6 +3287,7 @@ function processFigmaNodeResponse(result: unknown): any {
 
 // Update the connectToFigma function
 function connectToFigma(port: number = 3055) {
+  if (disposed) return;
   // If already connected, do nothing
   if (ws && ws.readyState === WebSocket.OPEN) {
     logger.info('Already connected to Figma');
@@ -3377,9 +3420,10 @@ function connectToFigma(port: number = 3055) {
       pendingRequests.delete(id);
     }
 
-    // Attempt to reconnect
-    logger.info('Attempting to reconnect in 2 seconds...');
-    setTimeout(() => connectToFigma(port), 2000);
+    if (!disposed) {
+      logger.info('Attempting to reconnect in 2 seconds...');
+      reconnectTimer = setTimeout(() => connectToFigma(port), 2000);
+    }
   });
 }
 
@@ -3700,17 +3744,181 @@ server.tool(
   }
 );
 
-// Start the server
-async function main() {
   try {
-    // Try to connect to Figma socket server
     connectToFigma();
   } catch (error) {
     logger.warn(`Could not connect to Figma initially: ${error instanceof Error ? error.message : String(error)}`);
     logger.warn('Will try to connect when the first command is sent');
   }
+  const dispose = () => {
+    disposed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    for (const request of pendingRequests.values()) {
+      clearTimeout(request.timeout);
+      request.reject(new Error("MCP session closed"));
+    }
+    pendingRequests.clear();
+    if (ws) {
+      const socket = ws;
+      ws = null;
+      socket.removeAllListeners();
+      socket.on("error", () => undefined);
+      socket.terminate();
+    }
+  };
+  return { server, dispose };
+}
 
-  // Start the MCP server with stdio transport
+const runtimeArgs = process.argv.slice(2);
+const httpMode = runtimeArgs.includes("--http");
+const httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
+const httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
+
+const exportDirectory = process.env.FIGMA_EXPORT_DIR || path.join(os.homedir(), ".macfleet", "figma-exports");
+const configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
+const exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0
+  ? configuredExportTTLHours
+  : 24;
+const exportTTL = exportTTLHours * 60 * 60 * 1000;
+const exportNamePattern = /^[0-9a-f-]{36}\.(png|jpg|svg|pdf)$/;
+
+function cleanupExports() {
+  if (!fs.existsSync(exportDirectory)) return;
+  const cutoff = Date.now() - exportTTL;
+  for (const name of fs.readdirSync(exportDirectory)) {
+    if (!exportNamePattern.test(name)) continue;
+    const file = path.join(exportDirectory, name);
+    try {
+      if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
+    } catch (error) {
+      logger.warn(`Could not clean export ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function exportContentType(name: string) {
+  if (name.endsWith(".svg")) return "image/svg+xml";
+  if (name.endsWith(".jpg")) return "image/jpeg";
+  if (name.endsWith(".pdf")) return "application/pdf";
+  return "image/png";
+}
+
+function serveExport(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+  if (!pathname.startsWith("/files/")) return false;
+  const name = pathname.slice("/files/".length);
+  if (!exportNamePattern.test(name)) {
+    res.writeHead(404).end("not found");
+    return true;
+  }
+  const file = path.join(exportDirectory, name);
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || Date.now() - stat.mtimeMs > exportTTL) {
+      if (stat.isFile()) fs.unlinkSync(file);
+      res.writeHead(404).end("not found");
+      return true;
+    }
+    res.writeHead(200, {
+      "Content-Type": exportContentType(name),
+      "Content-Length": stat.size,
+      "Cache-Control": "private, max-age=300",
+      "X-Content-Type-Options": "nosniff",
+    });
+    fs.createReadStream(file).pipe(res);
+  } catch {
+    res.writeHead(404).end("not found");
+  }
+  return true;
+}
+
+async function readJSON(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 10 * 1024 * 1024) throw new Error("request body too large");
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+async function startHTTPServer() {
+  if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
+    throw new Error(`Invalid --port: ${httpPort}`);
+  }
+  fs.mkdirSync(exportDirectory, { recursive: true, mode: 0o700 });
+  cleanupExports();
+  const cleanupTimer = setInterval(cleanupExports, Math.min(exportTTL, 60 * 60 * 1000));
+  cleanupTimer.unref();
+
+  const configuredBase = process.env.NEXUS_TUNNEL_PUBLIC_BASE || process.env.BROKER_PUBLIC_BASE;
+  const remoteExportBase = (configuredBase || `http://${httpHost}:${httpPort}`).replace(/\/$/, "");
+  const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer; dispose: () => void }>();
+
+  const httpServer = createHttpServer(async (req, res) => {
+    try {
+      const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
+      if (req.method === "GET" && serveExport(req, res, pathname)) return;
+      if (pathname === "/health" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (pathname !== "/mcp") {
+        res.writeHead(404).end("not found");
+        return;
+      }
+
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      let entry = sessionId ? sessions.get(sessionId) : undefined;
+      let body: unknown;
+      if (req.method === "POST") body = await readJSON(req);
+
+      if (!entry && req.method === "POST" && !sessionId && isInitializeRequest(body)) {
+        let transport: StreamableHTTPServerTransport;
+        const { server: mcpServer, dispose } = createMcpServer({ remoteExportBase });
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: uuidv4,
+          onsessioninitialized: (id) => sessions.set(id, { transport, server: mcpServer, dispose }),
+        });
+        transport.onclose = () => {
+          if (transport.sessionId) sessions.delete(transport.sessionId);
+          dispose();
+        };
+        await mcpServer.connect(transport);
+        entry = { transport, server: mcpServer, dispose };
+      }
+
+      if (!entry) {
+        res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Invalid or missing MCP session" },
+          id: null,
+        }));
+        return;
+      }
+      await entry.transport.handleRequest(req, res, body);
+    } catch (error) {
+      logger.error(`HTTP request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+      if (!res.writableEnded) res.end(JSON.stringify({ error: "internal error" }));
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(httpPort, httpHost, resolve);
+  });
+  logger.info(`FigmaMCP Streamable HTTP server listening on http://${httpHost}:${httpPort}/mcp`);
+}
+
+// Start the server
+async function main() {
+  if (httpMode) {
+    await startHTTPServer();
+    return;
+  }
+  const { server } = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info('FigmaMCP server running on stdio');
@@ -3721,6 +3929,3 @@ main().catch(error => {
   logger.error(`Error starting FigmaMCP server: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });
-
-
-
