@@ -3416,7 +3416,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       types: import_zod.z.array(import_zod.z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
       pageId: import_zod.z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
       limit: import_zod.z.number().int().positive().optional().describe("Max matches to return (default 50, max 200)."),
-      fresh: import_zod.z.boolean().optional().describe("Skip the relay-built disk index and search the live file page by page. RARELY needed: the index is refreshed incrementally within minutes of edits, so prefer the default (index) path \u2014 a live full-file scan takes 30s+ and returns a partial result if it exceeds its 90s budget. Use only when you have concrete evidence the index is missing something changed seconds ago, or combine with pageId to keep it cheap.")
+      fresh: import_zod.z.boolean().optional().describe("Skip the relay-built disk index and search the live file page by page. RARELY needed: the index is refreshed incrementally within minutes of edits, so prefer the default (index) path \u2014 a live full-file scan takes 30s+ and returns a partial result if it exceeds its 60s budget. Use only when you have concrete evidence the index is missing something changed seconds ago, or combine with pageId to keep it cheap.")
     },
     async ({ query, queries, match, types, pageId, limit, fresh }) => {
       try {
@@ -3552,7 +3552,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         let totalMatches = 0;
         let totalScannedPages = 0;
         let truncated = false;
-        const LIVE_BUDGET_MS = 9e4;
+        const LIVE_BUDGET_MS = 6e4;
         const liveStart = Date.now();
         let budgetExhausted = false;
         for (const page of pageOrder) {
