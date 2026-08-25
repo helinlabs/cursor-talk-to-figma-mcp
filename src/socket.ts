@@ -17,7 +17,7 @@ import {
   type ProjectIndex,
 } from "./shared/search-index";
 
-const PROTOCOL_VERSION = "2.2.0";
+import { PROTOCOL_VERSION } from "./shared/version";
 
 function isProtocolCompatible(version: unknown): boolean {
   if (typeof version !== "string") return false;

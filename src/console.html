@@ -203,7 +203,17 @@
       // as mixed content. The relay accepts upgrades on every path, so this also
       // preserves the local http://localhost:3055/console workflow.
       const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname}`;
-      const PROTOCOL_VERSION = "2.0.0";
+      // Fallback only: the live value arrives with every snapshot/channels
+      // message from the relay and is kept in RELAY_PROTOCOL_VERSION below.
+      const PROTOCOL_VERSION = "2.2.0";
+      let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
+      const protoMajor = (v) => {
+        const m = Number(String(v || "").split(".")[0]);
+        return Number.isInteger(m) ? m : null;
+      };
+      // true when a client's protocol MAJOR differs from the relay's
+      const versionMismatch = (v) =>
+        v != null && protoMajor(v) !== null && protoMajor(v) !== protoMajor(RELAY_PROTOCOL_VERSION);
       const RING = 5000;          // browser-side ring buffer size
       const FLUSH_MS = 150;       // batch incoming events to avoid render storms
       const ROW_H = 26;
@@ -592,6 +602,14 @@
               <div className="member" key={cl.id}>
                 <span className={"badge " + cl.role}>{cl.role}</span>
                 <code>{cl.id}</code>
+                {cl.protocolVersion && (
+                  <code
+                    style={versionMismatch(cl.protocolVersion) ? { color: "#ff6b6b", fontWeight: 700 } : { opacity: 0.7 }}
+                    title={versionMismatch(cl.protocolVersion) ? `MAJOR version differs from relay v${RELAY_PROTOCOL_VERSION}` : "protocol version"}
+                  >
+                    v{cl.protocolVersion}{versionMismatch(cl.protocolVersion) ? " ⚠" : ""}
+                  </code>
+                )}
               </div>
             ))}
             {when && <div className="member"><code>{when}</code></div>}
@@ -656,12 +674,21 @@
                   <div className="member">
                     <code>busy {project.busy || 0} · recommended #{project.recommendedChannel || "—"}</code>
                   </div>
-                  {project.connections.map((connection) => (
-                    <div className="member" key={connection.channel}>
-                      <span className="badge figma">#{connection.channel}</span>
-                      <code>{connection.queueDepth || 0} active · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
-                    </div>
-                  ))}
+                  {project.connections.map((connection) => {
+                    const plugin = connection.clients.find((c) => c.role === "figma");
+                    const pv = plugin && plugin.protocolVersion;
+                    return (
+                      <div className="member" key={connection.channel}>
+                        <span className="badge figma">#{connection.channel}</span>
+                        <code>{connection.queueDepth || 0} active · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
+                        {pv && (
+                          <code style={versionMismatch(pv) ? { color: "#ff6b6b", fontWeight: 700 } : { opacity: 0.7 }}>
+                            v{pv}{versionMismatch(pv) ? " ⚠" : ""}
+                          </code>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               ))}
             </div>
@@ -967,7 +994,7 @@
             const to = setTimeout(() => reject(new Error("connect/join timeout")), 8000);
             // join as a controller (so the server labels us controller, not figma)
             ws.onopen = () => {
-              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: PROTOCOL_VERSION }));
+              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: RELAY_PROTOCOL_VERSION }));
               ws.send(JSON.stringify({ type: "join", channel: target, requesterId: "dashboard", id: genId(), message: { command: "join" } }));
             };
             ws.onerror = () => { clearTimeout(to); reject(new Error("socket error")); };
@@ -1172,6 +1199,7 @@
       // ----- Root app --------------------------------------------------------
       function App() {
         const [connected, setConnected] = useState(false);
+        const [relayVersion, setRelayVersion] = useState(null);
         const [channels, setChannels] = useState([]);
         const [projects, setProjects] = useState([]);
         const [bulkJobs, setBulkJobs] = useState([]);
@@ -1199,6 +1227,10 @@
             ws.onerror = () => { try { ws.close(); } catch {} };
             ws.onmessage = (ev) => {
               let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+              if (msg.protocolVersion) {
+                RELAY_PROTOCOL_VERSION = msg.protocolVersion;
+                setRelayVersion(msg.protocolVersion);
+              }
               if (msg.kind === "snapshot") {
                 setChannels(msg.channels || []);
                 setProjects(msg.projects || []);
@@ -1240,6 +1272,7 @@
             <div className="topbar">
               <span className={"dot " + (connected ? "on" : "off")}></span>
               <h1>Talk-to-Figma · Server Console</h1>
+              {relayVersion && <span className="badge" title="relay protocol version">relay v{relayVersion}</span>}
               <span className="muted">{WS_URL}</span>
               <span className="view-tabs">
                 <button className={"vtab" + (view === "logs" ? " active" : "")} onClick={() => setView("logs")}>Logs</button>

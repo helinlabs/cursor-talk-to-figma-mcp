@@ -367,6 +367,7 @@
                source. "loaded" is the re-run time, proving Figma reloaded. -->
           <p class="build-badge">
             build <span id="build-id">…</span><span id="build-loaded"></span>
+            · <span id="proto-versions">plugin v?</span>
           </p>
         </div>
       </div>
@@ -508,6 +509,11 @@
     </div>
 
     <script>
+      // Hardcoded copy of src/shared/version.ts (the plugin is not bundled, so
+      // it cannot import the shared module). Drift is caught at connect time:
+      // the relay's hello/join handshake rejects a MAJOR mismatch with a
+      // protocol_mismatch message, and the header badge below shows both
+      // versions with a warning. Bump this together with src/shared/version.ts.
       const PROTOCOL_VERSION = "2.2.0";
       // WebSocket connection state
       const state = {
@@ -542,15 +548,31 @@
         try {
           const portEl = document.getElementById("port");
           const port = (portEl && parseInt(portEl.value, 10)) || 3055;
+          const protoEl = document.getElementById("proto-versions");
+          if (protoEl) protoEl.textContent = "plugin v" + PROTOCOL_VERSION;
           fetch("http://localhost:" + port + "/plugin-version")
             .then((r) => r.json())
             .then((j) => {
               const el = document.getElementById("build-id");
               if (el && j && j.build) el.textContent = j.build;
+              // Show plugin + relay protocol versions side by side; a MAJOR
+              // mismatch is highlighted (the relay will also refuse the
+              // handshake in that case).
+              if (protoEl && j && j.protocolVersion) {
+                const major = (v) => String(v || "").split(".")[0];
+                const mismatch = major(j.protocolVersion) !== major(PROTOCOL_VERSION);
+                protoEl.textContent =
+                  "plugin v" + PROTOCOL_VERSION + " / relay v" + j.protocolVersion + (mismatch ? " ⚠ mismatch" : "");
+                if (mismatch) {
+                  protoEl.style.color = "#e5484d";
+                  protoEl.style.fontWeight = "700";
+                }
+              }
             })
             .catch(() => {
               const el = document.getElementById("build-id");
               if (el) el.textContent = "?";
+              if (protoEl) protoEl.textContent = "plugin v" + PROTOCOL_VERSION + " / relay unreachable";
             });
         } catch (e) {}
       })();

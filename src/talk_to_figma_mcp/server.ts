@@ -25,7 +25,7 @@ import {
   textMatchSnippet,
 } from "../shared/search-index";
 
-const PROTOCOL_VERSION = "2.2.0";
+import { PROTOCOL_VERSION, protocolMajor } from "../shared/version";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -3556,11 +3556,15 @@ async function joinChannel(channelName: string): Promise<void> {
 }
 
 // Function to send commands to Figma
-async function relayProjects(): Promise<any[]> {
+async function relayProjectsPayload(): Promise<any> {
   const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/projects" : `https://${serverUrl}/projects`;
   const response = await fetch(httpUrl);
   if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
-  return ((await response.json()) as any).projects || [];
+  return (await response.json()) as any;
+}
+
+async function relayProjects(): Promise<any[]> {
+  return (await relayProjectsPayload()).projects || [];
 }
 
 async function selectProject(query?: string): Promise<any> {
@@ -4136,13 +4140,58 @@ async function runBulk(job: BulkJob): Promise<void> {
 
 server.tool(
   "list_figma_projects",
-  "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients.",
+  "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients. The response starts with a versions summary ({mcp, relay}); use get_versions for the full per-plugin version picture.",
   {},
   async () => {
     try {
-      return { content: [{ type: "text", text: JSON.stringify({ current: selectedProject, projects: await relayProjects() }, null, 2) }] };
+      const payload = await relayProjectsPayload();
+      return { content: [{ type: "text", text: JSON.stringify({
+        versions: { mcp: PROTOCOL_VERSION, relay: payload.protocolVersion ?? null },
+        current: selectedProject,
+        projects: payload.projects || [],
+      }, null, 2) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error listing Figma projects: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_versions",
+  "Report the protocol versions of every talk-to-figma surface: this MCP server, the relay, and each connected Figma plugin (per project/channel), plus whether any MAJOR versions mismatch. Use this first when behavior seems inconsistent between surfaces — a mismatch means one of them is running stale code.",
+  {},
+  async () => {
+    try {
+      const mcp = PROTOCOL_VERSION;
+      let relay: string | null = null;
+      let relayError: string | undefined;
+      const plugins: Array<{ project: string; channel: string; protocolVersion: string | null }> = [];
+      try {
+        const payload = await relayProjectsPayload();
+        relay = payload.protocolVersion ?? null;
+        for (const project of payload.projects || []) {
+          for (const connection of project.connections || []) {
+            for (const client of connection.clients || []) {
+              if (client.role === "figma") {
+                plugins.push({ project: project.name, channel: connection.channel, protocolVersion: client.protocolVersion ?? null });
+              }
+            }
+          }
+        }
+      } catch (error) {
+        relayError = error instanceof Error ? error.message : String(error);
+      }
+      const majors = new Set(
+        [mcp, relay, ...plugins.map((p) => p.protocolVersion)]
+          .map((v) => protocolMajor(v))
+          .filter((m): m is number => m !== null)
+      );
+      const result: any = { mcp, relay, plugins, mismatch: majors.size > 1 };
+      if (relayError) result.relayError = relayError;
+      if (result.mismatch) result.note = "MAJOR versions differ between surfaces — update/rebuild the stale one(s) and reconnect (the relay refuses mismatched clients at handshake, so a listed mismatch usually means a surface has not reconnected since an update).";
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting versions: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
