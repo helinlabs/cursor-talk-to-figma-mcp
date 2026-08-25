@@ -267,7 +267,7 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 ### Connection management
 - `list_figma_projects` / `use_figma_project` — project-first discovery and connection
 - `get_figma_workload` — plugin/MCP connection counts and queued work
-- `get_current_figma_screenshot` — capture the local Figma app window by default, or use `captureMode: "node-export"`
+- `get_current_figma_screenshot` — capture the matching local Figma app window
 - `list_figma_channels` — list relay channels and which document each is on
 - `join_channel` — legacy low-level compatibility tool
 - `start_bulk_operations` / `get_bulk_operation` / `cancel_bulk_operation`

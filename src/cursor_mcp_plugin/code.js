@@ -158,7 +158,6 @@ figma.on("currentpagechange", () => {
 });
 
 figma.on("selectionchange", () => scheduleLivePreview(150));
-figma.on("documentchange", () => scheduleLivePreview(500));
 
 // Listen for plugin commands from menu
 figma.on("run", ({ command }) => {

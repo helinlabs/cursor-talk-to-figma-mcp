@@ -1416,18 +1416,16 @@ Failed: ${JSON.stringify(failures)}` : "")
   );
   server.tool(
     "get_current_figma_screenshot",
-    "Capture the current Figma view. By default Bun captures the matching local Figma application window on macOS (fast, requires Screen Recording permission and a visible local window). Set captureMode=node-export to export the selected design node, or the largest visible top-level node when nothing is selected. If outputPath is provided, save the image on the MCP server machine instead of returning it inline.",
+    "Capture the matching local Figma application window on macOS. This requires Screen Recording permission and a visible local Figma window. If outputPath is provided, save the image on the MCP server machine instead of returning it inline.",
     {
       maxDimension: z.number().int().min(320).max(2400).optional().describe("Maximum output width or height in pixels (default 1200)"),
-      captureMode: z.enum(["app-window", "node-export"]).optional().describe("Capture source; defaults to app-window"),
       outputPath: z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved"),
       saveToGallery: z.boolean().optional().describe("Save into the managed export gallery shown in the web dashboard")
     },
-    async ({ maxDimension, captureMode, outputPath, saveToGallery }) => {
+    async ({ maxDimension, outputPath, saveToGallery }) => {
       try {
-        const mode = captureMode || "app-window";
-        const localCapture = mode === "app-window" ? await captureLocalFigmaWindow(selectedProject?.name, maxDimension || 1200) : null;
-        const result = localCapture ? {
+        const localCapture = await captureLocalFigmaWindow(selectedProject?.name, maxDimension || 1200);
+        const result = {
           imageBytes: localCapture.bytes,
           mimeType: localCapture.mimeType,
           nodeName: localCapture.windowName,
@@ -1435,15 +1433,10 @@ Failed: ${JSON.stringify(failures)}` : "")
           width: localCapture.width,
           height: localCapture.height,
           capturedAt: localCapture.capturedAt
-        } : await sendCommandToFigma("get_current_figma_screenshot", {
-          maxDimension: maxDimension || 1200
-        });
+        };
         if (!result.imageBytes) throw new Error("Image payload was not received");
         const metadata = {
-          nodeId: result.nodeId,
           nodeName: result.nodeName,
-          pageId: result.pageId,
-          pageName: result.pageName,
           source: result.source,
           width: result.width,
           height: result.height,

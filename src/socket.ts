@@ -129,7 +129,7 @@ const clientMeta = new Map<ServerWebSocket<any>, ClientMeta>();
 const monitors = new Set<ServerWebSocket<any>>();
 const requests = new Map<string, RequestMeta>();
 const bulkJobs = new Map<string, any>();
-type PreviewMode = "app-window" | "node-export";
+type PreviewMode = "app-window";
 interface PreviewSubscription { channel: string; mode: PreviewMode }
 const previewSubscriptions = new Map<ServerWebSocket<any>, PreviewSubscription>();
 let localPreviewTimer: ReturnType<typeof setInterval> | null = null;
@@ -218,19 +218,6 @@ function chooseFigma(channelName: string): ServerWebSocket<any> | undefined {
 
 function previewSubscriberCount(channelName: string): number {
   return [...previewSubscriptions.values()].filter((subscription) => subscription.channel === channelName).length;
-}
-
-function nodePreviewSubscriberCount(channelName: string): number {
-  return [...previewSubscriptions.values()].filter((subscription) =>
-    subscription.channel === channelName && subscription.mode === "node-export"
-  ).length;
-}
-
-function sendPreviewControl(channelName: string, enabled: boolean): void {
-  const figma = chooseFigma(channelName);
-  if (figma?.readyState === WebSocket.OPEN) {
-    figma.send(JSON.stringify({ type: "preview_control", channel: channelName, enabled }));
-  }
 }
 
 function sendPreviewError(channelName: string, mode: PreviewMode, error: unknown): void {
@@ -1171,50 +1158,15 @@ const server = Bun.serve({
           if (!meta?.isMonitor) return;
           const nextChannel = typeof data.channel === "string" && data.channel ? data.channel : null;
           if (nextChannel && !channels.has(nextChannel)) return;
-          const nextMode: PreviewMode = data.mode === "node-export" ? "node-export" : "app-window";
+          const nextMode: PreviewMode = "app-window";
           const previous = previewSubscriptions.get(ws);
           if (previous?.channel === nextChannel && previous.mode === nextMode) return;
           if (previous) previewSubscriptions.delete(ws);
-          if (previous?.mode === "node-export" && nodePreviewSubscriberCount(previous.channel) === 0) {
-            sendPreviewControl(previous.channel, false);
-          }
           if (nextChannel) {
             previewSubscriptions.set(ws, { channel: nextChannel, mode: nextMode });
-            if (nextMode === "node-export") sendPreviewControl(nextChannel, true);
           }
           refreshLocalPreviewLoop();
           pushChannels();
-          return;
-        }
-
-        if (data.type === "preview_frame") {
-          if (!meta || meta.role !== "figma" || meta.channel !== data.channel) return;
-          const preview = { ...(data.preview || {}) };
-          delete preview.imageData;
-          for (const [subscriber, subscription] of previewSubscriptions) {
-            if (subscription.channel !== data.channel || subscription.mode !== "node-export" || subscriber.readyState !== WebSocket.OPEN) continue;
-            const subscriberMeta = clientMeta.get(subscriber);
-            const envelope = { kind: "preview_frame", channel: subscription.channel, preview };
-            if (binaryPayload && subscriberMeta?.capabilities.has("binaryFrames")) {
-              subscriber.send(encodeBinaryFrame(envelope, binaryPayload));
-            } else if (binaryPayload) {
-              subscriber.send(JSON.stringify({
-                ...envelope,
-                preview: { ...preview, imageData: Buffer.from(binaryPayload).toString("base64") },
-              }));
-            } else if (typeof data.preview?.imageData === "string") {
-              subscriber.send(JSON.stringify({ ...envelope, preview: data.preview }));
-            }
-          }
-          return;
-        }
-
-        if (data.type === "preview_error") {
-          for (const [subscriber, subscription] of previewSubscriptions) {
-            if (subscription.channel === data.channel && subscription.mode === "node-export" && subscriber.readyState === WebSocket.OPEN) {
-              subscriber.send(JSON.stringify({ kind: "preview_error", channel: subscription.channel, mode: subscription.mode, error: data.error }));
-            }
-          }
           return;
         }
 
@@ -1293,7 +1245,6 @@ const server = Bun.serve({
           channelDocs.set(channelName, data.document);
           channelAnnouncedAt.set(channelName, Date.now());
           if (meta) meta.role = "figma"; // only the plugin announces a document
-          if (nodePreviewSubscriberCount(channelName) > 0) sendPreviewControl(channelName, true);
           console.log(`\n📄 Channel "${channelName}" → document:`, JSON.stringify(data.document));
           pushEvent({ kind: "document", clientId: meta?.id, channel: channelName, document: data.document });
           pushChannels();
@@ -1562,11 +1513,7 @@ const server = Bun.serve({
       const meta = clientMeta.get(ws);
 
       monitors.delete(ws);
-      const previewSubscription = previewSubscriptions.get(ws);
       previewSubscriptions.delete(ws);
-      if (previewSubscription?.mode === "node-export" && nodePreviewSubscriberCount(previewSubscription.channel) === 0) {
-        sendPreviewControl(previewSubscription.channel, false);
-      }
       refreshLocalPreviewLoop();
 
       for (const [id, request] of requests) {
@@ -1637,8 +1584,6 @@ const server = Bun.serve({
           if (clients.size === 0) {
             emptyChannels.set(channelName, Date.now());
             pruneEmptyChannels();
-          } else if (meta?.role === "figma" && nodePreviewSubscriberCount(channelName) > 0) {
-            sendPreviewControl(channelName, true);
           }
         }
       });

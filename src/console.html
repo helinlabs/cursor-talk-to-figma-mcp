@@ -692,17 +692,14 @@
         );
       }
 
-      function PreviewPanel({ project, preview, captureMode, onModeChange, onClose }) {
+      function PreviewPanel({ project, preview, onClose }) {
         if (!project) return null;
         return (
           <div className="preview-panel">
             <div className="preview-head">
               <strong>Live Figma preview · {project.name || "(untitled)"}</strong>
               <span className="badge">only while this detail is open</span>
-              <select value={captureMode} onChange={(event) => onModeChange(event.target.value)} style={{ width: 190 }}>
-                <option value="app-window">Figma app window (default)</option>
-                <option value="node-export">Design node export</option>
-              </select>
+              <span className="badge">Figma app window</span>
               <button className="ghost" onClick={onClose}>Close preview</button>
             </div>
             <div className="preview-stage">
@@ -1335,13 +1332,9 @@
         const [view, setView] = useState("logs");   // main area: logs | explorer
         const [selectedProject, setSelectedProject] = useState(null);
         const [preview, setPreview] = useState(null);
-        const [captureMode, setCaptureMode] = useState(() =>
-          localStorage.getItem("talk-to-figma-preview-mode") === "node-export" ? "node-export" : "app-window"
-        );
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
         const desiredPreviewChannelRef = useRef(null);
-        const captureModeRef = useRef("app-window");
 
         pausedRef.current = paused;
 
@@ -1358,7 +1351,7 @@
               ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard-monitor", protocolVersion: PROTOCOL_VERSION, deviceName: "Web console monitor", platform: navigator.platform || navigator.userAgent, capabilities: ["binaryFrames", "livePreview"] }));
               ws.send(JSON.stringify({ type: "monitor" }));
               if (desiredPreviewChannelRef.current) {
-                ws.send(JSON.stringify({ type: "preview_subscribe", channel: desiredPreviewChannelRef.current, mode: captureModeRef.current }));
+                ws.send(JSON.stringify({ type: "preview_subscribe", channel: desiredPreviewChannelRef.current, mode: "app-window" }));
               }
             };
             ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 1500); };
@@ -1432,23 +1425,17 @@
         desiredPreviewChannelRef.current = selectedProject && view === "logs"
           ? selectedProject.recommendedChannel
           : null;
-        captureModeRef.current = captureMode;
-
-        useEffect(() => {
-          localStorage.setItem("talk-to-figma-preview-mode", captureMode);
-        }, [captureMode]);
-
         useEffect(() => {
           const channel = desiredPreviewChannelRef.current;
           const ws = monitorRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "preview_subscribe", channel, mode: captureMode }));
+            ws.send(JSON.stringify({ type: "preview_subscribe", channel, mode: "app-window" }));
           }
           setPreview((previous) => {
             if (previous?.url) URL.revokeObjectURL(previous.url);
             return null;
           });
-        }, [selectedProject?.recommendedChannel, view, captureMode]);
+        }, [selectedProject?.recommendedChannel, view]);
 
         const clear = () => { bufRef.current = []; queueRef.current = []; setVersion((v) => v + 1); };
         const clearEmpty = useCallback(() => {
@@ -1486,7 +1473,7 @@
                 <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">
-                {view === "logs" && <PreviewPanel project={selectedProject} preview={preview} captureMode={captureMode} onModeChange={setCaptureMode} onClose={() => setSelectedProject(null)} />}
+                {view === "logs" && <PreviewPanel project={selectedProject} preview={preview} onClose={() => setSelectedProject(null)} />}
                 {view === "logs"
                   ? <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
                   : <RequestExplorer projects={projects} />}
