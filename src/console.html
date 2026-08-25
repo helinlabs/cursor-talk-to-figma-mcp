@@ -141,8 +141,16 @@
       .gallery-item { background: #11131a; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; }
       .gallery-item img { width: 100%; height: 72px; object-fit: cover; display: block; background: #090a0d; }
       .gallery-caption { padding: 5px; font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      /* Full-width page for a single feature panel (non-overview tabs) */
+      .panel-page { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg); }
+      .panel-page > .section { max-width: 900px; margin: 0 auto; border-bottom: none; padding: 16px; }
+      .idx-page-row {
+        display: flex; gap: 8px; align-items: center; margin-top: 5px;
+        font-size: 12px; font-family: ui-monospace, Menlo, monospace;
+      }
+      .idx-page-row .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       /* View tabs in the top bar */
-      .view-tabs { display: inline-flex; gap: 4px; margin-left: 16px; }
+      .view-tabs { display: inline-flex; gap: 4px; margin-left: 16px; flex-wrap: wrap; }
       .vtab {
         background: transparent; border: 1px solid var(--border); color: var(--muted);
         padding: 5px 12px; border-radius: 6px; font-weight: 500; cursor: pointer; width: auto;
@@ -219,7 +227,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.5.1";
+      const PROTOCOL_VERSION = "2.5.2";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -777,10 +785,18 @@
         return `${Math.round(s / 86400)}d ago`;
       }
 
+      // Query-first index panel: clicking a project card opens a read-only
+      // DETAIL view (per-page builtAt/nodeCount/partial/dirty). Rebuilds only
+      // run from explicit small buttons behind a confirm dialog; per-page
+      // reindex (light) runs without confirm via POST /index/rebuild-page.
       function IndexPanel({ projects }) {
         const [status, setStatus] = useState(null);
         const [cacheStatus, setCacheStatus] = useState({}); // projectKey -> result|{error}
         const [busy, setBusy] = useState(false);
+        const [detailKey, setDetailKey] = useState(null);   // expanded project
+        const [detail, setDetail] = useState(null);         // /index/project result
+        const [pageBusy, setPageBusy] = useState({});       // pageId -> bool
+        const [pageMsg, setPageMsg] = useState({});         // pageId -> string
 
         const refresh = useCallback(async () => {
           try {
@@ -795,12 +811,54 @@
           return () => clearInterval(t);
         }, [refresh]);
 
-        const rebuild = async (projectKey) => {
+        const loadDetail = useCallback(async (projectKey) => {
+          setDetail({ loading: true });
+          try {
+            const r = await fetch(relayApiUrl("index/project") + `?project=${encodeURIComponent(projectKey)}`);
+            const data = await r.json();
+            setDetail(r.ok ? data : { error: data.error || `HTTP ${r.status}` });
+          } catch (e) { setDetail({ error: String(e) }); }
+        }, []);
+
+        const toggleDetail = (projectKey) => {
+          if (detailKey === projectKey) { setDetailKey(null); setDetail(null); return; }
+          setDetailKey(projectKey);
+          setPageMsg({});
+          loadDetail(projectKey);
+        };
+
+        const rebuild = async (projectKey, name) => {
+          const q = projectKey
+            ? `Rebuild the FULL index for "${name || projectKey}"? Every page is rescanned — this can take a while.`
+            : "Rebuild the FULL index for ALL live projects? Every page of every project is rescanned — this can take a while.";
+          if (!window.confirm(q)) return;
           setBusy(true);
           try {
             await fetch(relayApiUrl("index/rebuild") + (projectKey ? `?project=${encodeURIComponent(projectKey)}` : ""), { method: "POST" });
             await refresh();
           } finally { setBusy(false); }
+        };
+
+        const reindexPage = async (pageId) => {
+          if (!detailKey) return;
+          setPageBusy((s) => ({ ...s, [pageId]: true }));
+          setPageMsg((s) => ({ ...s, [pageId]: null }));
+          try {
+            const r = await fetch(relayApiUrl("index/rebuild-page"), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ project: detailKey, pageId }),
+            });
+            const data = await r.json();
+            if (r.status === 202) setPageMsg((s) => ({ ...s, [pageId]: "queued — another refresh is busy; picked up within 5 min" }));
+            else if (!r.ok) setPageMsg((s) => ({ ...s, [pageId]: "⚠ " + (data.error || `HTTP ${r.status}`) }));
+            await loadDetail(detailKey);
+            await refresh();
+          } catch (e) {
+            setPageMsg((s) => ({ ...s, [pageId]: "⚠ " + String(e) }));
+          } finally {
+            setPageBusy((s) => ({ ...s, [pageId]: false }));
+          }
         };
 
         const fetchCache = async (projectKey) => {
@@ -825,13 +883,14 @@
         const diskByKey = {};
         disk.forEach((d) => { diskByKey[d.projectKey] = d; });
 
+        const smallBtn = { padding: "2px 8px", fontSize: 11 };
         return (
           <div className="section">
             <h2>Search Index</h2>
             {!status && <div className="muted">Loading…</div>}
             {status && status.error && <div className="muted">{status.error}</div>}
             {status && !status.error && (
-              <div className="chan-card">
+              <div className="chan-card" style={{ cursor: "default" }}>
                 <div className="chan-head">
                   <span className="doc-name">{running ? "Indexing…" : "Idle"}</span>
                   <span className="badge">{running ? `${status.scannedPages}/${status.totalPages} pages` : `built ${fmtAge(status.lastCompletedAt)}`}</span>
@@ -849,17 +908,11 @@
                     </code>
                   </div>
                 )}
-                {status.dirty && status.dirty.projects && status.dirty.projects.map((dp) => (
-                  <div className="member" key={dp.projectKey} style={{ display: "block" }}>
-                    {dp.pages.map((pg) => (
-                      <div key={pg.pageId}><code>◔ {pg.pageName || pg.pageId} · dirty {fmtAge(pg.markedAt)}</code></div>
-                    ))}
-                  </div>
-                ))}
                 <div className="member">
-                  <button className="ghost" disabled={busy || running} onClick={() => rebuild()} style={{ padding: "2px 8px", fontSize: 11 }}>
-                    Reindex all now
+                  <button className="ghost" disabled={busy || running} onClick={() => rebuild()} style={smallBtn}>
+                    Rebuild all…
                   </button>
+                  <span className="muted" style={{ fontSize: 11 }}>full rescan of every live project (asks first)</span>
                 </div>
               </div>
             )}
@@ -867,19 +920,55 @@
               const d = diskByKey[projectKey];
               const j = jobByKey[projectKey];
               const cache = cacheStatus[projectKey];
+              const open = detailKey === projectKey;
               return (
-                <div className="chan-card" key={projectKey}>
-                  <div className="chan-head">
-                    <span className="doc-name">{info.name || "(untitled)"}</span>
+                <div className="chan-card" key={projectKey} style={{ cursor: "default" }}>
+                  <div className="chan-head" style={{ cursor: "pointer" }} onClick={() => toggleDetail(projectKey)} title="Click for per-page detail">
+                    <span className="doc-name"><span className="caret">{open ? "▾" : "▸"}</span>{info.name || "(untitled)"}</span>
                     <span className="badge">{d ? `${d.pageCount} pages · ${d.nodeCount} nodes` : "no index"}</span>
                   </div>
-                  <div className="member"><code>built {fmtAge(d && d.builtAt)}{j && running ? ` · scanning ${j.scannedPages}/${j.totalPages}` : ""}{j && j.failures && j.failures.length ? ` · ${j.failures.length} failed pages` : ""}{j && j.partial && j.partial.length ? ` · ${j.partial.length} partial pages` : ""}</code></div>
-                  <div className="member" style={{ gap: 6 }}>
-                    <button className="ghost" disabled={busy || running || !info.live} onClick={() => rebuild(projectKey)} style={{ padding: "2px 8px", fontSize: 11 }}>Reindex</button>
-                    <button className="ghost" disabled={!info.live} onClick={() => fetchCache(projectKey)} style={{ padding: "2px 8px", fontSize: 11 }}>Plugin cache</button>
-                  </div>
-                  {cache && cache.error && <div className="member"><code>⚠ {cache.error}</code></div>}
-                  {cache && cache.pages && (
+                  <div className="member"><code>built {fmtAge(d && d.builtAt)}{d && d.updatedAt && d.updatedAt !== d.builtAt ? ` · updated ${fmtAge(d.updatedAt)}` : ""}{j && running ? ` · scanning ${j.scannedPages}/${j.totalPages}` : ""}{j && j.failures && j.failures.length ? ` · ${j.failures.length} failed pages` : ""}{j && j.partial && j.partial.length ? ` · ${j.partial.length} partial pages` : ""}</code></div>
+
+                  {open && detail && detail.loading && <div className="member muted">Loading detail…</div>}
+                  {open && detail && detail.error && <div className="member"><code>⚠ {detail.error}</code></div>}
+                  {open && detail && detail.pages && (
+                    <div style={{ marginTop: 6 }}>
+                      {detail.pages.map((p) => (
+                        <div key={p.pageId}>
+                          <div className="idx-page-row">
+                            <span className="grow" title={p.pageId}>
+                              {p.dirty ? "◔ " : "● "}{p.pageName || p.pageId}
+                            </span>
+                            <span className="muted">{p.nodeCount} nodes · {fmtAge(p.builtAt)}</span>
+                            {p.partial && <span className="badge" title={p.partial.error || "some nodes were skipped"}>partial · {p.partial.skippedNodes} skipped</span>}
+                            {p.dirty && <span className="badge" title="changed since last index; queued for the incremental cycle">dirty</span>}
+                            <button
+                              className="ghost" style={smallBtn}
+                              disabled={!!pageBusy[p.pageId] || running || !info.live}
+                              title={info.live ? "Re-index only this page (light)" : "Needs a live plugin"}
+                              onClick={() => reindexPage(p.pageId)}
+                            >
+                              {pageBusy[p.pageId] ? "…" : "↻"}
+                            </button>
+                          </div>
+                          {pageMsg[p.pageId] && <div className="member"><code>{pageMsg[p.pageId]}</code></div>}
+                        </div>
+                      ))}
+                      {detail.failures && detail.failures.length > 0 && (
+                        <div className="member" style={{ display: "block" }}>
+                          {detail.failures.map((f, i) => (
+                            <div key={i}><code>✗ {f.pageName || f.pageId} · {f.error}</code></div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="member" style={{ gap: 6 }}>
+                        <button className="ghost" disabled={busy || running || !info.live} onClick={() => rebuild(projectKey, info.name)} style={smallBtn}>Rebuild project…</button>
+                        <button className="ghost" disabled={!info.live} onClick={() => fetchCache(projectKey)} style={smallBtn}>Plugin cache</button>
+                      </div>
+                    </div>
+                  )}
+                  {open && cache && cache.error && <div className="member"><code>⚠ {cache.error}</code></div>}
+                  {open && cache && cache.pages && (
                     <div className="member" style={{ display: "block" }}>
                       {cache.pages.map((p) => (
                         <div key={p.pageId}><code>{p.cached ? "●" : "○"} {p.name}{p.cached ? ` · ${p.nodeCount} nodes · ${fmtAge(p.builtAt)}` : ""}</code></div>
@@ -907,7 +996,24 @@
         const [busy, setBusy] = useState(false);
         const [error, setError] = useState(null);
 
-        const effectiveKey = projectKey || (projects[0] && projects[0].projectKey) || "";
+        // Selectable projects: live ones first, then disk-index-only ones
+        // (pages/search still work offline; goto/focus answer 503).
+        const [diskProjects, setDiskProjects] = useState([]);
+        useEffect(() => {
+          (async () => {
+            try {
+              const r = await fetch(relayApiUrl("index/status"));
+              const data = await r.json();
+              setDiskProjects((data.diskIndexes || []).map((d) => ({ projectKey: d.projectKey, name: d.projectName || d.projectKey })));
+            } catch {}
+          })();
+        }, []);
+        const options = projects.map((p) => ({ key: p.projectKey, name: p.name, live: true }));
+        for (const d of diskProjects) {
+          if (!options.some((o) => o.key === d.projectKey)) options.push({ key: d.projectKey, name: d.name, live: false });
+        }
+
+        const effectiveKey = projectKey || (options[0] && options[0].key) || "";
         const liveProject = projects.find((p) => p.projectKey === effectiveKey);
         // Current page name as announced by the plugin (best effort highlight).
         const currentPageName = liveProject
@@ -966,8 +1072,8 @@
           <div className="section">
             <h2>Navigator</h2>
             <select style={selStyle} value={projectKey} onChange={(e) => setProjectKey(e.target.value)}>
-              {!projects.length && <option value="">(no live projects)</option>}
-              {projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.name}</option>)}
+              {!options.length && <option value="">(no projects)</option>}
+              {options.map((o) => <option key={o.key} value={o.key}>{o.name}{o.live ? "" : " (offline — browse only)"}</option>)}
             </select>
             <div className="row" style={{ marginBottom: 6 }}>
               <input
@@ -993,7 +1099,8 @@
                 ))}
               </div>
             )}
-            {!pages && !error && <div className="muted">Loading pages…</div>}
+            {!effectiveKey && <div className="muted">No live or indexed Figma projects yet.</div>}
+            {effectiveKey && !pages && !error && <div className="muted">Loading pages…</div>}
             {pages && pages.pages.map((p) => {
               const isCurrent = currentPageName && p.pageName === currentPageName;
               const open = !!expanded[p.pageId];
@@ -1683,7 +1790,7 @@
         const [paused, setPaused] = useState(false);
         const [version, setVersion] = useState(0); // bumped on flush to trigger renders
         const [filter, setFilter] = useState("");  // shared: channel click sets this
-        const [view, setView] = useState("logs");   // main area: logs | explorer
+        const [view, setView] = useState("overview"); // top GNB: one feature group per screen
         const [selectedProject, setSelectedProject] = useState(null);
         const [preview, setPreview] = useState(null);
         const seqRef = useRef(0);
@@ -1776,7 +1883,7 @@
           return () => { alive = false; clearTimeout(retry); clearInterval(flush); try { ws.close(); } catch {} };
         }, []);
 
-        desiredPreviewChannelRef.current = selectedProject && view === "logs"
+        desiredPreviewChannelRef.current = selectedProject && view === "overview"
           ? selectedProject.recommendedChannel
           : null;
         useEffect(() => {
@@ -1797,45 +1904,71 @@
           if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "clear_empty" }));
         }, []);
 
+        // One feature group per screen. Overview keeps the live status +
+        // event log; every other tab renders its panel full-width.
+        const TABS = [
+          ["overview", "Overview"],
+          ["navigator", "Navigator"],
+          ["index", "Index"],
+          ["annotations", "Annotations"],
+          ["context", "Context"],
+          ["script", "Script"],
+          ["errors", "Errors"],
+          ["exports", "Exports"],
+          ["explorer", "Explorer"],
+        ];
         return (
           <>
             <div className="topbar">
               <span className={"dot " + (connected ? "on" : "off")}></span>
               <h1>Talk-to-Figma · Server Console</h1>
-              {relayVersion && <span className="badge" title="relay protocol version">relay v{relayVersion}</span>}
-              <span className="muted">{WS_URL}</span>
               <span className="view-tabs">
-                <button className={"vtab" + (view === "logs" ? " active" : "")} onClick={() => setView("logs")}>Logs</button>
-                <button className={"vtab" + (view === "explorer" ? " active" : "")} onClick={() => setView("explorer")}>Request Explorer</button>
+                {TABS.map(([id, label]) => (
+                  <button key={id} className={"vtab" + (view === id ? " active" : "")} onClick={() => setView(id)}>{label}</button>
+                ))}
               </span>
               <span style={{ marginLeft: "auto" }} className="row">
-                {view === "logs" && <button className="ghost" onClick={() => setPaused((p) => !p)}>{paused ? "Resume" : "Pause"}</button>}
-                {view === "logs" && <button className="ghost" onClick={clear}>Clear log</button>}
+                {view === "overview" && <button className="ghost" onClick={() => setPaused((p) => !p)}>{paused ? "Resume" : "Pause"}</button>}
+                {view === "overview" && <button className="ghost" onClick={clear}>Clear log</button>}
               </span>
             </div>
             <div className="main">
-              <div className="sidebar">
-                <Projects
-                  projects={projects}
-                  bulkJobs={bulkJobs}
-                  onProjectPick={(project) => { setSelectedProject(project); setFilter(project.name || project.projectKey); setView("logs"); }}
-                  onFilterPick={(value) => { setSelectedProject(null); setFilter(value); setView("logs"); }}
-                />
-                <NavigatorPanel projects={projects} />
-                <ExportGallery />
-                <IndexPanel projects={projects} />
-                <ProjectContextPanel projects={projects} />
-                <ScriptPanel projects={projects} />
-                <AnnotationsPanel projects={projects} />
-                <ErrorsPanel />
-                <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
-              </div>
-              <div className="logwrap">
-                {view === "logs" && <PreviewPanel project={selectedProject} preview={preview} onClose={() => setSelectedProject(null)} />}
-                {view === "logs"
-                  ? <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
-                  : <RequestExplorer projects={projects} />}
-              </div>
+              {view === "overview" && (
+                <>
+                  <div className="sidebar">
+                    <div className="section">
+                      <h2>Relay</h2>
+                      <div className="member">
+                        {relayVersion && <span className="badge" title="relay protocol version">relay v{relayVersion}</span>}
+                        <code className="muted">{WS_URL}</code>
+                      </div>
+                    </div>
+                    <Projects
+                      projects={projects}
+                      bulkJobs={bulkJobs}
+                      onProjectPick={(project) => { setSelectedProject(project); setFilter(project.name || project.projectKey); }}
+                      onFilterPick={(value) => { setSelectedProject(null); setFilter(value); }}
+                    />
+                    <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); }} onClearEmpty={clearEmpty} />
+                  </div>
+                  <div className="logwrap">
+                    <PreviewPanel project={selectedProject} preview={preview} onClose={() => setSelectedProject(null)} />
+                    <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
+                  </div>
+                </>
+              )}
+              {view === "navigator" && <div className="panel-page"><NavigatorPanel projects={projects} /></div>}
+              {view === "index" && <div className="panel-page"><IndexPanel projects={projects} /></div>}
+              {view === "annotations" && <div className="panel-page"><AnnotationsPanel projects={projects} /></div>}
+              {view === "context" && <div className="panel-page"><ProjectContextPanel projects={projects} /></div>}
+              {view === "script" && <div className="panel-page"><ScriptPanel projects={projects} /></div>}
+              {view === "errors" && <div className="panel-page"><ErrorsPanel /></div>}
+              {view === "exports" && <div className="panel-page"><ExportGallery /></div>}
+              {view === "explorer" && (
+                <div className="logwrap">
+                  <RequestExplorer projects={projects} />
+                </div>
+              )}
             </div>
           </>
         );

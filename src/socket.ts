@@ -1191,6 +1191,87 @@ const server = Bun.serve({
       });
     }
 
+    // Disk-index detail for ONE project (console index panel): per-page
+    // builtAt/nodeCount plus partial/failure info from the last job and any
+    // pending dirty marks. Read-only — answers from disk, no plugin needed.
+    if (url.pathname === "/index/project" && req.method === "GET") {
+      const project = url.searchParams.get("project") || "";
+      if (!project) {
+        return new Response(JSON.stringify({ error: "project query param is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const idx = resolveNavigatorIndex(project);
+      if (!idx) {
+        return new Response(JSON.stringify({ error: `No disk index for project "${project}"` }), { status: 404, headers: JSON_HEADERS });
+      }
+      const progress = loadIndexProgress().projects.find((p) => p.projectKey === idx.projectKey);
+      const partialByPage = new Map((progress?.partial ?? []).map((p) => [p.pageId, p]));
+      const dirtySet = dirtyPages.get(idx.projectKey);
+      return new Response(JSON.stringify({
+        projectKey: idx.projectKey,
+        projectName: idx.projectName ?? null,
+        builtAt: idx.builtAt,
+        updatedAt: idx.updatedAt,
+        pageCount: idx.pageCount,
+        nodeCount: idx.nodeCount,
+        live: resolveProjectChannel(idx.projectKey) !== null,
+        pages: idx.pages.map((p) => ({
+          pageId: p.pageId,
+          pageName: p.pageName,
+          builtAt: p.builtAt,
+          nodeCount: p.nodeCount,
+          partial: partialByPage.get(p.pageId) ?? null,
+          dirty: dirtySet?.has(p.pageId) ?? false,
+        })),
+        failures: progress?.failures ?? [],
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    // Re-index ONE page on demand (console): reuses the dirty-page incremental
+    // path — mark the page dirty, then run one incremental cycle right away.
+    // 409 while a full rebuild is running; 503 without a live plugin.
+    if (url.pathname === "/index/rebuild-page" && req.method === "POST") {
+      let body: any;
+      try {
+        body = await req.json();
+      } catch {
+        return new Response(JSON.stringify({ error: "JSON body is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const project = String(body?.project || "").trim();
+      const pageId = String(body?.pageId || "").trim();
+      if (!project || !pageId) {
+        return new Response(JSON.stringify({ error: "project and pageId are required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      if (indexer.state === "running") {
+        return new Response(JSON.stringify({ error: "a full index rebuild is running — it already rescans every page; retry after it completes" }), { status: 409, headers: JSON_HEADERS });
+      }
+      const idx = resolveNavigatorIndex(project);
+      if (!idx) {
+        return new Response(JSON.stringify({ error: `No disk index for project "${project}" — run a full build first (POST /index/rebuild)` }), { status: 404, headers: JSON_HEADERS });
+      }
+      const channel = resolveProjectChannel(idx.projectKey) ?? resolveNavigatorChannel(project);
+      if (!channel) {
+        return new Response(JSON.stringify({ error: `No live Figma plugin for project "${project}" — open the file in Figma and run the plugin, then retry` }), { status: 503, headers: JSON_HEADERS });
+      }
+      const known = idx.pages.find((p) => p.pageId === pageId);
+      markPageDirty(idx.projectKey, pageId, known?.pageName || String(body?.pageName || ""));
+      await runIncrementalReindex();
+      const stillDirty = dirtyPages.get(idx.projectKey)?.has(pageId) ?? false;
+      const after = loadProjectIndex(idx.projectKey);
+      const page = after?.pages.find((p) => p.pageId === pageId) ?? null;
+      if (stillDirty) {
+        // Another refresh cycle (or a just-started full rebuild) held the lock;
+        // the mark survives and the next incremental cycle picks it up.
+        return new Response(JSON.stringify({ queued: true, reason: "another index refresh is busy; the page stays queued for the next incremental cycle (runs every 5 minutes)", page }, null, 2), { status: 202, headers: JSON_HEADERS });
+      }
+      if (!page) {
+        return new Response(JSON.stringify({ error: "page could not be reindexed — it may have been deleted, or the dump failed (see /errors, source: indexer)" }), { status: 502, headers: JSON_HEADERS });
+      }
+      return new Response(JSON.stringify({
+        ok: true,
+        page: { pageId: page.pageId, pageName: page.pageName, builtAt: page.builtAt, nodeCount: page.nodeCount },
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
     // Plugin-side page cache status for a project (on-demand, for the console).
     if (url.pathname === "/index/cache-status") {
       const projectKey = url.searchParams.get("project") || "";
