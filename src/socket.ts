@@ -154,6 +154,7 @@ function handleConnection(ws: ServerWebSocket<any>) {
 
 const server = Bun.serve({
   port: Number(process.env.PORT) || 3055,
+  hostname: process.env.HOST || "127.0.0.1",
   // uncomment this to allow connections in windows wsl
   // hostname: "0.0.0.0",
   fetch(req: Request, server: Server) {
