@@ -784,7 +784,7 @@
 
         const refresh = useCallback(async () => {
           try {
-            const r = await fetch("/index/status");
+            const r = await fetch(relayApiUrl("index/status"));
             setStatus(await r.json());
           } catch (e) { setStatus({ error: String(e) }); }
         }, []);
@@ -798,14 +798,14 @@
         const rebuild = async (projectKey) => {
           setBusy(true);
           try {
-            await fetch("/index/rebuild" + (projectKey ? `?project=${encodeURIComponent(projectKey)}` : ""), { method: "POST" });
+            await fetch(relayApiUrl("index/rebuild") + (projectKey ? `?project=${encodeURIComponent(projectKey)}` : ""), { method: "POST" });
             await refresh();
           } finally { setBusy(false); }
         };
 
         const fetchCache = async (projectKey) => {
           try {
-            const r = await fetch(`/index/cache-status?project=${encodeURIComponent(projectKey)}`);
+            const r = await fetch(relayApiUrl("index/cache-status") + `?project=${encodeURIComponent(projectKey)}`);
             setCacheStatus((s) => ({ ...s, [projectKey]: null }));
             const data = await r.json();
             setCacheStatus((s) => ({ ...s, [projectKey]: data }));
@@ -885,7 +885,7 @@
 
         const refresh = useCallback(async () => {
           try {
-            const r = await fetch("/search/annotations");
+            const r = await fetch(relayApiUrl("search/annotations"));
             const data = await r.json();
             setItems(data.annotations || []);
           } catch (e) { setError(String(e)); }
@@ -896,7 +896,7 @@
         const add = async () => {
           setError(null);
           const projectKey = form.projectKey || (projects[0] && projects[0].projectKey) || "";
-          const r = await fetch("/search/annotations", {
+          const r = await fetch(relayApiUrl("search/annotations"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ keyword: form.keyword, projectKey, nodeId: form.nodeId, note: form.note || undefined }),
@@ -908,7 +908,7 @@
         };
 
         const remove = async (a) => {
-          await fetch(`/search/annotations?keyword=${encodeURIComponent(a.keyword)}&projectKey=${encodeURIComponent(a.projectKey)}&nodeId=${encodeURIComponent(a.nodeId)}`, { method: "DELETE" });
+          await fetch(relayApiUrl("search/annotations") + `?keyword=${encodeURIComponent(a.keyword)}&projectKey=${encodeURIComponent(a.projectKey)}&nodeId=${encodeURIComponent(a.nodeId)}`, { method: "DELETE" });
           refresh();
         };
 
