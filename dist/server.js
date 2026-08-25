@@ -337,7 +337,7 @@ function loadRelayErrors(opts) {
 }
 
 // src/shared/version.ts
-var PROTOCOL_VERSION = "2.5.0";
+var PROTOCOL_VERSION = "2.5.1";
 function protocolMajor(version) {
   if (typeof version !== "string") return null;
   const major = Number(version.split(".")[0]);

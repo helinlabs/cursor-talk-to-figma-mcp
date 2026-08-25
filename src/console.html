@@ -219,7 +219,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.5.0";
+      const PROTOCOL_VERSION = "2.5.1";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -889,6 +889,146 @@
                 </div>
               );
             })}
+          </div>
+        );
+      }
+
+      // ----- Navigator panel ------------------------------------------------
+      // Browse the disk index's pages/sections and drive the Figma viewport
+      // from the console: click a page → set_current_page, click a section or
+      // a search result → set_focus (select + scroll). Reads work from the
+      // disk index alone; goto/focus need a live plugin (relay answers 503).
+      function NavigatorPanel({ projects }) {
+        const [projectKey, setProjectKey] = useState("");
+        const [pages, setPages] = useState(null);       // GET /navigator/pages result
+        const [expanded, setExpanded] = useState({});   // pageId -> bool
+        const [query, setQuery] = useState("");
+        const [searchResults, setSearchResults] = useState(null);
+        const [busy, setBusy] = useState(false);
+        const [error, setError] = useState(null);
+
+        const effectiveKey = projectKey || (projects[0] && projects[0].projectKey) || "";
+        const liveProject = projects.find((p) => p.projectKey === effectiveKey);
+        // Current page name as announced by the plugin (best effort highlight).
+        const currentPageName = liveProject
+          && liveProject.connections
+          && liveProject.connections.map((c) => c.document && c.document.page).find(Boolean);
+
+        const loadPages = useCallback(async (key) => {
+          if (!key) return;
+          setError(null);
+          try {
+            const r = await fetch(relayApiUrl("navigator/pages") + `?project=${encodeURIComponent(key)}`);
+            const data = await r.json();
+            if (!r.ok) { setPages(null); setError(data.error || `HTTP ${r.status}`); return; }
+            setPages(data);
+          } catch (e) { setPages(null); setError(String(e)); }
+        }, []);
+
+        useEffect(() => {
+          setPages(null); setSearchResults(null); setExpanded({});
+          if (effectiveKey) loadPages(effectiveKey);
+        }, [effectiveKey, loadPages]);
+
+        const post = async (endpoint, body) => {
+          setBusy(true); setError(null);
+          try {
+            const r = await fetch(relayApiUrl(endpoint), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ project: effectiveKey, ...body }),
+            });
+            const data = await r.json();
+            if (!r.ok) setError(data.error || `HTTP ${r.status}`);
+          } catch (e) { setError(String(e)); }
+          finally { setBusy(false); }
+        };
+
+        const goto = (pageId) => post("navigator/goto", { pageId });
+        const focus = (nodeId) => post("navigator/focus", { nodeId });
+
+        const search = async () => {
+          const q = query.trim();
+          if (!q || !effectiveKey) return;
+          setBusy(true); setError(null);
+          try {
+            const r = await fetch(relayApiUrl("navigator/search") + `?project=${encodeURIComponent(effectiveKey)}&q=${encodeURIComponent(q)}&limit=50`);
+            const data = await r.json();
+            if (!r.ok) { setSearchResults(null); setError(data.error || `HTTP ${r.status}`); return; }
+            setSearchResults(data.results || []);
+          } catch (e) { setError(String(e)); }
+          finally { setBusy(false); }
+        };
+
+        const selStyle = { width: "100%", boxSizing: "border-box", marginBottom: 4, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", fontSize: 12 };
+        const rowBtn = { padding: "1px 7px", fontSize: 11 };
+        return (
+          <div className="section">
+            <h2>Navigator</h2>
+            <select style={selStyle} value={projectKey} onChange={(e) => setProjectKey(e.target.value)}>
+              {!projects.length && <option value="">(no live projects)</option>}
+              {projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.name}</option>)}
+            </select>
+            <div className="row" style={{ marginBottom: 6 }}>
+              <input
+                style={{ ...selStyle, marginBottom: 0 }}
+                placeholder="search nodes… (Enter)"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") search(); }}
+              />
+              <button className="ghost" style={rowBtn} disabled={busy || !query.trim() || !effectiveKey} onClick={search}>Search</button>
+              {searchResults && <button className="ghost" style={rowBtn} onClick={() => { setSearchResults(null); setQuery(""); }}>✕</button>}
+            </div>
+            {error && <div className="member"><code>⚠ {error}</code></div>}
+            {searchResults && (
+              <div className="chan-card">
+                <div className="chan-head"><span className="doc-name">Results</span><span className="badge">{searchResults.length}</span></div>
+                {!searchResults.length && <div className="member muted">No matches in the disk index.</div>}
+                {searchResults.map((n) => (
+                  <div className="member" key={n.id} style={{ cursor: "pointer" }} onClick={() => focus(n.id)} title={`Focus ${n.id} (select + scroll)`}>
+                    <span className="badge">{n.annotation ? "★" : (n.type || "?")}</span>
+                    <code>{n.name || "(unnamed)"}{n.pageName ? ` · ${n.pageName}` : ""}</code>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!pages && !error && <div className="muted">Loading pages…</div>}
+            {pages && pages.pages.map((p) => {
+              const isCurrent = currentPageName && p.pageName === currentPageName;
+              const open = !!expanded[p.pageId];
+              return (
+                <div className="chan-card" key={p.pageId} style={isCurrent ? { borderColor: "var(--green)" } : undefined}>
+                  <div className="chan-head">
+                    <span
+                      style={{ cursor: "pointer", flex: 1, color: isCurrent ? "var(--green)" : "var(--blue)", fontWeight: 600 }}
+                      onClick={() => goto(p.pageId)}
+                      title="Go to this page in Figma"
+                    >
+                      {isCurrent ? "● " : ""}{p.pageName || p.pageId}
+                    </span>
+                    <span
+                      className="badge"
+                      style={{ cursor: "pointer" }}
+                      onClick={() => setExpanded((s) => ({ ...s, [p.pageId]: !open }))}
+                      title="Show sections"
+                    >
+                      {open ? "▾" : "▸"} {p.sections.length}
+                    </span>
+                  </div>
+                  {open && !p.sections.length && <div className="member muted">No sections on this page.</div>}
+                  {open && p.sections.map((s) => (
+                    <div className="member" key={s.id} style={{ cursor: "pointer" }} onClick={() => focus(s.id)} title={`Focus ${s.id} (select + scroll)`}>
+                      <span className="badge">{s.type}</span>
+                      <code>{s.name || "(unnamed)"}</code>
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+            {pages && (
+              <div className="member"><code className="muted">index built {fmtAge(pages.builtAt)} · updated {fmtAge(pages.updatedAt)}</code></div>
+            )}
           </div>
         );
       }
@@ -1681,6 +1821,7 @@
                   onProjectPick={(project) => { setSelectedProject(project); setFilter(project.name || project.projectKey); setView("logs"); }}
                   onFilterPick={(value) => { setSelectedProject(null); setFilter(value); setView("logs"); }}
                 />
+                <NavigatorPanel projects={projects} />
                 <ExportGallery />
                 <IndexPanel projects={projects} />
                 <ProjectContextPanel projects={projects} />

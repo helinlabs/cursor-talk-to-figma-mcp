@@ -12,6 +12,7 @@ import {
   removeSearchAnnotations,
   replaceProjectAnnotations,
   normalizeKeywordKey,
+  findAnnotationsForKeys,
 } from "./shared/annotations-store";
 import {
   loadCachedProjectContext,
@@ -23,6 +24,8 @@ import {
   loadProjectIndex,
   saveProjectIndex,
   listProjectIndexSummaries,
+  buildNeedles,
+  findNormalizedMatch,
   type ProjectIndex,
 } from "./shared/search-index";
 import {
@@ -629,6 +632,28 @@ indexer.lastCompletedAt = loadIndexProgress().lastCompletedAt;
 function resolveProjectChannel(projectKey: string): string | null {
   const project = snapshotProjects().find((p) => p.projectKey === projectKey);
   return project?.recommendedChannel ?? null;
+}
+
+// Loose project resolution for the console Navigator: exact projectKey first,
+// then case-insensitive name substring (same convenience as /index/rebuild).
+function resolveNavigatorChannel(project: string): string | null {
+  const direct = resolveProjectChannel(project);
+  if (direct) return direct;
+  const f = project.toLowerCase();
+  const match = snapshotProjects().find(
+    (p) => p.connectionCount > 0 && p.recommendedChannel && String(p.name || "").toLowerCase().includes(f)
+  );
+  return match?.recommendedChannel ?? null;
+}
+
+function resolveNavigatorIndex(project: string): ProjectIndex | null {
+  const direct = loadProjectIndex(project);
+  if (direct) return direct;
+  const f = project.toLowerCase();
+  const summary = listProjectIndexSummaries().find(
+    (s) => String(s.projectName || "").toLowerCase().includes(f)
+  );
+  return summary ? loadProjectIndex(summary.projectKey) : null;
 }
 
 function indexEta(): { avgPageMs: number | null; etaMs: number | null } {
@@ -1354,6 +1379,121 @@ const server = Bun.serve({
           return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
         }
       }
+    }
+
+    // --- Navigator: page/section browsing + goto/focus from the console -----
+    // Read side (pages/search) answers from the DISK index (works offline);
+    // act side (goto/focus) needs a live plugin and 503s without one.
+    if (url.pathname === "/navigator/pages" && req.method === "GET") {
+      const project = url.searchParams.get("project") || "";
+      if (!project) {
+        return new Response(JSON.stringify({ error: "project query param is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const idx = resolveNavigatorIndex(project);
+      if (!idx) {
+        return new Response(JSON.stringify({ error: `No disk index for project "${project}" — run an index build first (POST /index/rebuild or wait for the auto/daily build)` }), { status: 404, headers: JSON_HEADERS });
+      }
+      const SECTION_TYPES = new Set(["FRAME", "COMPONENT", "COMPONENT_SET"]);
+      const pages = idx.pages.map((page) => ({
+        pageId: page.pageId,
+        pageName: page.pageName,
+        sections: page.entries
+          .filter((e) => e.type === "SECTION" || (SECTION_TYPES.has(e.type) && !e.path.includes(" > ")))
+          .slice(0, 100)
+          .map((e) => ({ id: e.id, name: e.name, type: e.type })),
+      }));
+      return new Response(JSON.stringify({
+        projectKey: idx.projectKey,
+        projectName: idx.projectName ?? null,
+        builtAt: idx.builtAt,
+        updatedAt: idx.updatedAt,
+        pages,
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    if ((url.pathname === "/navigator/goto" || url.pathname === "/navigator/focus") && req.method === "POST") {
+      const isGoto = url.pathname === "/navigator/goto";
+      const command = isGoto ? "set_current_page" : "set_focus";
+      let body: any;
+      try {
+        body = await req.json();
+      } catch {
+        return new Response(JSON.stringify({ error: "JSON body is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const project = String(body?.project || "").trim();
+      const targetId = String((isGoto ? body?.pageId : body?.nodeId) || "").trim();
+      if (!project || !targetId) {
+        return new Response(JSON.stringify({ error: `project and ${isGoto ? "pageId" : "nodeId"} are required` }), { status: 400, headers: JSON_HEADERS });
+      }
+      const channel = resolveNavigatorChannel(project);
+      if (!channel) {
+        return new Response(JSON.stringify({ error: `No live Figma plugin for project "${project}" — open the file in Figma and run the plugin, then retry` }), { status: 503, headers: JSON_HEADERS });
+      }
+      try {
+        const result = await sendInternalCommand(channel, command, isGoto ? { pageId: targetId } : { nodeId: targetId }, 15_000);
+        return new Response(JSON.stringify({ ok: true, result }, null, 2), { headers: JSON_HEADERS });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        recordRelayError({ source: "relay", project: channelProjectInfo(channel).name, command, message: `navigator ${isGoto ? "goto" : "focus"} failed: ${message}` });
+        return new Response(JSON.stringify({ error: message }), { status: 502, headers: JSON_HEADERS });
+      }
+    }
+
+    if (url.pathname === "/navigator/search" && req.method === "GET") {
+      const project = url.searchParams.get("project") || "";
+      const q = (url.searchParams.get("q") || "").trim();
+      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+      if (!project || !q) {
+        return new Response(JSON.stringify({ error: "project and q query params are required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const idx = resolveNavigatorIndex(project);
+      if (!idx) {
+        return new Response(JSON.stringify({ error: `No disk index for project "${project}" — run an index build first (POST /index/rebuild or wait for the auto/daily build)` }), { status: 404, headers: JSON_HEADERS });
+      }
+      const needle = buildNeedles([q])[0];
+      if (!needle) {
+        return new Response(JSON.stringify({ results: [] }), { headers: JSON_HEADERS });
+      }
+      type NavResult = { id: string; name: string; type: string | null; pageId: string | null; pageName: string | null; path: string | null; annotation?: boolean };
+      const results: NavResult[] = [];
+      const seen = new Set<string>();
+      // Annotation cache matches go on top (same precedence as search_nodes).
+      const annotated = findAnnotationsForKeys(idx.projectKey, [normalizeKeywordKey(q)]);
+      const entryById = new Map<string, { entry: any; page: any }>();
+      for (const page of idx.pages) {
+        for (const entry of page.entries) entryById.set(entry.id, { entry, page });
+      }
+      for (const a of annotated) {
+        if (seen.has(a.nodeId)) continue;
+        seen.add(a.nodeId);
+        const hit = entryById.get(a.nodeId);
+        results.push({
+          id: a.nodeId,
+          name: hit?.entry.name ?? a.nodeName ?? "",
+          type: hit?.entry.type ?? null,
+          pageId: hit?.page.pageId ?? null,
+          pageName: hit?.page.pageName ?? null,
+          path: hit?.entry.path ?? null,
+          annotation: true,
+        });
+      }
+      outer: for (const page of idx.pages) {
+        for (const entry of page.entries) {
+          if (results.length >= limit) break outer;
+          if (seen.has(entry.id)) continue;
+          if (!findNormalizedMatch(entry.name || "", needle.qLower, needle.qLowerNoSpace)) continue;
+          seen.add(entry.id);
+          results.push({
+            id: entry.id,
+            name: entry.name,
+            type: entry.type,
+            pageId: page.pageId,
+            pageName: page.pageName,
+            path: entry.path,
+          });
+        }
+      }
+      return new Response(JSON.stringify({ results: results.slice(0, limit) }, null, 2), { headers: JSON_HEADERS });
     }
 
     if (url.pathname === "/status") {
