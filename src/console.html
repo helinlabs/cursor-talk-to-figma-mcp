@@ -137,6 +137,10 @@
       .preview-stage { min-height: 120px; max-height: 420px; display: flex; align-items: center; justify-content: center; overflow: auto; background: #090a0d; border: 1px solid var(--border); border-radius: 7px; }
       .preview-stage img { display: block; max-width: 100%; max-height: 400px; object-fit: contain; }
       .preview-meta { color: var(--muted); font-size: 11px; margin-top: 7px; }
+      .gallery-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
+      .gallery-item { background: #11131a; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; }
+      .gallery-item img { width: 100%; height: 72px; object-fit: cover; display: block; background: #090a0d; }
+      .gallery-caption { padding: 5px; font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       /* View tabs in the top bar */
       .view-tabs { display: inline-flex; gap: 4px; margin-left: 16px; }
       .vtab {
@@ -209,6 +213,12 @@
         ? location.pathname.slice(0, -"console".length)
         : location.pathname;
       const WS_URL = `${wsProtocol}//${location.host}${wsPath || "/"}`;
+      function relayApiUrl(endpoint) {
+        const url = new URL(WS_URL);
+        url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+        url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
+        return url.toString();
+      }
       const PROTOCOL_VERSION = "2.1.0";
       const RING = 5000;          // browser-side ring buffer size
       const FLUSH_MS = 150;       // batch incoming events to avoid render storms
@@ -736,6 +746,58 @@
         );
       }
 
+      function ExportGallery() {
+        const [gallery, setGallery] = useState(null);
+        const [days, setDays] = useState(30);
+        const [busy, setBusy] = useState(false);
+        const load = useCallback(async () => {
+          try {
+            const response = await fetch(relayApiUrl("exports"));
+            const data = await response.json();
+            setGallery(data);
+            if (data.retentionDays) setDays(data.retentionDays);
+          } catch {}
+        }, []);
+        useEffect(() => { load(); const timer = setInterval(load, 10000); return () => clearInterval(timer); }, [load]);
+        const clean = async (all) => {
+          if (all && !window.confirm("Delete every image in the managed export gallery? This cannot be undone.")) return;
+          setBusy(true);
+          try {
+            const suffix = all ? "" : `?olderThanDays=${Math.max(0, Number(days) || 0)}`;
+            const response = await fetch(relayApiUrl(`exports${suffix}`), { method: "DELETE" });
+            const data = await response.json();
+            setGallery(data.gallery || gallery);
+          } finally { setBusy(false); }
+        };
+        const formatBytes = (bytes) => bytes >= 1024 * 1024
+          ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
+          : `${Math.round((bytes || 0) / 1024)} KB`;
+        return (
+          <div className="section">
+            <h2>Generated Images</h2>
+            <div className="member"><code>{gallery?.files?.length || 0} files · {formatBytes(gallery?.totalBytes || 0)} · auto-delete after {gallery?.retentionDays || 30} days</code></div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <input type="number" min="0" value={days} onChange={(e) => setDays(e.target.value)} title="Delete files older than this many days" />
+              <button className="ghost" disabled={busy} onClick={() => clean(false)}>Delete older</button>
+              <button className="ghost" disabled={busy || !gallery?.files?.length} onClick={() => clean(true)}>Delete all</button>
+            </div>
+            <div className="gallery-grid">
+              {(gallery?.files || []).slice(0, 20).map((file) => {
+                const fileUrl = relayApiUrl(`exports/file/${encodeURIComponent(file.name)}`);
+                return (
+                  <div className="gallery-item" key={file.name} title={`${file.name}\n${formatBytes(file.bytes)}\n${new Date(file.createdAt).toLocaleString()}`} onClick={() => window.open(fileUrl, "_blank")}>
+                    {file.mimeType.startsWith("image/") && file.mimeType !== "image/svg+xml"
+                      ? <img src={fileUrl} loading="lazy" alt={file.name} />
+                      : <div style={{ height: 72, display: "grid", placeItems: "center" }}>{file.mimeType.includes("pdf") ? "PDF" : "SVG"}</div>}
+                    <div className="gallery-caption">{file.name} · {formatBytes(file.bytes)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      }
+
       // ----- Test call panel (uses its own peer WebSocket) -------------------
       // ----- Swagger-style request explorer ---------------------------------
       function Field({ p, value, onChange }) {
@@ -1212,6 +1274,7 @@
                   onProjectPick={(project) => { setSelectedProject(project); setFilter(project.name || project.projectKey); setView("logs"); }}
                   onFilterPick={(value) => { setSelectedProject(null); setFilter(value); setView("logs"); }}
                 />
+                <ExportGallery />
                 <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">

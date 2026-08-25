@@ -34,65 +34,110 @@ var os = __toESM(require("os"), 1);
 
 // src/local-figma-capture.ts
 var import_node_child_process = require("child_process");
+var import_node_crypto = require("crypto");
 var import_promises = require("fs/promises");
+var import_node_fs = require("fs");
 var import_node_os = require("os");
 var import_node_path = require("path");
 var import_node_util = require("util");
 var execFileAsync = (0, import_node_util.promisify)(import_node_child_process.execFile);
-var WINDOW_SCRIPT = `
-function run(argv) {
-  const wanted = String(argv[0] || "");
-  const normalize = (value) => String(value || "").replace(/^[^A-Za-z0-9\uAC00-\uD7A3]+/, "").trim().toLowerCase();
-  const target = normalize(wanted);
-  const systemEvents = Application("System Events");
-  const process = systemEvents.processes.byName("Figma");
-  if (!process.exists()) throw new Error("Figma application is not running on this Mac");
-  const windows = process.windows().map((window) => ({
-    name: String(window.name() || ""),
-    position: window.position(),
-    size: window.size(),
-  }));
-  const match = target
-    ? windows.find((window) => {
-        const name = normalize(window.name);
-        return name === target || name.includes(target) || target.includes(name);
-      })
-    : windows[0];
-  if (!match) throw new Error("No local Figma window matches project: " + wanted);
-  return JSON.stringify(match);
-}`;
+var WINDOW_HELPER_SOURCE = String.raw`
+import Cocoa
+import CoreGraphics
+
+func normalize(_ value: String) -> String {
+  let scalars = value.unicodeScalars.drop { !CharacterSet.alphanumerics.contains($0) }
+  let stripped = String(String.UnicodeScalarView(scalars))
+  return stripped.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+}
+
+let wanted = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+let target = normalize(wanted)
+let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+guard let rows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+  fputs("Could not enumerate macOS windows\n", stderr); exit(2)
+}
+let figmaWindows = rows.compactMap { row -> [String: Any]? in
+  guard (row[kCGWindowOwnerName as String] as? String) == "Figma",
+        (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+        let number = row[kCGWindowNumber as String] as? NSNumber else { return nil }
+  let name = row[kCGWindowName as String] as? String ?? ""
+  return ["id": number.intValue, "name": name]
+}
+let namedMatch = target.isEmpty ? figmaWindows.first : figmaWindows.first { row in
+  let name = normalize(row["name"] as? String ?? "")
+  return name == target || name.contains(target) || target.contains(name)
+}
+// macOS hides window titles from background processes until Screen Recording
+// permission is granted. A single Figma window is still unambiguous.
+let match = namedMatch ?? (figmaWindows.count == 1 ? figmaWindows.first : nil)
+guard let window = match else {
+  fputs("No local Figma window matches project: \(wanted)\n", stderr); exit(3)
+}
+let data = try JSONSerialization.data(withJSONObject: window)
+print(String(data: data, encoding: .utf8)!)
+`;
+var helperPromise = null;
+async function localWindowHelper() {
+  if (helperPromise) return helperPromise;
+  helperPromise = (async () => {
+    const hash = (0, import_node_crypto.createHash)("sha256").update(WINDOW_HELPER_SOURCE).digest("hex").slice(0, 12);
+    const helperPath = (0, import_node_path.join)((0, import_node_os.tmpdir)(), `talk-to-figma-window-${hash}`);
+    try {
+      await (0, import_promises.access)(helperPath, import_node_fs.constants.X_OK);
+      return helperPath;
+    } catch {
+    }
+    const buildDir = await (0, import_promises.mkdtemp)((0, import_node_path.join)((0, import_node_os.tmpdir)(), "talk-to-figma-window-build-"));
+    const sourcePath = (0, import_node_path.join)(buildDir, "main.swift");
+    const outputPath = (0, import_node_path.join)(buildDir, "window-helper");
+    try {
+      await (0, import_promises.writeFile)(sourcePath, WINDOW_HELPER_SOURCE, "utf8");
+      await execFileAsync("/usr/bin/swiftc", [sourcePath, "-O", "-o", outputPath]);
+      await (0, import_promises.chmod)(outputPath, 493);
+      await (0, import_promises.rename)(outputPath, helperPath);
+      return helperPath;
+    } finally {
+      await (0, import_promises.rm)(buildDir, { recursive: true, force: true });
+    }
+  })();
+  return helperPromise;
+}
 async function captureLocalFigmaWindow(projectName, maxDimension = 1400) {
   if (process.platform !== "darwin") {
     throw new Error("Local Figma window capture is currently supported on macOS only");
   }
-  const { stdout } = await execFileAsync("/usr/bin/osascript", [
-    "-l",
-    "JavaScript",
-    "-e",
-    WINDOW_SCRIPT,
-    projectName || ""
-  ], { maxBuffer: 1024 * 1024 });
-  const windowInfo = JSON.parse(stdout.trim());
-  const [x, y] = windowInfo.position.map((value) => Math.round(value));
-  const [width, height] = windowInfo.size.map((value) => Math.max(1, Math.round(value)));
+  let windowInfo;
+  try {
+    const { stdout } = await execFileAsync(await localWindowHelper(), [projectName || ""], { maxBuffer: 1024 * 1024 });
+    windowInfo = JSON.parse(stdout.trim());
+  } catch (error) {
+    const detail = String(error?.stderr || error?.message || error).trim();
+    throw new Error(detail || `No local Figma window matches project: ${projectName || "current"}`);
+  }
   const captureDir = await (0, import_promises.mkdtemp)((0, import_node_path.join)((0, import_node_os.tmpdir)(), "talk-to-figma-preview-"));
   const capturePath = (0, import_node_path.join)(captureDir, "figma-window.jpg");
   try {
     try {
-      await execFileAsync("/usr/sbin/screencapture", ["-x", `-R${x},${y},${width},${height}`, "-tjpg", capturePath]);
+      await execFileAsync("/usr/sbin/screencapture", ["-x", "-o", `-l${windowInfo.id}`, "-tjpg", capturePath]);
     } catch {
       throw new Error("Could not capture the local Figma window. Grant Screen Recording permission to the Bun/relay process and keep the Figma window visible.");
     }
-    const scale = Math.min(1, Math.max(320, maxDimension) / Math.max(width, height));
-    if (scale < 1) {
-      await execFileAsync("/usr/bin/sips", ["-Z", String(Math.round(Math.max(width, height) * scale)), capturePath]);
+    const { stdout: originalDimensions } = await execFileAsync("/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", capturePath]);
+    const originalWidth = Number(originalDimensions.match(/pixelWidth:\s*(\d+)/)?.[1]) || maxDimension;
+    const originalHeight = Number(originalDimensions.match(/pixelHeight:\s*(\d+)/)?.[1]) || maxDimension;
+    if (Math.max(originalWidth, originalHeight) > Math.max(320, maxDimension)) {
+      await execFileAsync("/usr/bin/sips", ["-Z", String(Math.max(320, maxDimension)), capturePath]);
     }
+    const { stdout: dimensions } = await execFileAsync("/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", capturePath]);
+    const pixelWidth = Number(dimensions.match(/pixelWidth:\s*(\d+)/)?.[1]) || originalWidth;
+    const pixelHeight = Number(dimensions.match(/pixelHeight:\s*(\d+)/)?.[1]) || originalHeight;
     return {
       bytes: await (0, import_promises.readFile)(capturePath),
       mimeType: "image/jpeg",
-      windowName: windowInfo.name,
-      width: Math.max(1, Math.round(width * scale)),
-      height: Math.max(1, Math.round(height * scale)),
+      windowName: windowInfo.name || projectName || "Figma",
+      width: pixelWidth,
+      height: pixelHeight,
       capturedAt: Date.now()
     };
   } finally {
@@ -162,6 +207,21 @@ function relayHttpUrl(endpoint) {
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
   url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
   return url.toString();
+}
+async function saveToRelayGallery(bytes, suggestedName, extension) {
+  const body = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Buffer.from(bytes);
+  const response = await fetch(relayHttpUrl("exports"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Figma-Export-Name": encodeURIComponent(suggestedName),
+      "X-Figma-Export-Extension": extension
+    },
+    body
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `Gallery upload failed with HTTP ${response.status}`);
+  return result;
 }
 server.tool(
   "get_document_info",
@@ -1098,9 +1158,10 @@ server.tool(
     format: import_zod.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format (default PNG)"),
     scale: import_zod.z.number().positive().optional().describe("Export scale (raster only, default 1)"),
     outputPath: import_zod.z.string().optional().describe("If set, save the export to this file path (absolute, or relative to the server's working dir) instead of returning it inline. Parent directories are created automatically."),
+    saveToGallery: import_zod.z.boolean().optional().describe("Save into the relay/MCP managed export gallery so it can be browsed and cleaned from the web dashboard"),
     includeColorTokens: import_zod.z.boolean().optional().describe("SVG only: also return `colorTokens` ([{token, hex, property}], document order) listing every paint bound to a color variable, so the caller can map resolved colors back to design tokens. The SVG itself keeps real colors.")
   },
-  async ({ nodeId, format, scale, outputPath, includeColorTokens }) => {
+  async ({ nodeId, format, scale, outputPath, saveToGallery, includeColorTokens }) => {
     try {
       const fmt = (format || "PNG").toUpperCase();
       const result = await sendCommandToFigma("export_node_as_image", {
@@ -1109,6 +1170,13 @@ server.tool(
         scale: scale || 1,
         includeColorTokens: !!includeColorTokens
       });
+      if (saveToGallery && !outputPath) {
+        const extension = fmt === "JPG" ? "jpg" : fmt.toLowerCase();
+        const payload = fmt === "SVG" && typeof result.svg === "string" ? result.svg : result.imageBytes;
+        if (!payload) throw new Error("Image payload was not received");
+        const gallery = await saveToRelayGallery(payload, result.nodeName || "figma-export", extension);
+        return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, nodeName: result.nodeName, format: fmt }) }] };
+      }
       if (outputPath) {
         const resolved = path.resolve(outputPath);
         fs.mkdirSync(path.dirname(resolved), { recursive: true });
@@ -1178,9 +1246,10 @@ server.tool(
   {
     maxDimension: import_zod.z.number().int().min(320).max(2400).optional().describe("Maximum output width or height in pixels (default 1200)"),
     captureMode: import_zod.z.enum(["app-window", "node-export"]).optional().describe("Capture source; defaults to app-window"),
-    outputPath: import_zod.z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved")
+    outputPath: import_zod.z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved"),
+    saveToGallery: import_zod.z.boolean().optional().describe("Save into the managed export gallery shown in the web dashboard")
   },
-  async ({ maxDimension, captureMode, outputPath }) => {
+  async ({ maxDimension, captureMode, outputPath, saveToGallery }) => {
     try {
       const mode = captureMode || "app-window";
       const localCapture = mode === "app-window" ? await captureLocalFigmaWindow(selectedProject?.name, maxDimension || 1200) : null;
@@ -1206,6 +1275,11 @@ server.tool(
         height: result.height,
         capturedAt: result.capturedAt
       };
+      if (saveToGallery && !outputPath) {
+        const extension = result.mimeType === "image/jpeg" ? "jpg" : "png";
+        const gallery = await saveToRelayGallery(result.imageBytes, result.nodeName || "figma-screenshot", extension);
+        return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, ...metadata }) }] };
+      }
       if (outputPath) {
         const resolved = path.resolve(outputPath);
         fs.mkdirSync(path.dirname(resolved), { recursive: true });

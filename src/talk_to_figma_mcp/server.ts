@@ -159,6 +159,22 @@ function relayHttpUrl(endpoint: string): string {
   return url.toString();
 }
 
+async function saveToRelayGallery(bytes: Uint8Array | string, suggestedName: string, extension: string): Promise<any> {
+  const body = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Buffer.from(bytes);
+  const response = await fetch(relayHttpUrl("exports"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Figma-Export-Name": encodeURIComponent(suggestedName),
+      "X-Figma-Export-Extension": extension,
+    },
+    body,
+  });
+  const result: any = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `Gallery upload failed with HTTP ${response.status}`);
+  return result;
+}
+
 // Document Info Tool
 server.tool(
   "get_document_info",
@@ -1261,12 +1277,13 @@ server.tool(
       .string()
       .optional()
       .describe("If set, save the export to this file path (absolute, or relative to the server's working dir) instead of returning it inline. Parent directories are created automatically."),
+    saveToGallery: z.boolean().optional().describe("Save into the relay/MCP managed export gallery so it can be browsed and cleaned from the web dashboard"),
     includeColorTokens: z
       .boolean()
       .optional()
       .describe("SVG only: also return `colorTokens` ([{token, hex, property}], document order) listing every paint bound to a color variable, so the caller can map resolved colors back to design tokens. The SVG itself keeps real colors."),
   },
-  async ({ nodeId, format, scale, outputPath, includeColorTokens }: any) => {
+  async ({ nodeId, format, scale, outputPath, saveToGallery, includeColorTokens }: any) => {
     try {
       const fmt = (format || "PNG").toUpperCase();
       const result = (await sendCommandToFigma("export_node_as_image", {
@@ -1286,6 +1303,14 @@ server.tool(
       };
 
       // --- Save to disk when an output path is provided ---------------------
+      if (saveToGallery && !outputPath) {
+        const extension = fmt === "JPG" ? "jpg" : fmt.toLowerCase();
+        const payload = fmt === "SVG" && typeof result.svg === "string" ? result.svg : result.imageBytes;
+        if (!payload) throw new Error("Image payload was not received");
+        const gallery = await saveToRelayGallery(payload, result.nodeName || "figma-export", extension);
+        return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, nodeName: result.nodeName, format: fmt }) }] };
+      }
+
       if (outputPath) {
         const resolved = path.resolve(outputPath);
         fs.mkdirSync(path.dirname(resolved), { recursive: true });
@@ -1364,8 +1389,9 @@ server.tool(
     maxDimension: z.number().int().min(320).max(2400).optional().describe("Maximum output width or height in pixels (default 1200)"),
     captureMode: z.enum(["app-window", "node-export"]).optional().describe("Capture source; defaults to app-window"),
     outputPath: z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved"),
+    saveToGallery: z.boolean().optional().describe("Save into the managed export gallery shown in the web dashboard"),
   },
-  async ({ maxDimension, captureMode, outputPath }: any) => {
+  async ({ maxDimension, captureMode, outputPath, saveToGallery }: any) => {
     try {
       const mode = captureMode || "app-window";
       const localCapture = mode === "app-window"
@@ -1404,6 +1430,11 @@ server.tool(
         height: result.height,
         capturedAt: result.capturedAt,
       };
+      if (saveToGallery && !outputPath) {
+        const extension = result.mimeType === "image/jpeg" ? "jpg" : "png";
+        const gallery = await saveToRelayGallery(result.imageBytes, result.nodeName || "figma-screenshot", extension);
+        return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, ...metadata }) }] };
+      }
       if (outputPath) {
         const resolved = path.resolve(outputPath);
         fs.mkdirSync(path.dirname(resolved), { recursive: true });

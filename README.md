@@ -137,6 +137,7 @@ In the AI client:
 | Project connections and recommended targets | http://localhost:3055/projects |
 | Workload, in-flight requests, and bulk jobs | http://localhost:3055/status |
 | Current plugin build hash (matches the plugin badge) | http://localhost:3055/plugin-version |
+| Managed export gallery JSON / files | http://localhost:3055/exports |
 | Relay health (running? crashes?) | `./scripts/relayctl.sh status` |
 | Relay logs / crash history | `./scripts/relayctl.sh logs` · `crashes` · files under `.relay/` |
 | Which plugin code Figma loaded | the **build badge** in the plugin window |
@@ -159,11 +160,22 @@ During development, backward-compatible features increment the v2 minor/patch
 version. Formal release versions and tags are managed separately.
 
 The dashboard starts a live preview only while a viewer has opened a specific
-project detail. The default `Figma app window` mode captures a matching visible
-local macOS Figma window every two seconds and requires Screen Recording
-permission for the relay process. `Design node export` uses the connected Figma
+project detail. The default `Figma app window` mode captures a matching on-screen
+local macOS Figma window by CoreGraphics window id every two seconds and requires
+Screen Recording permission for the relay/Bun process. It still works when the
+window is partly covered, but minimized windows are unavailable. `Design node export` uses the connected Figma
 plugin instead, works even when the app window is covered, and updates after
 selection/document changes. With no viewers, neither capture path runs.
+
+Inline MCP images and live previews are not stored. Pass `saveToGallery: true`
+to `export_node_as_image` or `get_current_figma_screenshot` to upload a managed
+copy to the relay gallery. The dashboard lists files, thumbnails, count, and
+total size and can delete files older than a chosen number of days or delete the
+entire gallery. Managed files live under `.relay/exports`, are automatically
+deleted after 30 days by default, and can be configured with
+`TALK_TO_FIGMA_EXPORT_DIR` and `TALK_TO_FIGMA_EXPORT_RETENTION_DAYS`. Explicit
+arbitrary `outputPath` files remain user-managed and are never deleted by the
+dashboard.
 
 ## Editing — what makes a change take effect
 

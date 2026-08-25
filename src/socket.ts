@@ -4,6 +4,7 @@ import { Server, ServerWebSocket } from "bun";
 import { readFileSync } from "fs";
 import { createHash } from "crypto";
 import { captureLocalFigmaWindow } from "./local-figma-capture";
+import { applyManagedExportRetention, deleteManagedExports, listManagedExports, readManagedExport, saveManagedExport } from "./managed-exports";
 
 const PROTOCOL_VERSION = "2.1.0";
 const BINARY_MAGIC = new Uint8Array([0x54, 0x54, 0x46, 0x42]); // "TTFB"
@@ -141,6 +142,11 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
 const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
+
+try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
+setInterval(() => {
+  try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
+}, 60 * 60 * 1000);
 
 function connectionScope(address?: string): ClientMeta["connectionScope"] {
   if (!address) return "unknown";
@@ -475,14 +481,14 @@ function handleConnection(ws: ServerWebSocket<any>) {
 const server = Bun.serve({
   port: Number(process.env.PORT) || 3055,
   hostname: process.env.HOST || "0.0.0.0",
-  fetch(req: Request, server: Server) {
+  async fetch(req: Request, server: Server) {
     // Handle CORS preflight
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Figma-Export-Name, X-Figma-Export-Extension",
         },
       });
     }
@@ -548,6 +554,53 @@ const server = Bun.serve({
           "Access-Control-Allow-Origin": "*",
         },
       });
+    }
+
+    if (url.pathname === "/exports" && req.method === "GET") {
+      return new Response(JSON.stringify(listManagedExports(), null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    if (url.pathname === "/exports" && req.method === "POST") {
+      try {
+        const bytes = new Uint8Array(await req.arrayBuffer());
+        if (!bytes.byteLength || bytes.byteLength > 64 * 1024 * 1024) throw new Error("Export must be between 1 byte and 64 MB");
+        const target = saveManagedExport(
+          bytes,
+          decodeURIComponent(req.headers.get("x-figma-export-name") || "figma-export"),
+          req.headers.get("x-figma-export-extension") || "png",
+        );
+        const gallery = listManagedExports();
+        const file = gallery.files.find((item) => target.endsWith(item.name));
+        return new Response(JSON.stringify({ saved: true, path: target, file }, null, 2), {
+          status: 201,
+          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+    }
+
+    if (url.pathname === "/exports" && req.method === "DELETE") {
+      const daysParam = url.searchParams.get("olderThanDays");
+      const result = deleteManagedExports(daysParam === null ? undefined : Math.max(0, Number(daysParam) || 0));
+      return new Response(JSON.stringify({ ...result, gallery: listManagedExports() }, null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    if (url.pathname.startsWith("/exports/file/") && req.method === "GET") {
+      try {
+        const name = decodeURIComponent(url.pathname.slice("/exports/file/".length));
+        const file = readManagedExport(name);
+        return new Response(file.bytes, { headers: { "Content-Type": file.mimeType, "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" } });
+      } catch {
+        return new Response("Export not found", { status: 404 });
+      }
     }
 
     // Build id of the on-disk plugin files (for the plugin UI's version badge).
