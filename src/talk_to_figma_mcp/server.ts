@@ -12,7 +12,7 @@ import * as path from "path";
 import * as os from "os";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
 
-const PROTOCOL_VERSION = "2.0.0";
+const PROTOCOL_VERSION = "2.2.0";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -73,6 +73,41 @@ type McpServerOptions = {
   remoteExportBase?: string;
 };
 
+// ---------------------------------------------------------------------------
+// Persisted state (survives MCP server restarts, e.g. client reconnects).
+// ---------------------------------------------------------------------------
+type SelectedProject = { projectKey: string; name: string; fileKey?: string | null };
+
+const STATE_DIR = path.join(os.homedir(), ".talk-to-figma");
+const STATE_FILE = path.join(STATE_DIR, "state.json");
+
+function loadPersistedSelectedProject(): SelectedProject | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const project = raw?.selectedProject;
+    if (project && typeof project === "object" && typeof project.name === "string") {
+      return {
+        projectKey: String(project.projectKey || ""),
+        name: project.name,
+        fileKey: project.fileKey ?? null,
+      };
+    }
+  } catch (error) {
+    // Missing/corrupt state file is fine — start unselected.
+  }
+  return null;
+}
+
+function persistSelectedProject(project: SelectedProject | null): void {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+  } catch (error) {
+    // Persistence is best-effort; never fail a command over it.
+    logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function createMcpServer(options: McpServerOptions = {}) {
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
@@ -91,7 +126,7 @@ const pendingRequests = new Map<string, {
 // Track which channel each client is in
 let currentChannel: string | null = null;
 let desiredChannel: string | null = null;
-let selectedProject: { projectKey: string; name: string; fileKey?: string | null } | null = null;
+let selectedProject: SelectedProject | null = loadPersistedSelectedProject();
 let fatalProtocolError: string | null = null;
 const requesterId =
   process.env.TALK_TO_FIGMA_REQUESTER_ID ||
@@ -122,7 +157,7 @@ const bulkJobs = new Map<string, BulkJob>();
 // Create MCP server
 const server = new McpServer({
   name: "TalkToFigmaMCP",
-  version: "1.0.0",
+  version: PROTOCOL_VERSION,
 });
 
 // Add command line argument parsing
@@ -134,7 +169,7 @@ const WS_URL = serverUrl === 'localhost' ? `ws://${serverUrl}` : `wss://${server
 // Document Info Tool
 server.tool(
   "get_document_info",
-  "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
+  "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it. If you know (part of) the name of what you're looking for, use search_nodes first instead of inspecting pages one by one; for a one-call overview of all pages use get_file_outline.",
   {
     pageId: z.string().optional().describe("Inspect this page instead of the current one (see list_pages for ids)."),
   },
@@ -1949,7 +1984,7 @@ server.prompt(
 // Text Node Scanning Tool
 server.tool(
   "scan_text_nodes",
-  "Scan all text nodes in the selected Figma node",
+  "Scan all text nodes in the selected Figma node. Expensive on whole pages — if you are looking for a node by name, use search_nodes first and scan only the matched subtree.",
   {
     nodeId: z.string().describe("ID of the node to scan"),
     chunkSize: z.number().int().positive().optional().describe("Nodes processed per chunk (default 50). Larger = fewer round-trips/progress updates."),
@@ -3130,7 +3165,9 @@ type FigmaCommand =
   | "diagnose_pages"
   | "get_design_system_info"
   | "get_nodes_design_info"
-  | "scan_design_usage";
+  | "scan_design_usage"
+  | "search_nodes"
+  | "get_file_outline";
 
 type CommandParams = {
   get_document_info: Record<string, never>;
@@ -3527,19 +3564,26 @@ async function selectProject(query?: string): Promise<any> {
   if (matches.length !== 1) {
     throw new Error(query
       ? `Project query matched ${matches.length} projects: ${matches.map((project: any) => project.name).join(", ") || "none"}`
-      : `Choose a project first: ${live.map((project: any) => project.name).join(", ")}`);
+      : `Choose a project first — call use_figma_project with one of: ${live.map((project: any) => project.name).join(", ")}`);
   }
   const project = matches[0];
   await joinChannel(project.recommendedChannel);
   selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
+  persistSelectedProject(selectedProject);
   return project;
 }
 
 async function ensureProjectSelected(): Promise<void> {
   if (currentChannel) return;
   if (selectedProject) {
-    await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
-    return;
+    try {
+      await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
+      return;
+    } catch (error) {
+      // The previously selected (possibly persisted) project is no longer
+      // live — fall through and auto-select if exactly one live project exists.
+      logger.warn(`Previously selected project "${selectedProject.name}" is not available: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   await selectProject();
 }
@@ -3635,7 +3679,7 @@ heartbeatTimer = setInterval(() => {
 
 server.tool(
   "list_pages",
-  "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
+  "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info. If you know (part of) a node's name, use search_nodes first; for pages plus their top-level children in one call, use get_file_outline.",
   {},
   async () => {
     try {
@@ -3643,6 +3687,39 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "search_nodes",
+  "Search the WHOLE FILE (every page) for nodes whose name contains the query (case-insensitive) in a single call. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something by name — use this tool first, then drill into the returned node/page ids. Each match includes {id, name, type, pageId, pageName, path}. Optionally filter by node types or restrict to one page.",
+  {
+    query: z.string().describe("Substring to match against node names (case-insensitive)."),
+    types: z.array(z.string()).optional().describe("Optional node types to restrict the search to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Faster on large files."),
+    pageId: z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
+    limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200)."),
+  },
+  async ({ query, types, pageId, limit }: any) => {
+    try {
+      const result = await sendCommandToFigma("search_nodes", { query, types, pageId, limit }, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_file_outline",
+  "Get an outline of the ENTIRE file in one call: every page with its top-level children (id, name, type). Replaces calling get_document_info once per page. Children are capped at 200 per page (marked truncated). If you are looking for something by name, prefer search_nodes.",
+  {},
+  async () => {
+    try {
+      const result = await sendCommandToFigma("get_file_outline", {}, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting file outline: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );

@@ -182,6 +182,10 @@ async function handleCommand(command, params) {
       return await getNodeByKey(params);
     case "diagnose_pages":
       return await diagnosePages(params);
+    case "search_nodes":
+      return await searchNodes(params);
+    case "get_file_outline":
+      return await getFileOutline();
     case "get_node_info":
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
@@ -785,6 +789,139 @@ async function listPages() {
         entry.childCount = p.children.length;
       } catch (e) {
         entry.childCount = null;
+        entry.childrenReadable = false;
+      }
+      return entry;
+    }),
+  };
+}
+
+// Build a "Page > Section > ... > Parent" path string for a node (parents only,
+// node itself excluded) so a match can be located without extra round-trips.
+function nodePathString(node, page) {
+  const parts = [];
+  let cur = node.parent;
+  while (cur && cur.type !== "PAGE" && cur.type !== "DOCUMENT") {
+    parts.unshift(cur.name);
+    cur = cur.parent;
+  }
+  parts.unshift(page.name);
+  return parts.join(" > ");
+}
+
+// Search the whole file (or a single page) for nodes whose name contains the
+// query (case-insensitive), in ONE call — instead of walking pages one by one
+// with get_document_info / scan_text_nodes.
+async function searchNodes(params) {
+  const { query, types, pageId, limit } = params || {};
+  if (!query || typeof query !== "string") {
+    throw new Error("Missing query parameter");
+  }
+  const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+  const q = query.toLowerCase();
+
+  let pages;
+  if (pageId) {
+    const page = await figma.getNodeByIdAsync(pageId);
+    if (!page || page.type !== "PAGE") {
+      throw new Error(`Page not found with ID: ${pageId}`);
+    }
+    await page.loadAsync();
+    pages = [page];
+  } else {
+    // dynamic-page documentAccess: pages must be loaded before findAll.
+    await figma.loadAllPagesAsync();
+    pages = figma.root.children;
+  }
+
+  const prevSkip = figma.skipInvisibleInstanceChildren;
+  figma.skipInvisibleInstanceChildren = true; // big speedup on instance-heavy files
+  const matches = [];
+  const unreadablePages = [];
+  let totalMatches = 0;
+  let totalScannedPages = 0;
+  let truncated = false;
+  try {
+    for (const page of pages) {
+      totalScannedPages++;
+      let found;
+      try {
+        if (Array.isArray(types) && types.length > 0) {
+          found = page
+            .findAllWithCriteria({ types })
+            .filter((n) => n.name.toLowerCase().indexOf(q) !== -1);
+        } else {
+          found = page.findAll((n) => n.name.toLowerCase().indexOf(q) !== -1);
+        }
+      } catch (e) {
+        // A page containing an unclassifiable node type can throw; skip it
+        // (see diagnose_pages) instead of failing the whole search.
+        unreadablePages.push({ id: page.id, name: page.name });
+        continue;
+      }
+      totalMatches += found.length;
+      for (const node of found) {
+        if (matches.length >= max) {
+          truncated = true;
+          break;
+        }
+        matches.push({
+          id: node.id,
+          name: node.name,
+          type: node.type,
+          pageId: page.id,
+          pageName: page.name,
+          path: nodePathString(node, page),
+        });
+      }
+      if (truncated) break; // early stop on large files once the limit is hit
+    }
+  } finally {
+    figma.skipInvisibleInstanceChildren = prevSkip;
+  }
+
+  const result = {
+    query: query,
+    totalMatches: totalMatches,
+    truncated: truncated,
+    totalScannedPages: totalScannedPages,
+    totalPages: pages.length,
+    matches: matches,
+  };
+  if (truncated) {
+    // totalMatches only covers scanned pages when we stopped early.
+    result.note = `Stopped after ${totalScannedPages}/${pages.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
+  }
+  if (unreadablePages.length) result.unreadablePages = unreadablePages;
+  return result;
+}
+
+// One-call outline of the whole file: every page plus its top-level children
+// (id/name/type only) — replaces N get_document_info calls (one per page).
+async function getFileOutline() {
+  await figma.loadAllPagesAsync();
+  const MAX_CHILDREN_PER_PAGE = 200;
+  return {
+    currentPageId: figma.currentPage.id,
+    pageCount: figma.root.children.length,
+    pages: figma.root.children.map((p) => {
+      const entry = { id: p.id, name: p.name };
+      try {
+        entry.childCount = p.children.length;
+        const slice =
+          entry.childCount > MAX_CHILDREN_PER_PAGE
+            ? p.children.slice(0, MAX_CHILDREN_PER_PAGE)
+            : p.children;
+        entry.children = slice.map((c) => ({
+          id: c.id,
+          name: c.name,
+          type: c.type,
+        }));
+        if (entry.childCount > MAX_CHILDREN_PER_PAGE) entry.truncated = true;
+      } catch (e) {
+        // Page with a node type this plugin API can't classify (see diagnose_pages).
+        entry.childCount = null;
+        entry.children = [];
         entry.childrenReadable = false;
       }
       return entry;

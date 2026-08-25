@@ -4,7 +4,7 @@ import { Server, ServerWebSocket } from "bun";
 import { readFileSync } from "fs";
 import { createHash } from "crypto";
 
-const PROTOCOL_VERSION = "2.0.0";
+const PROTOCOL_VERSION = "2.2.0";
 
 function isProtocolCompatible(version: unknown): boolean {
   if (typeof version !== "string") return false;
@@ -346,6 +346,16 @@ const server = Bun.serve({
 
     if (url.pathname === "/projects") {
       return new Response(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, projects: snapshotProjects() }, null, 2), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    // Lightweight liveness probe (for admin dashboards / monitoring).
+    if (url.pathname === "/health") {
+      return new Response(JSON.stringify({ ok: true, protocolVersion: PROTOCOL_VERSION }), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Access-Control-Allow-Origin": "*",

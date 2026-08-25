@@ -12,7 +12,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { createServer as createHttpServer } from "http";
-var PROTOCOL_VERSION = "2.0.0";
+var PROTOCOL_VERSION = "2.2.0";
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -25,6 +25,31 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
+var STATE_DIR = path.join(os.homedir(), ".talk-to-figma");
+var STATE_FILE = path.join(STATE_DIR, "state.json");
+function loadPersistedSelectedProject() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const project = raw?.selectedProject;
+    if (project && typeof project === "object" && typeof project.name === "string") {
+      return {
+        projectKey: String(project.projectKey || ""),
+        name: project.name,
+        fileKey: project.fileKey ?? null
+      };
+    }
+  } catch (error) {
+  }
+  return null;
+}
+function persistSelectedProject(project) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+  } catch (error) {
+    logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 function createMcpServer(options = {}) {
   let ws = null;
   let disposed = false;
@@ -33,13 +58,13 @@ function createMcpServer(options = {}) {
   const pendingRequests = /* @__PURE__ */ new Map();
   let currentChannel = null;
   let desiredChannel = null;
-  let selectedProject = null;
+  let selectedProject = loadPersistedSelectedProject();
   let fatalProtocolError = null;
   const requesterId = process.env.TALK_TO_FIGMA_REQUESTER_ID || process.env.CODEX_THREAD_ID || process.env.CURSOR_SESSION_ID || `mcp-${process.pid}`;
   const bulkJobs = /* @__PURE__ */ new Map();
   const server = new McpServer({
     name: "TalkToFigmaMCP",
-    version: "1.0.0"
+    version: PROTOCOL_VERSION
   });
   const args = process.argv.slice(2);
   const serverArg = args.find((arg) => arg.startsWith("--server="));
@@ -47,7 +72,7 @@ function createMcpServer(options = {}) {
   const WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
   server.tool(
     "get_document_info",
-    "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
+    "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it. If you know (part of) the name of what you're looking for, use search_nodes first instead of inspecting pages one by one; for a one-call overview of all pages use get_file_outline.",
     {
       pageId: z.string().optional().describe("Inspect this page instead of the current one (see list_pages for ids).")
     },
@@ -1590,7 +1615,7 @@ Example Login Screen Structure:
   );
   server.tool(
     "scan_text_nodes",
-    "Scan all text nodes in the selected Figma node",
+    "Scan all text nodes in the selected Figma node. Expensive on whole pages \u2014 if you are looking for a node by name, use search_nodes first and scan only the matched subtree.",
     {
       nodeId: z.string().describe("ID of the node to scan"),
       chunkSize: z.number().int().positive().optional().describe("Nodes processed per chunk (default 50). Larger = fewer round-trips/progress updates."),
@@ -2753,18 +2778,23 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       );
     }
     if (matches.length !== 1) {
-      throw new Error(query ? `Project query matched ${matches.length} projects: ${matches.map((project2) => project2.name).join(", ") || "none"}` : `Choose a project first: ${live.map((project2) => project2.name).join(", ")}`);
+      throw new Error(query ? `Project query matched ${matches.length} projects: ${matches.map((project2) => project2.name).join(", ") || "none"}` : `Choose a project first \u2014 call use_figma_project with one of: ${live.map((project2) => project2.name).join(", ")}`);
     }
     const project = matches[0];
     await joinChannel(project.recommendedChannel);
     selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
+    persistSelectedProject(selectedProject);
     return project;
   }
   async function ensureProjectSelected() {
     if (currentChannel) return;
     if (selectedProject) {
-      await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
-      return;
+      try {
+        await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
+        return;
+      } catch (error) {
+        logger.warn(`Previously selected project "${selectedProject.name}" is not available: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     await selectProject();
   }
@@ -2838,7 +2868,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   }, 1e4);
   server.tool(
     "list_pages",
-    "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
+    "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info. If you know (part of) a node's name, use search_nodes first; for pages plus their top-level children in one call, use get_file_outline.",
     {},
     async () => {
       try {
@@ -2846,6 +2876,37 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "search_nodes",
+    "Search the WHOLE FILE (every page) for nodes whose name contains the query (case-insensitive) in a single call. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something by name \u2014 use this tool first, then drill into the returned node/page ids. Each match includes {id, name, type, pageId, pageName, path}. Optionally filter by node types or restrict to one page.",
+    {
+      query: z.string().describe("Substring to match against node names (case-insensitive)."),
+      types: z.array(z.string()).optional().describe("Optional node types to restrict the search to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Faster on large files."),
+      pageId: z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
+      limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200).")
+    },
+    async ({ query, types, pageId, limit }) => {
+      try {
+        const result = await sendCommandToFigma("search_nodes", { query, types, pageId, limit }, 12e4);
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "get_file_outline",
+    "Get an outline of the ENTIRE file in one call: every page with its top-level children (id, name, type). Replaces calling get_document_info once per page. Children are capped at 200 per page (marked truncated). If you are looking for something by name, prefer search_nodes.",
+    {},
+    async () => {
+      try {
+        const result = await sendCommandToFigma("get_file_outline", {}, 12e4);
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error getting file outline: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
