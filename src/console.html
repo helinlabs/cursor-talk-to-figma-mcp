@@ -219,7 +219,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.2.0";
+      const PROTOCOL_VERSION = "2.3.0";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -877,6 +877,75 @@
         );
       }
 
+      // ----- Project context panel ------------------------------------------
+      // Per-project structure guide (the Figma-side CLAUDE.md). SoR is the
+      // Figma document itself; the relay serves a cached copy (stale:true)
+      // when no plugin is online, and writes require a live plugin.
+      function ProjectContextPanel({ projects }) {
+        const [projectKey, setProjectKey] = useState("");
+        const [doc, setDoc] = useState(null);     // last GET response
+        const [text, setText] = useState("");
+        const [busy, setBusy] = useState(false);
+        const [error, setError] = useState(null);
+        const [savedAt, setSavedAt] = useState(null);
+
+        const effectiveKey = projectKey || (projects[0] && projects[0].projectKey) || "";
+
+        const load = useCallback(async (key) => {
+          if (!key) return;
+          setBusy(true); setError(null); setSavedAt(null);
+          try {
+            const r = await fetch(relayApiUrl("project-context") + `?project=${encodeURIComponent(key)}`);
+            const data = await r.json();
+            if (!r.ok && r.status !== 404) { setError(data.error || `HTTP ${r.status}`); setDoc(null); setText(""); return; }
+            setDoc(data);
+            setText(data.content || "");
+          } catch (e) { setError(String(e)); }
+          finally { setBusy(false); }
+        }, []);
+
+        useEffect(() => { if (effectiveKey) load(effectiveKey); }, [effectiveKey, load]);
+
+        const save = async () => {
+          setBusy(true); setError(null); setSavedAt(null);
+          try {
+            const r = await fetch(relayApiUrl("project-context") + `?project=${encodeURIComponent(effectiveKey)}`, {
+              method: "PUT",
+              headers: { "Content-Type": "text/plain; charset=utf-8" },
+              body: text,
+            });
+            const data = await r.json();
+            if (!r.ok) { setError(data.error || `HTTP ${r.status}`); return; }
+            setSavedAt(data.updatedAt || new Date().toISOString());
+            load(effectiveKey);
+          } catch (e) { setError(String(e)); }
+          finally { setBusy(false); }
+        };
+
+        const selStyle = { width: "100%", boxSizing: "border-box", marginBottom: 4, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", fontSize: 12 };
+        return (
+          <div className="section">
+            <h2>Project Context</h2>
+            <select style={selStyle} value={projectKey} onChange={(e) => setProjectKey(e.target.value)}>
+              {!projects.length && <option value="">(no live projects)</option>}
+              {projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.name}</option>)}
+            </select>
+            {doc && doc.stale && <div className="member"><code>⚠ cached copy (plugin offline) · cached {doc.cachedAt ? new Date(doc.cachedAt).toLocaleString() : "?"}</code></div>}
+            {doc && doc.source === "live" && doc.updatedAt && <div className="member"><code>updated {new Date(doc.updatedAt).toLocaleString()}{doc.updatedBy ? ` · ${doc.updatedBy}` : ""}</code></div>}
+            {doc && (doc.exists === false || doc.source === "none") && <div className="member muted">No context document yet. 페이지 용도·명명 규칙·기능 위치·오인 지점을 기록하면 에이전트가 프로젝트 진입 시 자동으로 읽는다.</div>}
+            <textarea rows={10} spellCheck={false} value={text} onChange={(e) => setText(e.target.value)}
+              placeholder={"# 프로젝트 구조 가이드 (markdown)\n\n## 페이지 용도\n- 레퍼런스: 타사 캡처 모음 (우리 디자인 아님)\n..."}
+              style={{ width: "100%", boxSizing: "border-box", marginTop: 4, fontSize: 12 }} />
+            <div className="row" style={{ marginTop: 4 }}>
+              <button className="ghost" disabled={busy || !effectiveKey} onClick={() => load(effectiveKey)}>Reload</button>
+              <button className="ghost" disabled={busy || !effectiveKey || (doc && doc.stale)} onClick={save}>Save to document</button>
+            </div>
+            {savedAt && <div className="member"><code>saved · {new Date(savedAt).toLocaleString()}</code></div>}
+            {error && <div className="member"><code>⚠ {error}</code></div>}
+          </div>
+        );
+      }
+
       // ----- Keyword annotations panel --------------------------------------
       function AnnotationsPanel({ projects }) {
         const [items, setItems] = useState(null);
@@ -1469,6 +1538,7 @@
                 />
                 <ExportGallery />
                 <IndexPanel projects={projects} />
+                <ProjectContextPanel projects={projects} />
                 <AnnotationsPanel projects={projects} />
                 <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>

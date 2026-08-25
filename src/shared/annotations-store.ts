@@ -6,12 +6,20 @@
 // registers the keyword→node link; on wrong-answer feedback it removes it.
 // search_nodes surfaces matching annotations at the top of its results.
 //
-// This module is the SINGLE definition of the file format. Both the MCP
-// server (add/remove tools, search-time lookup) and the relay console
-// (list/add/delete endpoints) read and write the same file through this code
-// — do not reimplement the schema elsewhere. Writes are atomic (tmp→rename)
-// because two processes share the file. Best-effort persistence: a missing or
-// corrupt file just means an empty store.
+// SOURCE OF TRUTH IS THE FIGMA DOCUMENT, not this file: each annotated node
+// carries its keywords in sharedPluginData("talk_to_figma", "search_keywords")
+// (plugin commands set_node_keywords / harvest_keyword_annotations), so the
+// knowledge follows the file across machines and dies with the node when the
+// node is deleted. This disk file is only the SEARCH-TIME CACHE shared by the
+// MCP server and the relay console; the relay rebuilds it from a document
+// harvest during index rebuilds (replaceProjectAnnotations — cache-only
+// entries for that project are dropped). Writes here must always mirror a
+// write that already succeeded on the document.
+//
+// This module is the SINGLE definition of the cache file format — do not
+// reimplement the schema elsewhere. Writes are atomic (tmp→rename) because
+// two processes share the file. Best-effort persistence: a missing or corrupt
+// file just means an empty cache.
 // ---------------------------------------------------------------------------
 import * as fs from "fs";
 import * as path from "path";
@@ -119,6 +127,37 @@ export function removeSearchAnnotations(input: {
   const removed = annotations.length - kept.length;
   if (removed > 0) saveSearchAnnotations(kept);
   return removed;
+}
+
+// Rebuild ONE project's cache slice from a document harvest (the SoR): every
+// cached annotation for the project is replaced by the harvested set —
+// cache-only entries (not present on any node in the file) are dropped.
+export function replaceProjectAnnotations(
+  projectKey: string,
+  harvested: Array<{
+    nodeId: string;
+    nodeName: string;
+    keywords: Array<{ keyword: string; note?: string; addedAt?: string }>;
+  }>
+): { total: number } {
+  const others = loadSearchAnnotations().filter((a) => a.projectKey !== projectKey);
+  const rebuilt: SearchAnnotation[] = [];
+  for (const node of harvested) {
+    for (const k of node.keywords || []) {
+      if (!k || typeof k.keyword !== "string" || !k.keyword.trim()) continue;
+      rebuilt.push({
+        keyword: k.keyword,
+        keywordKey: normalizeKeywordKey(k.keyword),
+        projectKey,
+        nodeId: node.nodeId,
+        nodeName: node.nodeName || "",
+        ...(k.note ? { note: k.note } : {}),
+        addedAt: k.addedAt || new Date().toISOString(),
+      });
+    }
+  }
+  saveSearchAnnotations([...others, ...rebuilt]);
+  return { total: rebuilt.length };
 }
 
 // Lookup annotations whose normalized key equals any of the given keys,

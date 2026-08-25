@@ -200,6 +200,14 @@ async function handleCommand(command, params) {
       return await dumpPageIndex(params);
     case "get_search_cache_status":
       return await getSearchCacheStatus();
+    case "get_project_context":
+      return await getProjectContext();
+    case "set_project_context":
+      return await setProjectContext(params);
+    case "set_node_keywords":
+      return await setNodeKeywords(params);
+    case "harvest_keyword_annotations":
+      return await harvestKeywordAnnotations();
     case "get_file_outline":
       return await getFileOutline();
     case "get_node_info":
@@ -6016,6 +6024,147 @@ async function createConnections(params) {
     count: results.length,
     connections: results
   };
+}
+
+// ── 프로젝트 컨텍스트 문서 (SoR = 피그마 문서 자체) ──
+//
+// 코드 레포의 CLAUDE.md 에 해당하는, "이 파일 구조가 무엇을 의미하는가"
+// (페이지 용도·명명 규칙·기능 위치·흔한 오인 지점) 마크다운을
+// figma.root 의 sharedPluginData 에 JSON {content, updatedAt, updatedBy?} 로
+// 담는다. 파일에 담기므로 피그마 클라우드로 동기화돼 어느 기기·어느
+// 릴레이에서 열어도 살아난다. root 접근이라 페이지 로드가 필요 없어 수 ms 다.
+//
+// 크기 가드: content 50KB(UTF-8) 상한 — Figma pluginData 는 노드당 100KB 를
+// 넘기면 조용히 잘리므로, 상한을 두고 저장 후 되읽어 검증한다.
+const PROJECT_CONTEXT_NAMESPACE = "talk_to_figma";
+const PROJECT_CONTEXT_KEY = "project_context";
+const PROJECT_CONTEXT_MAX_BYTES = 50 * 1024;
+
+function utf8ByteLength(str) {
+  // 플러그인 샌드박스에 TextEncoder 가 없을 수 있어 우회 계산한다.
+  return unescape(encodeURIComponent(str)).length;
+}
+
+async function getProjectContext() {
+  const raw = figma.root.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, PROJECT_CONTEXT_KEY);
+  if (!raw) return { exists: false, fileName: figma.root.name };
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.content !== "string" || !parsed.content.trim()) {
+      return { exists: false, fileName: figma.root.name };
+    }
+    return {
+      exists: true,
+      fileName: figma.root.name,
+      content: parsed.content,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : null,
+      updatedBy: typeof parsed.updatedBy === "string" ? parsed.updatedBy : null,
+    };
+  } catch (e) {
+    return { exists: false, fileName: figma.root.name, corrupt: true };
+  }
+}
+
+async function setProjectContext(params) {
+  const { content, updatedBy } = params || {};
+  if (typeof content !== "string") throw new Error("Missing content (string)");
+  if (!content.trim()) {
+    // 빈 문자열 = 삭제 (pluginData 규약과 동일)
+    figma.root.setSharedPluginData(PROJECT_CONTEXT_NAMESPACE, PROJECT_CONTEXT_KEY, "");
+    return { saved: true, cleared: true, fileName: figma.root.name };
+  }
+  const bytes = utf8ByteLength(content);
+  if (bytes > PROJECT_CONTEXT_MAX_BYTES) {
+    throw new Error(
+      `Project context is ${bytes} bytes (UTF-8) — over the ${PROJECT_CONTEXT_MAX_BYTES} byte limit. ` +
+      "Trim it: this is a structure guide, not full documentation."
+    );
+  }
+  const record = {
+    content,
+    updatedAt: new Date().toISOString(),
+  };
+  if (typeof updatedBy === "string" && updatedBy.trim()) record.updatedBy = updatedBy.trim();
+  const text = JSON.stringify(record);
+  figma.root.setSharedPluginData(PROJECT_CONTEXT_NAMESPACE, PROJECT_CONTEXT_KEY, text);
+  // 실제로 들어갔는지 되읽어 확인한다 — 상한을 넘기면 조용히 잘린다.
+  const back = figma.root.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, PROJECT_CONTEXT_KEY);
+  if (back !== text) {
+    throw new Error("Figma stored a truncated value — the context is too large for pluginData");
+  }
+  return {
+    saved: true,
+    fileName: figma.root.name,
+    bytes,
+    updatedAt: record.updatedAt,
+    updatedBy: record.updatedBy || null,
+  };
+}
+
+// ── 검색 키워드 주석 (SoR = 대상 노드의 sharedPluginData) ──
+//
+// "이 키워드로 찾으면 이 노드다"라는 큐레이션 지식을 노드 자신에 붙인다:
+// node.setSharedPluginData("talk_to_figma", "search_keywords",
+//   JSON.stringify([{keyword, note?, addedAt}])).
+// 파일을 따라다니고, 노드가 삭제되면 주석도 함께 사라지는 자가 정리가 장점.
+// 릴레이/MCP 의 디스크 annotations.json 은 검색 속도용 캐시일 뿐이며,
+// harvest_keyword_annotations 로 문서 전체를 수확해 캐시를 재구성한다.
+const SEARCH_KEYWORDS_KEY = "search_keywords";
+
+function parseNodeKeywords(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((k) => k && typeof k.keyword === "string" && k.keyword.trim());
+  } catch (e) {
+    return [];
+  }
+}
+
+// 전체 교체. keywords: [{keyword, note?, addedAt?}] — 빈 배열이면 삭제.
+async function setNodeKeywords(params) {
+  const { nodeId, keywords } = params || {};
+  if (!nodeId) throw new Error("Missing nodeId parameter");
+  if (!Array.isArray(keywords)) throw new Error("keywords must be an array (empty array clears)");
+  const node = await figma.getNodeByIdAsync(nodeId);
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  const cleaned = [];
+  for (const k of keywords) {
+    if (!k || typeof k.keyword !== "string" || !k.keyword.trim()) continue;
+    const entry = { keyword: k.keyword.trim(), addedAt: typeof k.addedAt === "string" ? k.addedAt : new Date().toISOString() };
+    if (typeof k.note === "string" && k.note.trim()) entry.note = k.note.trim();
+    cleaned.push(entry);
+  }
+  const text = cleaned.length ? JSON.stringify(cleaned) : "";
+  node.setSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY, text);
+  const back = node.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY);
+  if (back !== text) throw new Error("Figma stored a truncated value — too many/too large keywords for this node");
+  return { nodeId: node.id, nodeName: node.name || "", keywords: cleaned, cleared: !cleaned.length };
+}
+
+// 문서 전체에서 주석 달린 노드를 수확한다. root 검색이라 전체 페이지 로드가
+// 필요하다(dynamic-page manifest → loadAllPagesAsync). findAllWithCriteria 의
+// sharedPluginData 크라이테리어를 쓰고, 미지원 환경이면 findAll 폴백.
+async function harvestKeywordAnnotations() {
+  await figma.loadAllPagesAsync();
+  let nodes;
+  try {
+    nodes = figma.root.findAllWithCriteria({
+      sharedPluginData: { namespace: PROJECT_CONTEXT_NAMESPACE, keys: [SEARCH_KEYWORDS_KEY] },
+    });
+  } catch (e) {
+    nodes = figma.root.findAll(
+      (n) => !!n.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY)
+    );
+  }
+  const annotated = [];
+  for (const node of nodes) {
+    const keywords = parseNodeKeywords(node.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY));
+    if (!keywords.length) continue;
+    annotated.push({ nodeId: node.id, nodeName: node.name || "", keywords });
+  }
+  return { fileName: figma.root.name, nodeCount: annotated.length, nodes: annotated };
 }
 
 // ── 노드에 붙는 데이터 (SSOT 를 파일이 아니라 문서에 두기 위한 것) ──

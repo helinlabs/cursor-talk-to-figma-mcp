@@ -10,7 +10,14 @@ import {
   loadSearchAnnotations,
   upsertSearchAnnotation,
   removeSearchAnnotations,
+  replaceProjectAnnotations,
+  normalizeKeywordKey,
 } from "./shared/annotations-store";
+import {
+  loadCachedProjectContext,
+  cacheProjectContext,
+  clearCachedProjectContext,
+} from "./shared/project-context";
 import {
   INDEX_DIR,
   loadProjectIndex,
@@ -769,6 +776,19 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
           idx.builtAt = Date.now();
           saveProjectIndex(idx);
           pushEvent({ kind: "index_project_done", projectKey: pick.p.projectKey, name: pick.p.name, pages: idx.pages.length, nodes: idx.nodeCount, failures: pick.p.failures.length });
+          // Re-harvest keyword annotations from the document (the SoR: node
+          // sharedPluginData) and rebuild this project's cache slice — entries
+          // that exist only in the cache but not on any node are dropped. All
+          // pages were just loaded for the scan, so the harvest walk is cheap.
+          try {
+            const harvest = await sendInternalCommand(pick.channel, "harvest_keyword_annotations", {}, INDEX_STEP_TIMEOUT_MS);
+            const { total } = replaceProjectAnnotations(pick.p.projectKey, harvest?.nodes || []);
+            pushEvent({ kind: "annotations_harvest", projectKey: pick.p.projectKey, nodes: harvest?.nodeCount ?? 0, keywords: total });
+          } catch (err) {
+            // Harvest failure must not fail the index job; the cache keeps its
+            // previous slice until the next successful harvest.
+            pushEvent({ kind: "annotations_harvest_failed", projectKey: pick.p.projectKey, error: err instanceof Error ? err.message : String(err) });
+          }
         }
         saveIndexProgress(); // checkpoint the cursor after EVERY step
         indexer.currentStep = null;
@@ -867,7 +887,7 @@ const server = Bun.serve({
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Figma-Export-Name, X-Figma-Export-Extension",
         },
       });
@@ -960,11 +980,68 @@ const server = Bun.serve({
       }
     }
 
+    // --- Project context document (SoR = the Figma document itself) ---------
+    // GET: live read via the plugin when one is connected (and mirror to the
+    // local cache); otherwise serve the last cached copy marked stale:true.
+    // PUT (text/plain markdown body): live-only — the SoR must be written.
+    if (url.pathname === "/project-context") {
+      const projectKey = url.searchParams.get("project") || "";
+      if (!projectKey) {
+        return new Response(JSON.stringify({ error: "project query param is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      if (req.method === "GET") {
+        const channel = resolveProjectChannel(projectKey);
+        if (channel) {
+          try {
+            const doc = await sendInternalCommand(channel, "get_project_context", {}, 15_000);
+            if (doc?.exists && typeof doc.content === "string") {
+              cacheProjectContext(projectKey, { content: doc.content, updatedAt: doc.updatedAt ?? null, updatedBy: doc.updatedBy ?? null });
+              return new Response(JSON.stringify({
+                project: projectKey, source: "live", stale: false,
+                content: doc.content, updatedAt: doc.updatedAt ?? null, updatedBy: doc.updatedBy ?? null,
+              }, null, 2), { headers: JSON_HEADERS });
+            }
+            clearCachedProjectContext(projectKey);
+            return new Response(JSON.stringify({ project: projectKey, source: "live", stale: false, exists: false }, null, 2), { headers: JSON_HEADERS });
+          } catch {
+            // fall through to the cache below
+          }
+        }
+        const cached = loadCachedProjectContext(projectKey);
+        if (cached) {
+          return new Response(JSON.stringify({
+            project: projectKey, source: "cache", stale: true,
+            content: cached.content, updatedAt: cached.updatedAt, updatedBy: cached.updatedBy ?? null, cachedAt: cached.cachedAt,
+          }, null, 2), { headers: JSON_HEADERS });
+        }
+        return new Response(JSON.stringify({ project: projectKey, source: "none", exists: false }, null, 2), { status: 404, headers: JSON_HEADERS });
+      }
+      if (req.method === "PUT") {
+        const channel = resolveProjectChannel(projectKey);
+        if (!channel) {
+          return new Response(JSON.stringify({ error: `No live Figma plugin for project "${projectKey}" — the context lives in the Figma document itself; connect the plugin and retry` }), { status: 503, headers: JSON_HEADERS });
+        }
+        try {
+          const content = await req.text();
+          const result = await sendInternalCommand(channel, "set_project_context", { content }, 15_000);
+          if (result?.cleared) clearCachedProjectContext(projectKey);
+          else if (result?.saved) cacheProjectContext(projectKey, { content, updatedAt: result.updatedAt ?? null, updatedBy: result.updatedBy ?? null });
+          return new Response(JSON.stringify(result, null, 2), { headers: JSON_HEADERS });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
+        }
+      }
+    }
+
     // --- Keyword annotations (shared file with the MCP server) --------------
     if (url.pathname === "/search/annotations") {
       if (req.method === "GET") {
         return new Response(JSON.stringify({ annotations: loadSearchAnnotations() }, null, 2), { headers: JSON_HEADERS });
       }
+      // Writes go to the SoR — the node's own sharedPluginData in the Figma
+      // document — via the live plugin, then mirror into the disk cache. No
+      // live plugin means no write (the cache alone would be lost on the next
+      // harvest).
       if (req.method === "POST") {
         try {
           const body: any = await req.json();
@@ -974,32 +1051,68 @@ const server = Bun.serve({
           if (!keyword || !projectKey || !nodeId) {
             return new Response(JSON.stringify({ error: "keyword, projectKey and nodeId are required" }), { status: 400, headers: JSON_HEADERS });
           }
-          // Best-effort node name lookup via the live plugin (optional).
-          let nodeName = String(body?.nodeName || "");
-          if (!nodeName) {
-            const channel = resolveProjectChannel(projectKey);
-            if (channel) {
-              try {
-                const info = await sendInternalCommand(channel, "get_node_info", { nodeId, fields: ["id"], maxDepth: 0 }, 15_000);
-                nodeName = String(info?.name ?? "");
-              } catch {}
-            }
+          const channel = resolveProjectChannel(projectKey);
+          if (!channel) {
+            return new Response(JSON.stringify({ error: `No live Figma plugin for project "${projectKey}" — annotations live on the node in the Figma document; connect the plugin and retry` }), { status: 503, headers: JSON_HEADERS });
           }
-          const annotation = upsertSearchAnnotation({ keyword, projectKey, nodeId, nodeName, note: body?.note ? String(body.note) : undefined });
-          return new Response(JSON.stringify({ saved: true, annotation }, null, 2), { headers: JSON_HEADERS });
+          const note = body?.note ? String(body.note) : undefined;
+          const keywordKey = normalizeKeywordKey(keyword);
+          const data = await sendInternalCommand(channel, "get_node_data", { nodeId, namespace: "talk_to_figma", key: "search_keywords" }, 15_000);
+          let current: any[] = [];
+          try {
+            const parsed = JSON.parse(String(data?.value || "[]"));
+            if (Array.isArray(parsed)) current = parsed.filter((k: any) => k && typeof k.keyword === "string");
+          } catch {}
+          const kept = current.filter((k: any) => normalizeKeywordKey(k.keyword) !== keywordKey);
+          kept.push({ keyword, ...(note ? { note } : {}), addedAt: new Date().toISOString() });
+          const saved = await sendInternalCommand(channel, "set_node_keywords", { nodeId, keywords: kept }, 15_000);
+          const annotation = upsertSearchAnnotation({ keyword, projectKey, nodeId, nodeName: String(saved?.nodeName ?? body?.nodeName ?? ""), note });
+          return new Response(JSON.stringify({ saved: true, storedOnNode: true, annotation }, null, 2), { headers: JSON_HEADERS });
         } catch (err) {
-          return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 400, headers: JSON_HEADERS });
+          return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
         }
       }
       if (req.method === "DELETE") {
-        const keyword = url.searchParams.get("keyword") || "";
+        const keyword = (url.searchParams.get("keyword") || "").trim();
         const projectKey = url.searchParams.get("projectKey") || "";
         const nodeId = url.searchParams.get("nodeId") || undefined;
         if (!keyword || !projectKey) {
           return new Response(JSON.stringify({ error: "keyword and projectKey query params are required" }), { status: 400, headers: JSON_HEADERS });
         }
-        const removed = removeSearchAnnotations({ keyword, projectKey, nodeId });
-        return new Response(JSON.stringify({ removed }, null, 2), { headers: JSON_HEADERS });
+        const channel = resolveProjectChannel(projectKey);
+        if (!channel) {
+          return new Response(JSON.stringify({ error: `No live Figma plugin for project "${projectKey}" — annotations live on the node in the Figma document; connect the plugin and retry` }), { status: 503, headers: JSON_HEADERS });
+        }
+        try {
+          const keywordKey = normalizeKeywordKey(keyword);
+          const targets = nodeId
+            ? [nodeId]
+            : [...new Set(loadSearchAnnotations().filter((a) => a.projectKey === projectKey && a.keywordKey === keywordKey).map((a) => a.nodeId))];
+          for (const target of targets) {
+            let data: any;
+            try {
+              data = await sendInternalCommand(channel, "get_node_data", { nodeId: target, namespace: "talk_to_figma", key: "search_keywords" }, 15_000);
+            } catch (err) {
+              // A deleted node no longer carries the annotation anyway — just
+              // let the cache entry be removed below.
+              if (/not found/i.test(err instanceof Error ? err.message : String(err))) continue;
+              throw err;
+            }
+            let current: any[] = [];
+            try {
+              const parsed = JSON.parse(String(data?.value || "[]"));
+              if (Array.isArray(parsed)) current = parsed.filter((k: any) => k && typeof k.keyword === "string");
+            } catch {}
+            const kept = current.filter((k: any) => normalizeKeywordKey(k.keyword) !== keywordKey);
+            if (kept.length !== current.length) {
+              await sendInternalCommand(channel, "set_node_keywords", { nodeId: target, keywords: kept }, 15_000);
+            }
+          }
+          const removed = removeSearchAnnotations({ keyword, projectKey, nodeId });
+          return new Response(JSON.stringify({ removed, nodes: targets }, null, 2), { headers: JSON_HEADERS });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
+        }
       }
     }
 

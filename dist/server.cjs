@@ -30,9 +30,9 @@ var import_types = require("@modelcontextprotocol/sdk/types.js");
 var import_zod = require("zod");
 var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
-var fs3 = __toESM(require("fs"), 1);
-var path3 = __toESM(require("path"), 1);
-var os3 = __toESM(require("os"), 1);
+var fs4 = __toESM(require("fs"), 1);
+var path4 = __toESM(require("path"), 1);
+var os4 = __toESM(require("os"), 1);
 var import_http = require("http");
 
 // src/local-figma-capture.ts
@@ -276,8 +276,64 @@ function buildNeedles(queries) {
   return needles;
 }
 
+// src/shared/project-context.ts
+var fs3 = __toESM(require("fs"), 1);
+var path3 = __toESM(require("path"), 1);
+var os3 = __toESM(require("os"), 1);
+var CONTEXT_DIR = path3.join(os3.homedir(), ".talk-to-figma", "context");
+function sanitizeKey2(projectKey) {
+  return projectKey.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown";
+}
+function projectContextCachePath(projectKey) {
+  return path3.join(CONTEXT_DIR, `${sanitizeKey2(projectKey)}.json`);
+}
+function loadCachedProjectContext(projectKey) {
+  try {
+    const raw = JSON.parse(fs3.readFileSync(projectContextCachePath(projectKey), "utf8"));
+    if (raw && typeof raw.content === "string") {
+      return {
+        content: raw.content,
+        updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : null,
+        updatedBy: typeof raw.updatedBy === "string" ? raw.updatedBy : null,
+        cachedAt: typeof raw.cachedAt === "string" ? raw.cachedAt : ""
+      };
+    }
+  } catch {
+  }
+  return null;
+}
+function cacheProjectContext(projectKey, record) {
+  try {
+    fs3.mkdirSync(CONTEXT_DIR, { recursive: true });
+    const file = projectContextCachePath(projectKey);
+    const tmp = path3.join(
+      CONTEXT_DIR,
+      `.${sanitizeKey2(projectKey)}.${process.pid}.${Date.now()}.tmp`
+    );
+    const payload = {
+      content: record.content,
+      updatedAt: record.updatedAt ?? null,
+      ...record.updatedBy ? { updatedBy: record.updatedBy } : {},
+      cachedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    fs3.writeFileSync(tmp, JSON.stringify(payload, null, 2));
+    fs3.renameSync(tmp, file);
+  } catch {
+  }
+}
+function clearCachedProjectContext(projectKey) {
+  try {
+    fs3.rmSync(projectContextCachePath(projectKey), { force: true });
+  } catch {
+  }
+}
+function hasCachedProjectContext(projectKey) {
+  const cached = loadCachedProjectContext(projectKey);
+  return !!cached && cached.content.trim().length > 0;
+}
+
 // src/shared/version.ts
-var PROTOCOL_VERSION = "2.2.0";
+var PROTOCOL_VERSION = "2.3.0";
 function protocolMajor(version) {
   if (typeof version !== "string") return null;
   const major = Number(version.split(".")[0]);
@@ -317,11 +373,11 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
-var STATE_DIR = path3.join(os3.homedir(), ".talk-to-figma");
-var STATE_FILE = path3.join(STATE_DIR, "state.json");
+var STATE_DIR = path4.join(os4.homedir(), ".talk-to-figma");
+var STATE_FILE = path4.join(STATE_DIR, "state.json");
 function loadPersistedSelectedProject() {
   try {
-    const raw = JSON.parse(fs3.readFileSync(STATE_FILE, "utf8"));
+    const raw = JSON.parse(fs4.readFileSync(STATE_FILE, "utf8"));
     const project = raw?.selectedProject;
     if (project && typeof project === "object" && typeof project.name === "string") {
       return {
@@ -336,8 +392,8 @@ function loadPersistedSelectedProject() {
 }
 function persistSelectedProject(project) {
   try {
-    fs3.mkdirSync(STATE_DIR, { recursive: true });
-    fs3.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+    fs4.mkdirSync(STATE_DIR, { recursive: true });
+    fs4.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
   } catch (error) {
     logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1343,15 +1399,15 @@ Failed: ${JSON.stringify(failures)}` : "")
         if (!outputPath && options.remoteExportBase) {
           const extension = fmt.toLowerCase();
           const name = `${(0, import_uuid.v4)()}.${extension}`;
-          const resolved = path3.join(exportDirectory, name);
-          fs3.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+          const resolved = path4.join(exportDirectory, name);
+          fs4.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs3.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
+            fs4.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
           } else {
             if (!result.imageBytes) throw new Error("Figma export returned no image bytes");
-            fs3.writeFileSync(resolved, Buffer.from(result.imageBytes), { mode: 384 });
+            fs4.writeFileSync(resolved, Buffer.from(result.imageBytes), { mode: 384 });
           }
-          const stat = fs3.statSync(resolved);
+          const stat = fs4.statSync(resolved);
           const summary = {
             saved: true,
             url: `${options.remoteExportBase}/files/${name}`,
@@ -1374,15 +1430,15 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, nodeName: result.nodeName, format: fmt }) }] };
         }
         if (outputPath) {
-          const resolved = path3.resolve(outputPath);
-          fs3.mkdirSync(path3.dirname(resolved), { recursive: true });
+          const resolved = path4.resolve(outputPath);
+          fs4.mkdirSync(path4.dirname(resolved), { recursive: true });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs3.writeFileSync(resolved, result.svg, "utf8");
+            fs4.writeFileSync(resolved, result.svg, "utf8");
           } else {
             if (!result.imageBytes) throw new Error("Image payload was not received");
-            fs3.writeFileSync(resolved, Buffer.from(result.imageBytes));
+            fs4.writeFileSync(resolved, Buffer.from(result.imageBytes));
           }
-          const stat = fs3.statSync(resolved);
+          const stat = fs4.statSync(resolved);
           const summary = {
             saved: true,
             path: resolved,
@@ -1470,10 +1526,10 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, ...metadata }) }] };
         }
         if (outputPath) {
-          const resolved = path3.resolve(outputPath);
-          fs3.mkdirSync(path3.dirname(resolved), { recursive: true });
-          fs3.writeFileSync(resolved, Buffer.from(result.imageBytes));
-          return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs3.statSync(resolved).size, ...metadata }) }] };
+          const resolved = path4.resolve(outputPath);
+          fs4.mkdirSync(path4.dirname(resolved), { recursive: true });
+          fs4.writeFileSync(resolved, Buffer.from(result.imageBytes));
+          return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs4.statSync(resolved).size, ...metadata }) }] };
         }
         return {
           content: [
@@ -3030,8 +3086,8 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         role: "controller",
         requesterId,
         protocolVersion: PROTOCOL_VERSION,
-        deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os3.hostname(),
-        platform: `${os3.platform()} ${os3.arch()}`,
+        deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os4.hostname(),
+        platform: `${os4.platform()} ${os4.arch()}`,
         capabilities: ["binaryFrames", "livePreview"]
       }));
       if (desiredChannel) {
@@ -3193,6 +3249,44 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     persistSelectedProject(selectedProject);
     return project;
   }
+  function currentProjectKey() {
+    return selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+  }
+  async function fetchProjectContextFromDocument(timeoutMs = 15e3) {
+    const result = await sendCommandToFigma("get_project_context", {}, timeoutMs);
+    const projectKey = currentProjectKey();
+    if (projectKey) {
+      if (result?.exists && typeof result.content === "string") {
+        cacheProjectContext(projectKey, {
+          content: result.content,
+          updatedAt: result.updatedAt ?? null,
+          updatedBy: result.updatedBy ?? null
+        });
+      } else {
+        clearCachedProjectContext(projectKey);
+      }
+    }
+    return result;
+  }
+  function buildContextDraftMaterial(projectKey) {
+    const index = loadProjectIndex(projectKey);
+    if (!index || !index.pages.length) return null;
+    const pages = index.pages.map((page) => {
+      const name = page.pageName || "";
+      const flags = [];
+      if (/\[ab\]|\bab ?test|실험|experiment/i.test(name)) flags.push("experiment?");
+      if (/^[\s\-=—–─═*·.·|/\\]+$/.test(name)) flags.push("divider");
+      if (/개인|personal|playground|scratch|sandbox|draft|드래프트/i.test(name)) flags.push("personal?");
+      if (/레퍼런스|reference|벤치마크|benchmark|모음|캡처|capture|스크린샷|screenshot/i.test(name)) flags.push("reference?");
+      if (/아카이브|archive|백업|backup|\bold\b|deprecated|미사용|legacy/i.test(name)) flags.push("archive?");
+      return {
+        name,
+        nodeCount: page.entries.length,
+        ...flags.length ? { flags } : {}
+      };
+    });
+    return { source: "disk-index", indexedAt: index.builtAt ?? index.updatedAt, pages };
+  }
   async function ensureProjectSelected() {
     if (currentChannel) return;
     if (selectedProject) {
@@ -3312,6 +3406,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         }
         await ensureProjectSelected();
         const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const contextFlag = hasCachedProjectContext(projectKey) ? { hasContext: true, contextNote: "\uC774 \uD504\uB85C\uC81D\uD2B8\uC5D0\uB294 \uCEE8\uD14D\uC2A4\uD2B8 \uBB38\uC11C\uAC00 \uC788\uB2E4 \u2014 \uACB0\uACFC \uD574\uC11D \uC804(\uC5B4\uB290 \uD398\uC774\uC9C0\uC758 \uBB34\uC5C7\uC778\uC9C0 \uD310\uB2E8\uD558\uAE30 \uC804) get_project_context \uB97C \uD655\uC778\uD558\uB77C." } : {};
         const annotationMatches = findAnnotationsForKeys(
           projectKey,
           allQueries.map(normalizeKeywordKey)
@@ -3393,6 +3488,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
               }
             }
             const result2 = {
+              ...contextFlag,
               queries: allQueries,
               match: mode,
               source: "index",
@@ -3455,6 +3551,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
           }
         }
         const result = {
+          ...contextFlag,
           queries: allQueries,
           match: mode,
           source: "live",
@@ -3474,9 +3571,27 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       }
     }
   );
+  function parseNodeKeywordValue(raw) {
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((k) => k && typeof k.keyword === "string" && k.keyword.trim());
+    } catch {
+      return [];
+    }
+  }
+  async function readNodeKeywords(nodeId) {
+    const data = await sendCommandToFigma("get_node_data", {
+      nodeId,
+      namespace: "talk_to_figma",
+      key: "search_keywords"
+    });
+    return parseNodeKeywordValue(data?.value);
+  }
   server.tool(
     "add_search_annotation",
-    "Register a learned keyword\u2192node link for the CURRENT project so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. The node's existence is verified and its name stored. Same keyword+node updates in place.",
+    "Register a learned keyword\u2192node link so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The link is stored ON THE NODE ITSELF inside the Figma document (sharedPluginData), so it follows the file across machines and is deleted with the node; the local disk copy is only a search cache. Requires a live plugin connection. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. Same keyword+node updates in place.",
     {
       keyword: import_zod.z.string().describe("The search keyword this node should be found under (the term the search failed on). Original spelling is kept; matching is case- and whitespace-insensitive."),
       nodeId: import_zod.z.string().describe("The confirmed node id the keyword should resolve to."),
@@ -3485,11 +3600,21 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     async ({ keyword, nodeId, note }) => {
       try {
         if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
-        const info = await sendCommandToFigma("get_node_info", { nodeId, fields: ["id"], maxDepth: 0 });
-        const nodeName = String(info?.name ?? "");
-        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
-        const annotation = upsertSearchAnnotation({ keyword: keyword.trim(), projectKey, nodeId, nodeName, note });
-        return { content: [{ type: "text", text: JSON.stringify({ saved: true, annotation }) }] };
+        const trimmed = keyword.trim();
+        const keywordKey = normalizeKeywordKey(trimmed);
+        const current = await readNodeKeywords(nodeId);
+        const kept = current.filter((k) => normalizeKeywordKey(k.keyword) !== keywordKey);
+        kept.push({ keyword: trimmed, ...note ? { note } : {}, addedAt: (/* @__PURE__ */ new Date()).toISOString() });
+        const saved = await sendCommandToFigma("set_node_keywords", { nodeId, keywords: kept });
+        const projectKey = currentProjectKey();
+        const annotation = upsertSearchAnnotation({
+          keyword: trimmed,
+          projectKey,
+          nodeId,
+          nodeName: String(saved?.nodeName ?? ""),
+          note
+        });
+        return { content: [{ type: "text", text: JSON.stringify({ saved: true, storedOnNode: true, annotation }) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error adding search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
       }
@@ -3497,7 +3622,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "remove_search_annotation",
-    "Remove learned keyword\u2192node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG \u2014 remove it so searches stop surfacing it. Omit nodeId to remove every annotation stored under the keyword.",
+    "Remove learned keyword\u2192node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG \u2014 remove it so searches stop surfacing it. Removes the keyword from the node's own sharedPluginData (the source of truth, requires a live plugin connection) and from the local search cache. Omit nodeId to remove every annotation stored under the keyword.",
     {
       keyword: import_zod.z.string().describe("The keyword whose annotation(s) to remove (case- and whitespace-insensitive)."),
       nodeId: import_zod.z.string().optional().describe("Remove only the annotation pointing at this node; omit to remove ALL annotations for the keyword.")
@@ -3506,11 +3631,89 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       try {
         if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
         await ensureProjectSelected();
-        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const projectKey = currentProjectKey();
+        const keywordKey = normalizeKeywordKey(keyword.trim());
+        const targetNodeIds = nodeId ? [nodeId] : [...new Set(findAnnotationsForKeys(projectKey, [keywordKey]).map((a) => a.nodeId))];
+        const nodeResults = [];
+        for (const target of targetNodeIds) {
+          try {
+            const current = await readNodeKeywords(target);
+            const kept = current.filter((k) => normalizeKeywordKey(k.keyword) !== keywordKey);
+            if (kept.length !== current.length) {
+              await sendCommandToFigma("set_node_keywords", { nodeId: target, keywords: kept });
+              nodeResults.push({ nodeId: target, removed: true });
+            } else {
+              nodeResults.push({ nodeId: target, removed: false });
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (/not found/i.test(message)) nodeResults.push({ nodeId: target, removed: false });
+            else nodeResults.push({ nodeId: target, removed: false, error: message });
+          }
+        }
+        if (nodeResults.some((r) => r.error)) {
+          throw new Error(`Failed to update node(s): ${nodeResults.filter((r) => r.error).map((r) => `${r.nodeId}: ${r.error}`).join("; ")}`);
+        }
         const removed = removeSearchAnnotations({ keyword: keyword.trim(), projectKey, nodeId });
-        return { content: [{ type: "text", text: JSON.stringify({ removed }) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ removed, nodes: nodeResults }) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "get_project_context",
+    "Read the project's CONTEXT DOCUMENT \u2014 the Figma-side analogue of a code repo's CLAUDE.md, stored IN the Figma document itself (root sharedPluginData, so it follows the file across machines). It explains what the file structure MEANS: page purposes (e.g. a reference page holding competitor captures vs. actual in-progress designs), naming conventions, where each feature lives, and common misidentification traps. READ IT BEFORE interpreting search results or picking a screen as 'the' design. If the project has no context yet, the response includes outline material summarized from the search index \u2014 use it to DRAFT a structure guide and save it with set_project_context.",
+    {
+      project: import_zod.z.string().optional().describe("Project/document name or file key. Omit for the currently selected project. Passing a different project SWITCHES the current selection (same as use_figma_project).")
+    },
+    async ({ project }) => {
+      try {
+        if (project) await selectProject(project);
+        const doc = await fetchProjectContextFromDocument();
+        if (doc?.exists) {
+          return { content: [{ type: "text", text: JSON.stringify({
+            project: selectedProject?.name ?? null,
+            fileName: doc.fileName ?? null,
+            updatedAt: doc.updatedAt ?? null,
+            updatedBy: doc.updatedBy ?? null,
+            content: doc.content
+          }, null, 2) }] };
+        }
+        const material = buildContextDraftMaterial(currentProjectKey());
+        return { content: [{ type: "text", text: JSON.stringify({
+          exists: false,
+          project: selectedProject?.name ?? null,
+          note: "\uC774 \uD504\uB85C\uC81D\uD2B8\uC5D0\uB294 \uCEE8\uD14D\uC2A4\uD2B8 \uBB38\uC11C\uAC00 \uC544\uC9C1 \uC5C6\uB2E4. \uD30C\uC77C \uAD6C\uC870\uB97C \uD30C\uC545\uD588\uB2E4\uBA74 \u2014 \uD398\uC774\uC9C0 \uC6A9\uB3C4, \uBA85\uBA85 \uADDC\uCE59, \uAE30\uB2A5\uBCC4 \uC704\uCE58, \uD754\uD55C \uC624\uC778 \uC9C0\uC810 \u2014 set_project_context \uB85C \uAE30\uB85D\uD558\uB77C.",
+          ...material ? {
+            draftMaterial: material,
+            draftHint: "draftMaterial \uC740 \uB514\uC2A4\uD06C \uC778\uB371\uC2A4\uC5D0\uC11C \uBF51\uC740 \uD398\uC774\uC9C0 \uC544\uC6C3\uB77C\uC778 \uC694\uC57D\uC774\uB2E4(flags \uB294 \uC774\uB984 \uAE30\uBC18 \uD734\uB9AC\uC2A4\uD2F1 \uCD94\uC815). \uC774\uB97C \uC7AC\uB8CC\uB85C \uAD6C\uC870 \uAC00\uC774\uB4DC \uCD08\uC548\uC744 \uC791\uC131\uD574 set_project_context \uB85C \uC800\uC7A5\uD558\uB77C \u2014 \uB2E8\uC815\uD558\uC9C0 \uB9D0\uACE0 \uC2E4\uC81C \uD398\uC774\uC9C0 \uB0B4\uC6A9\uC744 \uD655\uC778\uD574 \uC11C\uC220\uD560 \uAC83."
+          } : {}
+        }, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error getting project context: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "set_project_context",
+    "Replace the project's CONTEXT DOCUMENT (full-document semantics; there is no partial patch \u2014 read with get_project_context, edit, then write the whole markdown back). Stored in the Figma document itself, so it syncs everywhere the file is opened. Record: page purposes (e.g. '\uB808\uD37C\uB7F0\uC2A4 \uD398\uC774\uC9C0 = \uD0C0\uC0AC \uCEA1\uCC98 \uBAA8\uC74C, \uC6B0\uB9AC \uB514\uC790\uC778 \uC544\uB2D8' vs '\uC791\uC5C5 \uC911 = \uC9C4\uD589 \uB514\uC790\uC778'), naming conventions, where each feature's screens live, and common misidentification traps. When the operator gives feedback that something was found WRONG (\uC798\uBABB \uCC3E\uC558\uB2E4), update this document with that lesson so the next agent does not repeat the mistake. Max 50KB UTF-8. An empty string clears the document.",
+    {
+      content: import_zod.z.string().describe("The full markdown context document (replaces the previous one; the previous document is what get_project_context returned). Empty string clears it."),
+      project: import_zod.z.string().optional().describe("Project/document name or file key. Omit for the currently selected project. Passing a different project SWITCHES the current selection (same as use_figma_project).")
+    },
+    async ({ content, project }) => {
+      try {
+        if (project) await selectProject(project);
+        const result = await sendCommandToFigma("set_project_context", { content }, 15e3);
+        const projectKey = currentProjectKey();
+        if (projectKey) {
+          if (result?.cleared) clearCachedProjectContext(projectKey);
+          else if (result?.saved) cacheProjectContext(projectKey, { content, updatedAt: result.updatedAt ?? null, updatedBy: result.updatedBy ?? null });
+        }
+        return { content: [{ type: "text", text: JSON.stringify({ ...result, project: selectedProject?.name ?? null }, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error setting project context: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
@@ -3736,16 +3939,37 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "use_figma_project",
-    "Connect this MCP client to a Figma project by project name or file key. No channel name is needed; the least-loaded healthy plugin connection is selected automatically.",
+    "Connect this MCP client to a Figma project by project name or file key. No channel name is needed; the least-loaded healthy plugin connection is selected automatically. The response includes the project's CONTEXT DOCUMENT (page purposes, naming conventions, feature locations, misidentification traps \u2014 stored in the Figma document itself); READ IT before interpreting anything in the file.",
     { project: import_zod.z.string().describe("Figma project/document name or file key") },
     async ({ project }) => {
       try {
         const selected = await selectProject(project);
+        const CONTEXT_PREVIEW_LIMIT = 2e3;
+        let projectContext = void 0;
+        try {
+          const doc = await fetchProjectContextFromDocument();
+          if (doc?.exists && typeof doc.content === "string") {
+            const truncated = doc.content.length > CONTEXT_PREVIEW_LIMIT;
+            projectContext = {
+              updatedAt: doc.updatedAt ?? null,
+              updatedBy: doc.updatedBy ?? null,
+              content: truncated ? doc.content.slice(0, CONTEXT_PREVIEW_LIMIT) : doc.content,
+              ...truncated ? { truncated: true, note: "\uC804\uCCB4\uB294 get_project_context \uB85C \uC77D\uC5B4\uB77C." } : {}
+            };
+          } else {
+            projectContext = {
+              exists: false,
+              note: "\uCEE8\uD14D\uC2A4\uD2B8 \uBB38\uC11C\uAC00 \uC544\uC9C1 \uC5C6\uB2E4 \u2014 \uD30C\uC77C \uAD6C\uC870\uB97C \uD30C\uC545\uD588\uB2E4\uBA74 set_project_context \uB85C \uAE30\uB85D\uD558\uB77C (get_project_context \uAC00 \uCD08\uC548 \uC7AC\uB8CC\uB97C \uC900\uB2E4)."
+            };
+          }
+        } catch {
+        }
         return { content: [{ type: "text", text: JSON.stringify({
           connected: true,
           project: selectedProject,
           connectionCount: selected.connectionCount,
-          busy: selected.busy
+          busy: selected.busy,
+          ...projectContext !== void 0 ? { projectContext } : {}
         }, null, 2) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error selecting Figma project: ${error instanceof Error ? error.message : String(error)}` }] };
@@ -3939,19 +4163,19 @@ var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
 var httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 var httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
-var exportDirectory = process.env.FIGMA_EXPORT_DIR || path3.join(os3.homedir(), ".macfleet", "figma-exports");
+var exportDirectory = process.env.FIGMA_EXPORT_DIR || path4.join(os4.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
 var exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0 ? configuredExportTTLHours : 24;
 var exportTTL = exportTTLHours * 60 * 60 * 1e3;
 var exportNamePattern = /^[0-9a-f-]{36}\.(png|jpg|svg|pdf)$/;
 function cleanupExports() {
-  if (!fs3.existsSync(exportDirectory)) return;
+  if (!fs4.existsSync(exportDirectory)) return;
   const cutoff = Date.now() - exportTTL;
-  for (const name of fs3.readdirSync(exportDirectory)) {
+  for (const name of fs4.readdirSync(exportDirectory)) {
     if (!exportNamePattern.test(name)) continue;
-    const file = path3.join(exportDirectory, name);
+    const file = path4.join(exportDirectory, name);
     try {
-      if (fs3.statSync(file).mtimeMs < cutoff) fs3.unlinkSync(file);
+      if (fs4.statSync(file).mtimeMs < cutoff) fs4.unlinkSync(file);
     } catch (error) {
       logger.warn(`Could not clean export ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -3970,11 +4194,11 @@ function serveExport(req, res, pathname) {
     res.writeHead(404).end("not found");
     return true;
   }
-  const file = path3.join(exportDirectory, name);
+  const file = path4.join(exportDirectory, name);
   try {
-    const stat = fs3.statSync(file);
+    const stat = fs4.statSync(file);
     if (!stat.isFile() || Date.now() - stat.mtimeMs > exportTTL) {
-      if (stat.isFile()) fs3.unlinkSync(file);
+      if (stat.isFile()) fs4.unlinkSync(file);
       res.writeHead(404).end("not found");
       return true;
     }
@@ -3984,7 +4208,7 @@ function serveExport(req, res, pathname) {
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff"
     });
-    fs3.createReadStream(file).pipe(res);
+    fs4.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
   }
@@ -4005,7 +4229,7 @@ async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
   }
-  fs3.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+  fs4.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
   cleanupExports();
   const cleanupTimer = setInterval(cleanupExports, Math.min(exportTTL, 60 * 60 * 1e3));
   cleanupTimer.unref();

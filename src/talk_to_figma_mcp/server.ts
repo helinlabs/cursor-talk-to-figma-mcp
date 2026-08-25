@@ -25,6 +25,11 @@ import {
   findNormalizedMatch,
   textMatchSnippet,
 } from "../shared/search-index";
+import {
+  cacheProjectContext,
+  clearCachedProjectContext,
+  hasCachedProjectContext,
+} from "../shared/project-context";
 
 import { PROTOCOL_VERSION, protocolMajor } from "../shared/version";
 const BINARY_MAGIC = Buffer.from([0x54, 0x54, 0x46, 0x42]); // "TTFB"
@@ -3301,7 +3306,11 @@ type FigmaCommand =
   | "get_nodes_design_info"
   | "scan_design_usage"
   | "search_nodes"
-  | "get_file_outline";
+  | "get_file_outline"
+  | "get_project_context"
+  | "set_project_context"
+  | "set_node_keywords"
+  | "harvest_keyword_annotations";
 
 type CommandParams = {
   get_document_info: Record<string, never>;
@@ -3735,6 +3744,53 @@ async function selectProject(query?: string): Promise<any> {
   return project;
 }
 
+function currentProjectKey(): string {
+  return selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+}
+
+// Read the project context document from the LIVE Figma document (the source
+// of truth: figma.root sharedPluginData) and mirror it into the local disk
+// cache so the console and search_nodes can see it without a plugin
+// round-trip. Root data needs no page loads, so this is a few ms.
+async function fetchProjectContextFromDocument(timeoutMs = 15000): Promise<any> {
+  const result = (await sendCommandToFigma("get_project_context", {}, timeoutMs)) as any;
+  const projectKey = currentProjectKey();
+  if (projectKey) {
+    if (result?.exists && typeof result.content === "string") {
+      cacheProjectContext(projectKey, {
+        content: result.content,
+        updatedAt: result.updatedAt ?? null,
+        updatedBy: result.updatedBy ?? null,
+      });
+    } else {
+      clearCachedProjectContext(projectKey);
+    }
+  }
+  return result;
+}
+
+// When a project has no context document yet, hand the calling agent raw
+// material (an outline summary from the relay's disk index) to DRAFT one from.
+function buildContextDraftMaterial(projectKey: string): any | null {
+  const index = loadProjectIndex(projectKey);
+  if (!index || !index.pages.length) return null;
+  const pages = index.pages.map((page) => {
+    const name = page.pageName || "";
+    const flags: string[] = [];
+    if (/\[ab\]|\bab ?test|실험|experiment/i.test(name)) flags.push("experiment?");
+    if (/^[\s\-=—–─═*·.·|/\\]+$/.test(name)) flags.push("divider");
+    if (/개인|personal|playground|scratch|sandbox|draft|드래프트/i.test(name)) flags.push("personal?");
+    if (/레퍼런스|reference|벤치마크|benchmark|모음|캡처|capture|스크린샷|screenshot/i.test(name)) flags.push("reference?");
+    if (/아카이브|archive|백업|backup|\bold\b|deprecated|미사용|legacy/i.test(name)) flags.push("archive?");
+    return {
+      name,
+      nodeCount: page.entries.length,
+      ...(flags.length ? { flags } : {}),
+    };
+  });
+  return { source: "disk-index", indexedAt: index.builtAt ?? index.updatedAt, pages };
+}
+
 async function ensureProjectSelected(): Promise<void> {
   if (currentChannel) return;
   if (selectedProject) {
@@ -3888,6 +3944,13 @@ server.tool(
       // selected first so the lookup is scoped correctly.
       await ensureProjectSelected();
       const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      // If this project has a context document (cache-mirrored on every live
+      // read, e.g. on use_figma_project), tell the caller to consult it before
+      // interpreting matches — e.g. a hit on a reference page of competitor
+      // captures is NOT our design.
+      const contextFlag = hasCachedProjectContext(projectKey)
+        ? { hasContext: true, contextNote: "이 프로젝트에는 컨텍스트 문서가 있다 — 결과 해석 전(어느 페이지의 무엇인지 판단하기 전) get_project_context 를 확인하라." }
+        : {};
       const annotationMatches = findAnnotationsForKeys(
         projectKey,
         allQueries.map(normalizeKeywordKey)
@@ -3968,6 +4031,7 @@ server.tool(
             }
           }
           const result: any = {
+            ...contextFlag,
             queries: allQueries,
             match: mode,
             source: "index",
@@ -4037,6 +4101,7 @@ server.tool(
       }
 
       const result: any = {
+        ...contextFlag,
         queries: allQueries,
         match: mode,
         source: "live",
@@ -4058,9 +4123,31 @@ server.tool(
   }
 );
 
+// Keywords stored ON a node (SoR): sharedPluginData("talk_to_figma",
+// "search_keywords") holds a JSON array [{keyword, note?, addedAt}].
+function parseNodeKeywordValue(raw: unknown): Array<{ keyword: string; note?: string; addedAt?: string }> {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((k: any) => k && typeof k.keyword === "string" && k.keyword.trim());
+  } catch {
+    return [];
+  }
+}
+
+async function readNodeKeywords(nodeId: string): Promise<Array<{ keyword: string; note?: string; addedAt?: string }>> {
+  const data = (await sendCommandToFigma("get_node_data", {
+    nodeId,
+    namespace: "talk_to_figma",
+    key: "search_keywords",
+  })) as any;
+  return parseNodeKeywordValue(data?.value);
+}
+
 server.tool(
   "add_search_annotation",
-  "Register a learned keyword→node link for the CURRENT project so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. The node's existence is verified and its name stored. Same keyword+node updates in place.",
+  "Register a learned keyword→node link so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The link is stored ON THE NODE ITSELF inside the Figma document (sharedPluginData), so it follows the file across machines and is deleted with the node; the local disk copy is only a search cache. Requires a live plugin connection. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. Same keyword+node updates in place.",
   {
     keyword: z.string().describe("The search keyword this node should be found under (the term the search failed on). Original spelling is kept; matching is case- and whitespace-insensitive."),
     nodeId: z.string().describe("The confirmed node id the keyword should resolve to."),
@@ -4069,12 +4156,22 @@ server.tool(
   async ({ keyword, nodeId, note }: any) => {
     try {
       if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
-      // Verify the node exists in the current project and capture its name.
-      const info = (await sendCommandToFigma("get_node_info", { nodeId, fields: ["id"], maxDepth: 0 })) as any;
-      const nodeName = String(info?.name ?? "");
-      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
-      const annotation = upsertSearchAnnotation({ keyword: keyword.trim(), projectKey, nodeId, nodeName, note });
-      return { content: [{ type: "text", text: JSON.stringify({ saved: true, annotation }) }] };
+      const trimmed = keyword.trim();
+      const keywordKey = normalizeKeywordKey(trimmed);
+      // Read-modify-write the node's keyword list (SoR), then mirror to cache.
+      const current = await readNodeKeywords(nodeId);
+      const kept = current.filter((k) => normalizeKeywordKey(k.keyword) !== keywordKey);
+      kept.push({ keyword: trimmed, ...(note ? { note } : {}), addedAt: new Date().toISOString() });
+      const saved = (await sendCommandToFigma("set_node_keywords", { nodeId, keywords: kept })) as any;
+      const projectKey = currentProjectKey();
+      const annotation = upsertSearchAnnotation({
+        keyword: trimmed,
+        projectKey,
+        nodeId,
+        nodeName: String(saved?.nodeName ?? ""),
+        note,
+      });
+      return { content: [{ type: "text", text: JSON.stringify({ saved: true, storedOnNode: true, annotation }) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error adding search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
     }
@@ -4083,7 +4180,7 @@ server.tool(
 
 server.tool(
   "remove_search_annotation",
-  "Remove learned keyword→node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG — remove it so searches stop surfacing it. Omit nodeId to remove every annotation stored under the keyword.",
+  "Remove learned keyword→node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG — remove it so searches stop surfacing it. Removes the keyword from the node's own sharedPluginData (the source of truth, requires a live plugin connection) and from the local search cache. Omit nodeId to remove every annotation stored under the keyword.",
   {
     keyword: z.string().describe("The keyword whose annotation(s) to remove (case- and whitespace-insensitive)."),
     nodeId: z.string().optional().describe("Remove only the annotation pointing at this node; omit to remove ALL annotations for the keyword."),
@@ -4092,11 +4189,98 @@ server.tool(
     try {
       if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
       await ensureProjectSelected();
-      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const projectKey = currentProjectKey();
+      const keywordKey = normalizeKeywordKey(keyword.trim());
+      // Which nodes carry this keyword? The cache knows (it is rebuilt from
+      // document harvests); an explicit nodeId wins.
+      const targetNodeIds = nodeId
+        ? [nodeId]
+        : [...new Set(findAnnotationsForKeys(projectKey, [keywordKey]).map((a) => a.nodeId))];
+      const nodeResults: Array<{ nodeId: string; removed: boolean; error?: string }> = [];
+      for (const target of targetNodeIds) {
+        try {
+          const current = await readNodeKeywords(target);
+          const kept = current.filter((k) => normalizeKeywordKey(k.keyword) !== keywordKey);
+          if (kept.length !== current.length) {
+            await sendCommandToFigma("set_node_keywords", { nodeId: target, keywords: kept });
+            nodeResults.push({ nodeId: target, removed: true });
+          } else {
+            nodeResults.push({ nodeId: target, removed: false });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          // A deleted node no longer carries the annotation anyway — allow the
+          // cache entry to be removed below.
+          if (/not found/i.test(message)) nodeResults.push({ nodeId: target, removed: false });
+          else nodeResults.push({ nodeId: target, removed: false, error: message });
+        }
+      }
+      if (nodeResults.some((r) => r.error)) {
+        // Do not silently drop the cache entry while the SoR still has it.
+        throw new Error(`Failed to update node(s): ${nodeResults.filter((r) => r.error).map((r) => `${r.nodeId}: ${r.error}`).join("; ")}`);
+      }
       const removed = removeSearchAnnotations({ keyword: keyword.trim(), projectKey, nodeId });
-      return { content: [{ type: "text", text: JSON.stringify({ removed }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ removed, nodes: nodeResults }) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_project_context",
+  "Read the project's CONTEXT DOCUMENT — the Figma-side analogue of a code repo's CLAUDE.md, stored IN the Figma document itself (root sharedPluginData, so it follows the file across machines). It explains what the file structure MEANS: page purposes (e.g. a reference page holding competitor captures vs. actual in-progress designs), naming conventions, where each feature lives, and common misidentification traps. READ IT BEFORE interpreting search results or picking a screen as 'the' design. If the project has no context yet, the response includes outline material summarized from the search index — use it to DRAFT a structure guide and save it with set_project_context.",
+  {
+    project: z.string().optional().describe("Project/document name or file key. Omit for the currently selected project. Passing a different project SWITCHES the current selection (same as use_figma_project)."),
+  },
+  async ({ project }: any) => {
+    try {
+      if (project) await selectProject(project);
+      const doc = await fetchProjectContextFromDocument();
+      if (doc?.exists) {
+        return { content: [{ type: "text", text: JSON.stringify({
+          project: selectedProject?.name ?? null,
+          fileName: doc.fileName ?? null,
+          updatedAt: doc.updatedAt ?? null,
+          updatedBy: doc.updatedBy ?? null,
+          content: doc.content,
+        }, null, 2) }] };
+      }
+      const material = buildContextDraftMaterial(currentProjectKey());
+      return { content: [{ type: "text", text: JSON.stringify({
+        exists: false,
+        project: selectedProject?.name ?? null,
+        note: "이 프로젝트에는 컨텍스트 문서가 아직 없다. 파일 구조를 파악했다면 — 페이지 용도, 명명 규칙, 기능별 위치, 흔한 오인 지점 — set_project_context 로 기록하라.",
+        ...(material ? {
+          draftMaterial: material,
+          draftHint: "draftMaterial 은 디스크 인덱스에서 뽑은 페이지 아웃라인 요약이다(flags 는 이름 기반 휴리스틱 추정). 이를 재료로 구조 가이드 초안을 작성해 set_project_context 로 저장하라 — 단정하지 말고 실제 페이지 내용을 확인해 서술할 것.",
+        } : {}),
+      }, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting project context: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "set_project_context",
+  "Replace the project's CONTEXT DOCUMENT (full-document semantics; there is no partial patch — read with get_project_context, edit, then write the whole markdown back). Stored in the Figma document itself, so it syncs everywhere the file is opened. Record: page purposes (e.g. '레퍼런스 페이지 = 타사 캡처 모음, 우리 디자인 아님' vs '작업 중 = 진행 디자인'), naming conventions, where each feature's screens live, and common misidentification traps. When the operator gives feedback that something was found WRONG (잘못 찾았다), update this document with that lesson so the next agent does not repeat the mistake. Max 50KB UTF-8. An empty string clears the document.",
+  {
+    content: z.string().describe("The full markdown context document (replaces the previous one; the previous document is what get_project_context returned). Empty string clears it."),
+    project: z.string().optional().describe("Project/document name or file key. Omit for the currently selected project. Passing a different project SWITCHES the current selection (same as use_figma_project)."),
+  },
+  async ({ content, project }: any) => {
+    try {
+      if (project) await selectProject(project);
+      const result = (await sendCommandToFigma("set_project_context", { content }, 15000)) as any;
+      const projectKey = currentProjectKey();
+      if (projectKey) {
+        if (result?.cleared) clearCachedProjectContext(projectKey);
+        else if (result?.saved) cacheProjectContext(projectKey, { content, updatedAt: result.updatedAt ?? null, updatedBy: result.updatedBy ?? null });
+      }
+      return { content: [{ type: "text", text: JSON.stringify({ ...result, project: selectedProject?.name ?? null }, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error setting project context: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
@@ -4343,16 +4527,40 @@ server.tool(
 
 server.tool(
   "use_figma_project",
-  "Connect this MCP client to a Figma project by project name or file key. No channel name is needed; the least-loaded healthy plugin connection is selected automatically.",
+  "Connect this MCP client to a Figma project by project name or file key. No channel name is needed; the least-loaded healthy plugin connection is selected automatically. The response includes the project's CONTEXT DOCUMENT (page purposes, naming conventions, feature locations, misidentification traps — stored in the Figma document itself); READ IT before interpreting anything in the file.",
   { project: z.string().describe("Figma project/document name or file key") },
   async ({ project }: any) => {
     try {
       const selected = await selectProject(project);
+      // Auto-load the project context document (root sharedPluginData — a few
+      // ms). Best-effort: a failure here must not fail project selection.
+      const CONTEXT_PREVIEW_LIMIT = 2000;
+      let projectContext: any = undefined;
+      try {
+        const doc = await fetchProjectContextFromDocument();
+        if (doc?.exists && typeof doc.content === "string") {
+          const truncated = doc.content.length > CONTEXT_PREVIEW_LIMIT;
+          projectContext = {
+            updatedAt: doc.updatedAt ?? null,
+            updatedBy: doc.updatedBy ?? null,
+            content: truncated ? doc.content.slice(0, CONTEXT_PREVIEW_LIMIT) : doc.content,
+            ...(truncated ? { truncated: true, note: "전체는 get_project_context 로 읽어라." } : {}),
+          };
+        } else {
+          projectContext = {
+            exists: false,
+            note: "컨텍스트 문서가 아직 없다 — 파일 구조를 파악했다면 set_project_context 로 기록하라 (get_project_context 가 초안 재료를 준다).",
+          };
+        }
+      } catch {
+        // context load is best-effort
+      }
       return { content: [{ type: "text", text: JSON.stringify({
         connected: true,
         project: selectedProject,
         connectionCount: selected.connectionCount,
         busy: selected.busy,
+        ...(projectContext !== undefined ? { projectContext } : {}),
       }, null, 2) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error selecting Figma project: ${error instanceof Error ? error.message : String(error)}` }] };
