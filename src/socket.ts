@@ -4,7 +4,30 @@ import { Server, ServerWebSocket } from "bun";
 import { readFileSync } from "fs";
 import { createHash } from "crypto";
 
-const PROTOCOL_VERSION = "2.0.0";
+const PROTOCOL_VERSION = "3.0.0";
+const BINARY_MAGIC = new Uint8Array([0x54, 0x54, 0x46, 0x42]); // "TTFB"
+
+function encodeBinaryFrame(envelope: any, payload: Uint8Array): Uint8Array {
+  const header = new TextEncoder().encode(JSON.stringify(envelope));
+  const frame = new Uint8Array(8 + header.byteLength + payload.byteLength);
+  frame.set(BINARY_MAGIC, 0);
+  new DataView(frame.buffer).setUint32(4, header.byteLength, false);
+  frame.set(header, 8);
+  frame.set(payload, 8 + header.byteLength);
+  return frame;
+}
+
+function decodeBinaryFrame(raw: Uint8Array): { envelope: any; payload: Uint8Array } {
+  if (raw.byteLength < 8 || BINARY_MAGIC.some((byte, index) => raw[index] !== byte)) {
+    throw new Error("Invalid Talk-to-Figma binary frame");
+  }
+  const headerLength = new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint32(4, false);
+  if (headerLength <= 0 || 8 + headerLength > raw.byteLength) {
+    throw new Error("Invalid Talk-to-Figma binary header length");
+  }
+  const envelope = JSON.parse(new TextDecoder().decode(raw.subarray(8, 8 + headerLength)));
+  return { envelope, payload: raw.subarray(8 + headerLength) };
+}
 
 function isProtocolCompatible(version: unknown): boolean {
   if (typeof version !== "string") return false;
@@ -55,6 +78,17 @@ interface ClientMeta {
   applicationHeartbeat: boolean;
   protocolVersion?: string;
   protocolVerified: boolean;
+  deviceName?: string;
+  platform?: string;
+  address?: string;
+  observedAddress?: string;
+  connectionScope: "localhost" | "lan" | "external" | "unknown";
+}
+
+interface ConnectionData {
+  address?: string;
+  observedAddress?: string;
+  connectionScope: ClientMeta["connectionScope"];
 }
 
 interface RequestMeta {
@@ -100,6 +134,17 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
 const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
+
+function connectionScope(address?: string): ClientMeta["connectionScope"] {
+  if (!address) return "unknown";
+  const value = address.trim().replace(/^::ffff:/, "").toLowerCase();
+  if (value === "localhost" || value === "127.0.0.1" || value === "::1") return "localhost";
+  if (/^10\./.test(value) || /^192\.168\./.test(value)) return "lan";
+  const match = value.match(/^172\.(\d+)\./);
+  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return "lan";
+  if (/^(fc|fd)[0-9a-f]{2}:/.test(value) || /^fe80:/.test(value)) return "lan";
+  return "external";
+}
 
 function touch(ws: ServerWebSocket<any>): void {
   const meta = clientMeta.get(ws);
@@ -176,6 +221,28 @@ function truncate(value: unknown, max = 4000): unknown {
   return { __truncated: true, length: str.length, preview: str.slice(0, max) };
 }
 
+function sanitizeForLog(value: any, depth = 0): any {
+  if (depth > 6) return "[depth omitted]";
+  if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitizeForLog(item, depth + 1));
+  if (!value || typeof value !== "object") return value;
+  const out: Record<string, any> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (/^(imageData|imageBase64|imageBytes|data)$/i.test(key)) {
+      const bytes = ArrayBuffer.isView(child)
+        ? child.byteLength
+        : child instanceof ArrayBuffer
+          ? child.byteLength
+          : undefined;
+      out[key] = typeof child === "string"
+        ? { omitted: true, encodedCharacters: child.length }
+        : { omitted: true, ...(bytes === undefined ? {} : { bytes }) };
+    } else {
+      out[key] = sanitizeForLog(child, depth + 1);
+    }
+  }
+  return out;
+}
+
 function pushEvent(evt: any): void {
   evt.ts = evt.ts ?? Date.now();
   eventLog.push(evt);
@@ -192,7 +259,9 @@ function snapshotChannels(): any[] {
     const members: any[] = [];
     clients.forEach((c) => {
       const m = clientMeta.get(c);
-      if (m) members.push({
+      if (m) {
+        const assigned = [...requests.values()].filter((request) => request.figma === c);
+        members.push({
         id: m.id,
         role: m.role,
         connectedAt: m.connectedAt,
@@ -201,8 +270,19 @@ function snapshotChannels(): any[] {
         activeRequests: m.activeRequests,
         unstable: m.unstable,
         protocolVersion: m.protocolVersion ?? null,
+        deviceName: m.deviceName ?? null,
+        platform: m.platform ?? null,
+        address: m.address ?? null,
+        observedAddress: m.observedAddress ?? null,
+        connectionScope: m.connectionScope,
+        runningRequests: assigned.filter((request) => request.startedAt !== undefined).length,
+        pendingRequests: assigned.filter((request) => request.startedAt === undefined).length,
       });
+      }
     });
+    const channelRequests = [...requests.values()].filter((request) => request.channel === name);
+    const runningRequests = channelRequests.filter((request) => request.startedAt !== undefined).length;
+    const pendingRequests = channelRequests.length - runningRequests;
     out.push({
       channel: name,
       count: members.length,
@@ -211,7 +291,11 @@ function snapshotChannels(): any[] {
       emptiedAt: emptyChannels.get(name) ?? null,
       document: channelDocs.get(name) ?? null,
       announcedAt: channelAnnouncedAt.get(name) ?? null,
-      queueDepth: members.reduce((sum, member) => sum + (member.activeRequests || 0), 0),
+      busy: runningRequests > 0,
+      runningRequests,
+      pendingRequests,
+      inFlightRequests: channelRequests.length,
+      queueDepth: pendingRequests,
     });
   });
   return out;
@@ -234,7 +318,7 @@ function snapshotProjects(): any[] {
     const leastLoaded = [...live].sort((a, b) => {
       const ac = a.clients.filter((client: any) => client.role === "controller").length;
       const bc = b.clients.filter((client: any) => client.role === "controller").length;
-      return ac - bc || a.queueDepth - b.queueDepth || (b.announcedAt || 0) - (a.announcedAt || 0);
+      return ac - bc || a.inFlightRequests - b.inFlightRequests || (b.announcedAt || 0) - (a.announcedAt || 0);
     })[0] ?? null;
     const document = (newest || connections[0]).document;
     return {
@@ -245,7 +329,10 @@ function snapshotProjects(): any[] {
       totalConnectionCount: connections.length,
       representativeChannel: newest?.channel ?? null,
       recommendedChannel: leastLoaded?.channel ?? null,
-      busy: live.reduce((sum, connection) => sum + connection.queueDepth, 0),
+      busy: live.some((connection) => connection.busy),
+      runningRequests: live.reduce((sum, connection) => sum + connection.runningRequests, 0),
+      pendingRequests: live.reduce((sum, connection) => sum + connection.pendingRequests, 0),
+      inFlightRequests: live.reduce((sum, connection) => sum + connection.inFlightRequests, 0),
       connections,
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
@@ -267,6 +354,7 @@ function pushChannels(): void {
 // ---------------------------------------------------------------------------
 
 function handleConnection(ws: ServerWebSocket<any>) {
+  const connection = (ws.data || {}) as ConnectionData;
   const meta: ClientMeta = {
     id: `c${++clientSeq}`,
     role: "unknown",
@@ -279,6 +367,9 @@ function handleConnection(ws: ServerWebSocket<any>) {
     unstable: false,
     applicationHeartbeat: false,
     protocolVerified: false,
+    address: connection.address,
+    observedAddress: connection.observedAddress,
+    connectionScope: connection.connectionScope || "unknown",
   };
   clientMeta.set(ws, meta);
 
@@ -290,13 +381,12 @@ function handleConnection(ws: ServerWebSocket<any>) {
     message: "Please join a channel to start chatting",
   }));
 
-  pushEvent({ kind: "connect", clientId: meta.id });
+  pushEvent({ kind: "connect", clientId: meta.id, address: meta.address, connectionScope: meta.connectionScope });
 }
 
 const server = Bun.serve({
   port: Number(process.env.PORT) || 3055,
-  // uncomment this to allow connections in windows wsl
-  // hostname: "0.0.0.0",
+  hostname: process.env.HOST || "0.0.0.0",
   fetch(req: Request, server: Server) {
     // Handle CORS preflight
     if (req.method === "OPTIONS") {
@@ -312,7 +402,13 @@ const server = Bun.serve({
     // Handle WebSocket upgrade first (clients connect to the root path).
     // For plain HTTP GETs this returns false and we fall through to serving
     // the web console below.
+    const observedAddress = server.requestIP(req)?.address;
+    const forwarded = req.headers.get("cf-connecting-ip")
+      || req.headers.get("x-real-ip")
+      || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+    const address = forwarded || observedAddress;
     const success = server.upgrade(req, {
+      data: { address, observedAddress, connectionScope: connectionScope(address) } satisfies ConnectionData,
       headers: {
         "Access-Control-Allow-Origin": "*",
       },
@@ -384,6 +480,7 @@ const server = Bun.serve({
     });
   },
   websocket: {
+    maxPayloadLength: 64 * 1024 * 1024,
     open: handleConnection,
     pong(ws: ServerWebSocket<any>) {
       // For Figma, require the application-level heartbeat from the plugin UI.
@@ -392,7 +489,15 @@ const server = Bun.serve({
     },
     message(ws: ServerWebSocket<any>, message: string | Buffer) {
       try {
-        const data = JSON.parse(message as string);
+        let data: any;
+        let binaryPayload: Uint8Array | undefined;
+        if (typeof message === "string") {
+          data = JSON.parse(message);
+        } else {
+          const decoded = decodeBinaryFrame(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
+          data = decoded.envelope;
+          binaryPayload = decoded.payload;
+        }
         const meta = clientMeta.get(ws);
         touch(ws);
 
@@ -410,6 +515,8 @@ const server = Bun.serve({
             meta.requesterId = data.requesterId ? String(data.requesterId) : meta.requesterId;
             if (data.role === "controller" || data.role === "figma") meta.role = data.role;
             if (data.role === "figma") meta.applicationHeartbeat = true;
+            if (data.deviceName) meta.deviceName = String(data.deviceName).slice(0, 120);
+            if (data.platform) meta.platform = String(data.platform).slice(0, 160);
             meta.protocolVersion = typeof data.protocolVersion === "string" ? data.protocolVersion : undefined;
             meta.protocolVerified = isProtocolCompatible(data.protocolVersion);
             if (!meta.protocolVerified) {
@@ -452,6 +559,7 @@ const server = Bun.serve({
               waitMs: request.startedAt - request.queuedAt,
               batchId: request.batchId,
             });
+            pushChannels();
           }
           return;
         }
@@ -525,7 +633,10 @@ const server = Bun.serve({
         } else if (data.message?.result) {
           console.log(`Response: ID: ${data.id}, Has Result: ${!!data.message.result}`);
         }
-        console.log(`Full message:`, JSON.stringify(data, null, 2));
+        console.log(`Message metadata:`, JSON.stringify({
+          ...sanitizeForLog(data),
+          ...(binaryPayload ? { binaryTransfer: { bytes: binaryPayload.byteLength } } : {}),
+        }, null, 2));
 
         if (data.type === "join") {
           if (!meta?.protocolVerified) {
@@ -711,14 +822,20 @@ const server = Bun.serve({
               error: data.message.error,
               timing,
               batchId: request.batchId,
+              transfer: binaryPayload ? { encoding: "binary", bytes: binaryPayload.byteLength } : undefined,
             });
             if (request.requester.readyState === WebSocket.OPEN) {
-              request.requester.send(JSON.stringify({
+              const responseEnvelope = {
                 type: "broadcast",
                 message: { ...data.message, timing },
                 sender: meta?.id ?? "figma",
                 channel: channelName,
-              }));
+              };
+              if (binaryPayload) {
+                request.requester.send(encodeBinaryFrame(responseEnvelope, binaryPayload));
+              } else {
+                request.requester.send(JSON.stringify(responseEnvelope));
+              }
             }
             requests.delete(requestId);
             pushChannels();

@@ -4,6 +4,8 @@
 // Plugin state
 const state = {
   serverPort: 3055, // Default port
+  serverUrl: "ws://localhost:3055",
+  deviceName: "",
 };
 
 
@@ -161,9 +163,13 @@ function updateSettings(settings) {
   if (settings.serverPort) {
     state.serverPort = settings.serverPort;
   }
+  if (settings.serverUrl) state.serverUrl = settings.serverUrl;
+  if (settings.deviceName !== undefined) state.deviceName = settings.deviceName;
 
   figma.clientStorage.setAsync("settings", {
     serverPort: state.serverPort,
+    serverUrl: state.serverUrl,
+    deviceName: state.deviceName,
   });
 }
 
@@ -2732,7 +2738,6 @@ async function exportNodeAsImage(params) {
       const out = Object.assign(base, {
         mimeType: "image/svg+xml",
         svg: svg,
-        imageData: customBase64Encode(utf8ToUint8(svg)),
       });
       if (includeColorTokens) {
         const resolver = makeDsResolver(true);
@@ -2761,7 +2766,8 @@ async function exportNodeAsImage(params) {
 
     const out = Object.assign(base, {
       mimeType,
-      imageData: customBase64Encode(bytes),
+      imageBytes: bytes,
+      byteLength: bytes.byteLength,
     });
     if (
       format !== "PDF" &&
@@ -2923,6 +2929,8 @@ async function setTextContent(params) {
       if (savedSettings.serverPort) {
         state.serverPort = savedSettings.serverPort;
       }
+      if (savedSettings.serverUrl) state.serverUrl = savedSettings.serverUrl;
+      if (savedSettings.deviceName) state.deviceName = savedSettings.deviceName;
     }
 
     // Send initial settings to UI
@@ -2930,6 +2938,8 @@ async function setTextContent(params) {
       type: "init-settings",
       settings: {
         serverPort: state.serverPort,
+        serverUrl: state.serverUrl,
+        deviceName: state.deviceName,
       },
     });
   } catch (error) {

@@ -197,8 +197,12 @@
       import { createRoot } from "react-dom/client";
       import { FixedSizeList } from "react-window";
 
-      const WS_URL = `ws://${location.host}`;
-      const PROTOCOL_VERSION = "2.0.0";
+      const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const wsPath = location.pathname.endsWith("/console")
+        ? location.pathname.slice(0, -"console".length)
+        : location.pathname;
+      const WS_URL = `${wsProtocol}//${location.host}${wsPath || "/"}`;
+      const PROTOCOL_VERSION = "3.0.0";
       const RING = 5000;          // browser-side ring buffer size
       const FLUSH_MS = 150;       // batch incoming events to avoid render storms
       const ROW_H = 26;
@@ -564,7 +568,9 @@
             <div className="chan-head">
               <span className="chan-name">#{c.channel}</span>
               <span className="badge">
-                {active ? `${c.count} client${c.count === 1 ? "" : "s"}` : "empty"}
+                {active
+                  ? `${c.busy ? "working" : "idle"} · ${c.runningRequests || 0} running · ${c.pendingRequests || 0} pending`
+                  : "empty"}
               </span>
             </div>
             {c.document && (
@@ -586,7 +592,15 @@
             {c.clients.map((cl) => (
               <div className="member" key={cl.id}>
                 <span className={"badge " + cl.role}>{cl.role}</span>
-                <code>{cl.id}</code>
+                <code>
+                  {cl.deviceName || cl.requesterId || cl.id}
+                  {` · ${cl.connectionScope || "unknown"}`}
+                  {cl.address ? ` · ${cl.address}` : ""}
+                  {` · ${cl.id}`}
+                  {(cl.runningRequests || cl.pendingRequests)
+                    ? ` · ${cl.runningRequests || 0} running / ${cl.pendingRequests || 0} pending`
+                    : ""}
+                </code>
               </div>
             ))}
             {when && <div className="member"><code>{when}</code></div>}
@@ -649,12 +663,12 @@
                     <span className="badge">{project.connectionCount} connected</span>
                   </div>
                   <div className="member">
-                    <code>busy {project.busy || 0} · recommended #{project.recommendedChannel || "—"}</code>
+                    <code>{project.busy ? "working" : "idle"} · {project.runningRequests || 0} running · {project.pendingRequests || 0} pending · recommended #{project.recommendedChannel || "—"}</code>
                   </div>
                   {project.connections.map((connection) => (
                     <div className="member" key={connection.channel}>
                       <span className="badge figma">#{connection.channel}</span>
-                      <code>{connection.queueDepth || 0} active · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
+                      <code>{connection.runningRequests || 0} running · {connection.pendingRequests || 0} pending · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
                     </div>
                   ))}
                 </div>
@@ -786,7 +800,7 @@
             const to = setTimeout(() => reject(new Error("connect/join timeout")), 8000);
             // join as a controller (so the server labels us controller, not figma)
             ws.onopen = () => {
-              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: PROTOCOL_VERSION }));
+              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: PROTOCOL_VERSION, deviceName: "Web console", platform: navigator.platform || navigator.userAgent }));
               ws.send(JSON.stringify({ type: "join", channel: target, requesterId: "dashboard", id: genId(), message: { command: "join" } }));
             };
             ws.onerror = () => { clearTimeout(to); reject(new Error("socket error")); };
@@ -1013,7 +1027,11 @@
           const connect = () => {
             ws = new WebSocket(WS_URL);
             monitorRef.current = ws;
-            ws.onopen = () => { setConnected(true); ws.send(JSON.stringify({ type: "monitor" })); };
+            ws.onopen = () => {
+              setConnected(true);
+              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard-monitor", protocolVersion: PROTOCOL_VERSION, deviceName: "Web console monitor", platform: navigator.platform || navigator.userAgent }));
+              ws.send(JSON.stringify({ type: "monitor" }));
+            };
             ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 1500); };
             ws.onerror = () => { try { ws.close(); } catch {} };
             ws.onmessage = (ev) => {

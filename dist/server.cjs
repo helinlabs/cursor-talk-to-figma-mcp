@@ -30,7 +30,28 @@ var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
 var fs = __toESM(require("fs"), 1);
 var path = __toESM(require("path"), 1);
-var PROTOCOL_VERSION = "2.0.0";
+var os = __toESM(require("os"), 1);
+var PROTOCOL_VERSION = "3.0.0";
+var BINARY_MAGIC = Buffer.from([84, 84, 70, 66]);
+function rawDataToBuffer(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (Array.isArray(data)) return Buffer.concat(data.map(rawDataToBuffer));
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return Buffer.from(data);
+}
+function decodeBinaryFrame(data) {
+  const raw = rawDataToBuffer(data);
+  if (raw.byteLength < 8 || !raw.subarray(0, 4).equals(BINARY_MAGIC)) {
+    throw new Error("Invalid Talk-to-Figma binary frame");
+  }
+  const headerLength = raw.readUInt32BE(4);
+  if (headerLength <= 0 || 8 + headerLength > raw.byteLength) {
+    throw new Error("Invalid Talk-to-Figma binary header length");
+  }
+  const envelope = JSON.parse(raw.subarray(8, 8 + headerLength).toString("utf8"));
+  return { envelope, payload: raw.subarray(8 + headerLength) };
+}
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -57,8 +78,21 @@ var server = new import_mcp.McpServer({
 });
 var args = process.argv.slice(2);
 var serverArg = args.find((arg) => arg.startsWith("--server="));
-var serverUrl = serverArg ? serverArg.split("=")[1] : "localhost";
-var WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
+var serverUrl = serverArg ? serverArg.slice("--server=".length) : "localhost";
+function normalizeRelayWebSocketUrl(value) {
+  const target = value.trim() || "localhost";
+  if (target === "localhost") return "ws://localhost:3055";
+  if (/^wss?:\/\//i.test(target)) return target;
+  if (/^https?:\/\//i.test(target)) return target.replace(/^http/i, "ws");
+  return `wss://${target}`;
+}
+var RELAY_WS_URL = normalizeRelayWebSocketUrl(serverUrl);
+function relayHttpUrl(endpoint) {
+  const url = new URL(RELAY_WS_URL);
+  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
+  return url.toString();
+}
 server.tool(
   "get_document_info",
   "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
@@ -1011,7 +1045,8 @@ server.tool(
         if (fmt === "SVG" && typeof result.svg === "string") {
           fs.writeFileSync(resolved, result.svg, "utf8");
         } else {
-          fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+          if (!result.imageBytes) throw new Error("Binary image payload was not received");
+          fs.writeFileSync(resolved, Buffer.from(result.imageBytes));
         }
         const stat = fs.statSync(resolved);
         const summary = {
@@ -1043,11 +1078,14 @@ server.tool(
         }
         return { content: [{ type: "text", text: result.svg }] };
       }
+      if (!result.imageBytes) throw new Error("Binary image payload was not received");
       return {
         content: [
           {
             type: "image",
-            data: result.imageData,
+            // MCP image content still requires base64. Conversion happens only
+            // here, after the binary has crossed plugin → relay → Bun.
+            data: Buffer.from(result.imageBytes).toString("base64"),
             mimeType: result.mimeType || "image/png"
           }
         ]
@@ -2577,23 +2615,38 @@ function connectToFigma(port = 3055) {
     logger.info("Already connected to Figma");
     return;
   }
-  const wsUrl = serverUrl === "localhost" ? `${WS_URL}:${port}` : WS_URL;
+  const wsUrl = serverUrl === "localhost" ? `ws://localhost:${port}` : RELAY_WS_URL;
   logger.info(`Connecting to Figma socket server at ${wsUrl}...`);
   ws = new import_ws.default(wsUrl);
   ws.on("open", () => {
     logger.info("Connected to Figma socket server");
     currentChannel = null;
     fatalProtocolError = null;
-    ws?.send(JSON.stringify({ type: "hello", role: "controller", requesterId, protocolVersion: PROTOCOL_VERSION }));
+    ws?.send(JSON.stringify({
+      type: "hello",
+      role: "controller",
+      requesterId,
+      protocolVersion: PROTOCOL_VERSION,
+      deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os.hostname(),
+      platform: `${os.platform()} ${os.arch()}`
+    }));
     if (desiredChannel) {
       joinChannel(desiredChannel).catch(
         (error) => logger.warn(`Could not resume project connection: ${error instanceof Error ? error.message : String(error)}`)
       );
     }
   });
-  ws.on("message", (data) => {
+  ws.on("message", (data, isBinary) => {
     try {
-      const json = JSON.parse(data);
+      let binaryPayload;
+      let json;
+      if (isBinary) {
+        const decoded = decodeBinaryFrame(data);
+        json = decoded.envelope;
+        binaryPayload = decoded.payload;
+      } else {
+        json = JSON.parse(rawDataToBuffer(data).toString("utf8"));
+      }
       if (json.type === "system" && json.event === "protocol_mismatch") {
         fatalProtocolError = String(json.message || `Protocol mismatch. MCP=${PROTOCOL_VERSION}`);
         currentChannel = null;
@@ -2654,6 +2707,9 @@ function connectToFigma(port = 3055) {
           request.reject(new Error(myResponse.error));
         } else {
           let result = myResponse.result;
+          if (binaryPayload) {
+            result = { ...result, imageBytes: binaryPayload, byteLength: binaryPayload.byteLength };
+          }
           if (myResponse.timing && result && typeof result === "object") {
             result = { ...result, _timing: myResponse.timing };
           }
@@ -2701,7 +2757,7 @@ async function joinChannel(channelName) {
   }
 }
 async function relayProjects() {
-  const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/projects" : `https://${serverUrl}/projects`;
+  const httpUrl = relayHttpUrl("projects");
   const response = await fetch(httpUrl);
   if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
   return (await response.json()).projects || [];
@@ -3062,7 +3118,7 @@ server.tool(
   {},
   async () => {
     try {
-      const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/channels" : `https://${serverUrl}/channels`;
+      const httpUrl = relayHttpUrl("channels");
       const res = await fetch(httpUrl);
       if (!res.ok) throw new Error(`relay returned HTTP ${res.status}`);
       const data = await res.json();
@@ -3071,6 +3127,18 @@ server.tool(
         active: !c.empty,
         hasFigma: (c.clients || []).some((cl) => cl.role === "figma"),
         clientRoles: (c.clients || []).map((cl) => cl.role),
+        busy: c.busy,
+        runningRequests: c.runningRequests || 0,
+        pendingRequests: c.pendingRequests || 0,
+        clients: (c.clients || []).map((cl) => ({
+          id: cl.id,
+          role: cl.role,
+          deviceName: cl.deviceName,
+          connectionScope: cl.connectionScope,
+          address: cl.address,
+          runningRequests: cl.runningRequests || 0,
+          pendingRequests: cl.pendingRequests || 0
+        })),
         document: c.document ? {
           name: c.document.documentName,
           page: c.document.page,

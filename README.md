@@ -3,8 +3,8 @@
 A Model Context Protocol (MCP) integration between an AI agent (Claude Code, Cursor)
 and Figma — it lets the agent read designs and modify them programmatically.
 
-This fork is run **entirely locally** (no published package, no deployment). The
-sections below are the first-run guide for a fresh machine.
+The default setup runs locally, but the relay, MCP server, and Figma plugin are
+independent processes and may run on different machines.
 
 ## Architecture
 
@@ -66,7 +66,10 @@ Control it any time with `./scripts/relayctl.sh <cmd>`:
 1. Figma → **Plugins → Development → Import plugin from manifest…**
 2. Select `src/cursor_mcp_plugin/manifest.json`.
 3. Run it: **Plugins → Development → Talk To Figma MCP Plugin**.
-4. In the plugin window click **Connect** (port 3055). The relay groups the
+4. In the plugin window click **Connect**. It defaults to
+   `ws://localhost:3055`; enter a reachable `ws://` LAN address or a `wss://`
+   remote address when the relay runs on another computer. Give the plugin a
+   recognizable device name. The relay groups the
    connection by Figma file/project automatically; random channel ids are now
    internal compatibility details.
 
@@ -74,6 +77,17 @@ The plugin header shows a **build badge**: `build <hash> · loaded HH:MM:SS`. Th
 hash is a content hash of the on-disk plugin files (fetched from the relay), and
 `loaded` is the time it last started — so you can always confirm Figma reloaded
 the latest code after an edit.
+
+For a remote relay, expose port 3055 through a firewall/VPN or TLS reverse
+proxy, then pass the same endpoint to the MCP server, for example
+`--server=wss://relay.example.com/talk-to-figma/`. The web console identifies
+connections by device name, local/LAN/external scope, and address. Browsers do
+not expose the operating-system hostname, so the plugin device name is an
+editable value; the MCP server uses its host name automatically.
+
+The relay itself does not authenticate clients. Do not expose it directly to
+the public internet; put it behind an authenticated `wss://` reverse proxy or a
+private VPN/network.
 
 ### 4. Point your AI client at the local MCP server
 
@@ -118,7 +132,7 @@ In the AI client:
 
 | What | Where |
 |---|---|
-| **Web console** (channels, documents, live request explorer) | http://localhost:3055/console (or `/`) |
+| **Web console** (channels, device/address identity, running and pending work) | http://localhost:3055/console (or `/`) |
 | Channels + documents as JSON | http://localhost:3055/channels |
 | Project connections and recommended targets | http://localhost:3055/projects |
 | Workload, in-flight requests, and bulk jobs | http://localhost:3055/status |
@@ -130,10 +144,15 @@ In the AI client:
 ## Protocol compatibility
 
 The relay, MCP server, Figma plugin, and dashboard send protocol version
-`2.0.0` during their WebSocket handshake. Versions with the same major number
+`3.0.0` during their WebSocket handshake. Versions with the same major number
 are compatible. A missing or different major version is rejected before join
 or command routing with an actionable `protocol_mismatch` message; rebuild or
 reconnect the MCP server and re-run the Figma development plugin to update it.
+
+Protocol v3 transports raster/PDF exports as binary WebSocket frames. The
+Figma plugin sends `Uint8Array` bytes, the relay records only transfer metadata,
+and the Bun MCP server either writes those bytes directly to `outputPath` or
+converts them to base64 only for a final inline MCP image response.
 
 ## Editing — what makes a change take effect
 

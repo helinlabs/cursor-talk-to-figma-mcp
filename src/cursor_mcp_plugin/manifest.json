@@ -10,11 +10,8 @@
   ],
   "permissions": [],
   "networkAccess": {
-    "allowedDomains": [
-      "ws://localhost:3055",
-      "https://www.google-analytics.com"
-    ],
-    "reasoning": "Connects to a local Cursor MCP relay; sends anonymous usage events to Google Analytics.",
+    "allowedDomains": ["*"],
+    "reasoning": "Users may connect the plugin to a self-hosted Talk-to-Figma relay on a local network or a user-configured remote domain; the plugin also sends anonymous usage events to Google Analytics.",
     "devAllowedDomains": [
       "http://localhost:3055",
       "ws://localhost:3055",
