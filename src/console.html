@@ -219,7 +219,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.4.0";
+      const PROTOCOL_VERSION = "2.5.0";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -840,6 +840,22 @@
                   <div className="member"><code>now: {status.currentStep.pageName} · avg {status.avgPageMs ? (status.avgPageMs / 1000).toFixed(1) : "?"}s/page · ETA {status.etaMs ? Math.round(status.etaMs / 1000) + "s" : "?"}</code></div>
                 )}
                 {status.lastError && <div className="member"><code>⚠ {status.lastError}</code></div>}
+                {status.dirty && (status.dirty.pendingPages > 0 || status.dirty.lastRunAt) && (
+                  <div className="member">
+                    <code>
+                      dirty: {status.dirty.pendingPages} page(s) queued
+                      {status.dirty.running ? " · refreshing…" : ""}
+                      {status.dirty.lastRunAt ? ` · last incremental ${fmtAge(status.dirty.lastRunAt)} (${status.dirty.lastUpdatedPages} page(s))` : ""}
+                    </code>
+                  </div>
+                )}
+                {status.dirty && status.dirty.projects && status.dirty.projects.map((dp) => (
+                  <div className="member" key={dp.projectKey} style={{ display: "block" }}>
+                    {dp.pages.map((pg) => (
+                      <div key={pg.pageId}><code>◔ {pg.pageName || pg.pageId} · dirty {fmtAge(pg.markedAt)}</code></div>
+                    ))}
+                  </div>
+                ))}
                 <div className="member">
                   <button className="ghost" disabled={busy || running} onClick={() => rebuild()} style={{ padding: "2px 8px", fontSize: 11 }}>
                     Reindex all now
@@ -857,7 +873,7 @@
                     <span className="doc-name">{info.name || "(untitled)"}</span>
                     <span className="badge">{d ? `${d.pageCount} pages · ${d.nodeCount} nodes` : "no index"}</span>
                   </div>
-                  <div className="member"><code>built {fmtAge(d && d.builtAt)}{j && running ? ` · scanning ${j.scannedPages}/${j.totalPages}` : ""}{j && j.failures && j.failures.length ? ` · ${j.failures.length} failed pages` : ""}</code></div>
+                  <div className="member"><code>built {fmtAge(d && d.builtAt)}{j && running ? ` · scanning ${j.scannedPages}/${j.totalPages}` : ""}{j && j.failures && j.failures.length ? ` · ${j.failures.length} failed pages` : ""}{j && j.partial && j.partial.length ? ` · ${j.partial.length} partial pages` : ""}</code></div>
                   <div className="member" style={{ gap: 6 }}>
                     <button className="ghost" disabled={busy || running || !info.live} onClick={() => rebuild(projectKey)} style={{ padding: "2px 8px", fontSize: 11 }}>Reindex</button>
                     <button className="ghost" disabled={!info.live} onClick={() => fetchCache(projectKey)} style={{ padding: "2px 8px", fontSize: 11 }}>Plugin cache</button>
@@ -1068,6 +1084,75 @@
               <button className="ghost" style={{ padding: "2px 8px", fontSize: 11 }} disabled={!form.keyword.trim() || !form.nodeId.trim()} onClick={add}>Add annotation</button>
               {error && <div className="member"><code>⚠ {error}</code></div>}
             </div>
+          </div>
+        );
+      }
+
+      // ----- Error ledger panel ---------------------------------------------
+      // Persistent record of pipeline errors (indexer / command / script /
+      // relay) from the relay's shared disk ledger. Recurring entries are
+      // improvement candidates.
+      function ErrorsPanel() {
+        const [items, setItems] = useState(null);
+        const [source, setSource] = useState("");
+        const [error, setError] = useState(null);
+        const [busy, setBusy] = useState(false);
+
+        const refresh = useCallback(async () => {
+          try {
+            const qs = source ? `?source=${encodeURIComponent(source)}&limit=50` : "?limit=50";
+            const r = await fetch(relayApiUrl("errors") + qs);
+            const data = await r.json();
+            setItems(data.errors || []);
+            setError(null);
+          } catch (e) { setError(String(e)); }
+        }, [source]);
+
+        useEffect(() => {
+          refresh();
+          const t = setInterval(refresh, 10000);
+          return () => clearInterval(t);
+        }, [refresh]);
+
+        const clearAll = async () => {
+          if (!window.confirm("Clear the entire relay error ledger?")) return;
+          setBusy(true);
+          try {
+            await fetch(relayApiUrl("errors"), { method: "DELETE" });
+            await refresh();
+          } finally { setBusy(false); }
+        };
+
+        const selStyle = { background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 4, padding: "2px 6px", fontSize: 11 };
+        return (
+          <div className="section">
+            <h2>Errors</h2>
+            <div className="row" style={{ marginBottom: 6, gap: 6 }}>
+              <select style={selStyle} value={source} onChange={(e) => setSource(e.target.value)}>
+                <option value="">all sources</option>
+                <option value="indexer">indexer</option>
+                <option value="command">command</option>
+                <option value="script">script</option>
+                <option value="relay">relay</option>
+              </select>
+              <button className="ghost" style={{ padding: "2px 8px", fontSize: 11 }} disabled={busy || !items || !items.length} onClick={clearAll}>Clear</button>
+            </div>
+            {error && <div className="member"><code>⚠ {error}</code></div>}
+            {items === null && !error && <div className="muted">Loading…</div>}
+            {items && !items.length && <div className="muted">No recorded errors.</div>}
+            {items && items.slice(0, 50).map((e, i) => (
+              <div className="chan-card" key={i}>
+                <div className="chan-head">
+                  <span className="badge">{e.source}{e.count && e.count > 1 ? ` ×${e.count}` : ""}</span>
+                  <span className="muted" style={{ fontSize: 11 }}>{fmtAge(Date.parse(e.lastTs || e.ts))}</span>
+                </div>
+                <div className="member"><code>{e.message}</code></div>
+                {(e.project || e.pageName || e.command) && (
+                  <div className="member"><code>{[e.project, e.pageName, e.command].filter(Boolean).join(" · ")}</code></div>
+                )}
+                {e.detail && <div className="member"><code className="muted">{e.detail}</code></div>}
+              </div>
+            ))}
           </div>
         );
       }
@@ -1601,6 +1686,7 @@
                 <ProjectContextPanel projects={projects} />
                 <ScriptPanel projects={projects} />
                 <AnnotationsPanel projects={projects} />
+                <ErrorsPanel />
                 <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">

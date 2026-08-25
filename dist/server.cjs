@@ -30,9 +30,9 @@ var import_types = require("@modelcontextprotocol/sdk/types.js");
 var import_zod = require("zod");
 var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
-var fs4 = __toESM(require("fs"), 1);
-var path4 = __toESM(require("path"), 1);
-var os4 = __toESM(require("os"), 1);
+var fs5 = __toESM(require("fs"), 1);
+var path5 = __toESM(require("path"), 1);
+var os5 = __toESM(require("os"), 1);
 var import_http = require("http");
 
 // src/local-figma-capture.ts
@@ -332,8 +332,34 @@ function hasCachedProjectContext(projectKey) {
   return !!cached && cached.content.trim().length > 0;
 }
 
+// src/shared/errors-store.ts
+var fs4 = __toESM(require("fs"), 1);
+var path4 = __toESM(require("path"), 1);
+var os4 = __toESM(require("os"), 1);
+var ERRORS_FILE = path4.join(os4.homedir(), ".talk-to-figma", "errors.json");
+var MAX_ENTRIES = 500;
+var VALID_SOURCES = /* @__PURE__ */ new Set(["indexer", "command", "script", "relay"]);
+function loadRaw() {
+  try {
+    const raw = JSON.parse(fs4.readFileSync(ERRORS_FILE, "utf8"));
+    if (Array.isArray(raw?.errors)) {
+      return raw.errors.filter(
+        (e) => e && typeof e.ts === "string" && typeof e.message === "string" && VALID_SOURCES.has(e.source)
+      );
+    }
+  } catch {
+  }
+  return [];
+}
+function loadRelayErrors(opts) {
+  let errors = loadRaw().slice().reverse();
+  if (opts?.source) errors = errors.filter((e) => e.source === opts.source);
+  const limit = Math.max(1, Math.min(Number(opts?.limit) || 100, MAX_ENTRIES));
+  return errors.slice(0, limit);
+}
+
 // src/shared/version.ts
-var PROTOCOL_VERSION = "2.4.0";
+var PROTOCOL_VERSION = "2.5.0";
 function protocolMajor(version) {
   if (typeof version !== "string") return null;
   const major = Number(version.split(".")[0]);
@@ -373,11 +399,11 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
-var STATE_DIR = path4.join(os4.homedir(), ".talk-to-figma");
-var STATE_FILE = path4.join(STATE_DIR, "state.json");
+var STATE_DIR = path5.join(os5.homedir(), ".talk-to-figma");
+var STATE_FILE = path5.join(STATE_DIR, "state.json");
 function loadPersistedSelectedProject() {
   try {
-    const raw = JSON.parse(fs4.readFileSync(STATE_FILE, "utf8"));
+    const raw = JSON.parse(fs5.readFileSync(STATE_FILE, "utf8"));
     const project = raw?.selectedProject;
     if (project && typeof project === "object" && typeof project.name === "string") {
       return {
@@ -392,8 +418,8 @@ function loadPersistedSelectedProject() {
 }
 function persistSelectedProject(project) {
   try {
-    fs4.mkdirSync(STATE_DIR, { recursive: true });
-    fs4.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+    fs5.mkdirSync(STATE_DIR, { recursive: true });
+    fs5.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
   } catch (error) {
     logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1399,15 +1425,15 @@ Failed: ${JSON.stringify(failures)}` : "")
         if (!outputPath && options.remoteExportBase) {
           const extension = fmt.toLowerCase();
           const name = `${(0, import_uuid.v4)()}.${extension}`;
-          const resolved = path4.join(exportDirectory, name);
-          fs4.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+          const resolved = path5.join(exportDirectory, name);
+          fs5.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs4.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
+            fs5.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
           } else {
             if (!result.imageBytes) throw new Error("Figma export returned no image bytes");
-            fs4.writeFileSync(resolved, Buffer.from(result.imageBytes), { mode: 384 });
+            fs5.writeFileSync(resolved, Buffer.from(result.imageBytes), { mode: 384 });
           }
-          const stat = fs4.statSync(resolved);
+          const stat = fs5.statSync(resolved);
           const summary = {
             saved: true,
             url: `${options.remoteExportBase}/files/${name}`,
@@ -1430,15 +1456,15 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, nodeName: result.nodeName, format: fmt }) }] };
         }
         if (outputPath) {
-          const resolved = path4.resolve(outputPath);
-          fs4.mkdirSync(path4.dirname(resolved), { recursive: true });
+          const resolved = path5.resolve(outputPath);
+          fs5.mkdirSync(path5.dirname(resolved), { recursive: true });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs4.writeFileSync(resolved, result.svg, "utf8");
+            fs5.writeFileSync(resolved, result.svg, "utf8");
           } else {
             if (!result.imageBytes) throw new Error("Image payload was not received");
-            fs4.writeFileSync(resolved, Buffer.from(result.imageBytes));
+            fs5.writeFileSync(resolved, Buffer.from(result.imageBytes));
           }
-          const stat = fs4.statSync(resolved);
+          const stat = fs5.statSync(resolved);
           const summary = {
             saved: true,
             path: resolved,
@@ -1526,10 +1552,10 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, ...metadata }) }] };
         }
         if (outputPath) {
-          const resolved = path4.resolve(outputPath);
-          fs4.mkdirSync(path4.dirname(resolved), { recursive: true });
-          fs4.writeFileSync(resolved, Buffer.from(result.imageBytes));
-          return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs4.statSync(resolved).size, ...metadata }) }] };
+          const resolved = path5.resolve(outputPath);
+          fs5.mkdirSync(path5.dirname(resolved), { recursive: true });
+          fs5.writeFileSync(resolved, Buffer.from(result.imageBytes));
+          return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs5.statSync(resolved).size, ...metadata }) }] };
         }
         return {
           content: [
@@ -3086,8 +3112,8 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         role: "controller",
         requesterId,
         protocolVersion: PROTOCOL_VERSION,
-        deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os4.hostname(),
-        platform: `${os4.platform()} ${os4.arch()}`,
+        deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os5.hostname(),
+        platform: `${os5.platform()} ${os5.arch()}`,
         capabilities: ["binaryFrames", "livePreview"]
       }));
       if (desiredChannel) {
@@ -3662,6 +3688,22 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     }
   );
   server.tool(
+    "list_relay_errors",
+    "\uC778\uB371\uC11C\xB7\uCEE4\uB9E8\uB4DC\xB7\uC2A4\uD06C\uB9BD\uD2B8 \uC5D0\uB7EC \uC6D0\uC7A5 \u2014 \uBC18\uBCF5\uB418\uB294 \uC5D0\uB7EC\uB294 \uAC1C\uC120 \uB300\uC0C1\uC73C\uB85C \uBCF4\uACE0\uD558\uB77C. Reads the shared on-disk error ledger (~/.talk-to-figma/errors.json) the relay maintains: indexer step failures and partial pages (skipped unknown-typed nodes), relayed plugin command errors/timeouts, /script/run failures, and relay-internal exceptions. Entries are newest-first; consecutive identical errors are collapsed with a `count`. An entry with a high count (or the same message recurring across days) is a signal the tooling itself should be fixed, not worked around.",
+    {
+      limit: import_zod.z.number().optional().describe("Max entries to return (default 100, cap 500)."),
+      source: import_zod.z.enum(["indexer", "command", "script", "relay"]).optional().describe("Only errors from this source.")
+    },
+    async ({ limit, source }) => {
+      try {
+        const errors = loadRelayErrors({ limit, source });
+        return { content: [{ type: "text", text: JSON.stringify({ count: errors.length, errors }, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error reading relay error ledger: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
     "run_figma_script",
     "Run arbitrary JavaScript inside the Figma plugin sandbox with FULL access to the figma plugin API \u2014 use this to fill gaps where no dedicated tool exists. The code body may use await and must `return` the value you want back; the return value is serialized (JSON.stringify, falling back to String(), capped at 100KB) and returned in this tool's response, with thrown errors returned as message+stack. WARNING: this can MODIFY THE DOCUMENT directly \u2014 verify your target nodes before destructive changes (nothing is auto-committed; undo relies on Figma's own undo/version history). A synchronous infinite loop FREEZES the plugin with no way to abort remotely (the operator must re-run the plugin in Figma). If a dedicated tool already does the job, use the dedicated tool instead. Timeout 120s.",
     {
@@ -4179,19 +4221,19 @@ var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
 var httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 var httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
-var exportDirectory = process.env.FIGMA_EXPORT_DIR || path4.join(os4.homedir(), ".macfleet", "figma-exports");
+var exportDirectory = process.env.FIGMA_EXPORT_DIR || path5.join(os5.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
 var exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0 ? configuredExportTTLHours : 24;
 var exportTTL = exportTTLHours * 60 * 60 * 1e3;
 var exportNamePattern = /^[0-9a-f-]{36}\.(png|jpg|svg|pdf)$/;
 function cleanupExports() {
-  if (!fs4.existsSync(exportDirectory)) return;
+  if (!fs5.existsSync(exportDirectory)) return;
   const cutoff = Date.now() - exportTTL;
-  for (const name of fs4.readdirSync(exportDirectory)) {
+  for (const name of fs5.readdirSync(exportDirectory)) {
     if (!exportNamePattern.test(name)) continue;
-    const file = path4.join(exportDirectory, name);
+    const file = path5.join(exportDirectory, name);
     try {
-      if (fs4.statSync(file).mtimeMs < cutoff) fs4.unlinkSync(file);
+      if (fs5.statSync(file).mtimeMs < cutoff) fs5.unlinkSync(file);
     } catch (error) {
       logger.warn(`Could not clean export ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -4210,11 +4252,11 @@ function serveExport(req, res, pathname) {
     res.writeHead(404).end("not found");
     return true;
   }
-  const file = path4.join(exportDirectory, name);
+  const file = path5.join(exportDirectory, name);
   try {
-    const stat = fs4.statSync(file);
+    const stat = fs5.statSync(file);
     if (!stat.isFile() || Date.now() - stat.mtimeMs > exportTTL) {
-      if (stat.isFile()) fs4.unlinkSync(file);
+      if (stat.isFile()) fs5.unlinkSync(file);
       res.writeHead(404).end("not found");
       return true;
     }
@@ -4224,7 +4266,7 @@ function serveExport(req, res, pathname) {
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff"
     });
-    fs4.createReadStream(file).pipe(res);
+    fs5.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
   }
@@ -4245,7 +4287,7 @@ async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
   }
-  fs4.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+  fs5.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
   cleanupExports();
   const cleanupTimer = setInterval(cleanupExports, Math.min(exportTTL, 60 * 60 * 1e3));
   cleanupTimer.unref();

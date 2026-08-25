@@ -515,7 +515,7 @@
       // the relay's hello/join handshake rejects a MAJOR mismatch with a
       // protocol_mismatch message, and the header badge below shows both
       // versions with a warning. Bump this together with src/shared/version.ts.
-      const PROTOCOL_VERSION = "2.4.0";
+      const PROTOCOL_VERSION = "2.5.0";
       const BINARY_MAGIC = [0x54, 0x54, 0x46, 0x42]; // "TTFB"
 
       function encodeBinaryFrame(envelope, payload) {
@@ -1484,6 +1484,18 @@
           case "doc-meta":
             state.docMeta = message.meta;
             announceDocMeta();
+            break;
+          case "page-dirty":
+            // Forward the dirty-page notification to the relay so its
+            // incremental indexer can refresh just this page's index slice.
+            if (state.connected && state.socket && state.channel) {
+              state.socket.send(JSON.stringify({
+                type: "page_dirty",
+                channel: state.channel,
+                pageId: message.pageId,
+                pageName: message.pageName || "",
+              }));
+            }
             break;
           case "preview-frame":
             sendPreviewFrame(message.result);

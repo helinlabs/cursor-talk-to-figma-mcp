@@ -30,6 +30,7 @@ import {
   clearCachedProjectContext,
   hasCachedProjectContext,
 } from "../shared/project-context";
+import { loadRelayErrors } from "../shared/errors-store";
 
 import { PROTOCOL_VERSION, protocolMajor } from "../shared/version";
 const BINARY_MAGIC = Buffer.from([0x54, 0x54, 0x46, 0x42]); // "TTFB"
@@ -4224,6 +4225,23 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify({ removed, nodes: nodeResults }) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "list_relay_errors",
+  "인덱서·커맨드·스크립트 에러 원장 — 반복되는 에러는 개선 대상으로 보고하라. Reads the shared on-disk error ledger (~/.talk-to-figma/errors.json) the relay maintains: indexer step failures and partial pages (skipped unknown-typed nodes), relayed plugin command errors/timeouts, /script/run failures, and relay-internal exceptions. Entries are newest-first; consecutive identical errors are collapsed with a `count`. An entry with a high count (or the same message recurring across days) is a signal the tooling itself should be fixed, not worked around.",
+  {
+    limit: z.number().optional().describe("Max entries to return (default 100, cap 500)."),
+    source: z.enum(["indexer", "command", "script", "relay"]).optional().describe("Only errors from this source."),
+  },
+  async ({ limit, source }: any) => {
+    try {
+      const errors = loadRelayErrors({ limit, source });
+      return { content: [{ type: "text", text: JSON.stringify({ count: errors.length, errors }, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error reading relay error ledger: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );

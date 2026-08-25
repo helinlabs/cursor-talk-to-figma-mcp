@@ -904,12 +904,35 @@ function textMatchSnippet(characters, range) {
 const pageSearchIndexCache = new Map(); // pageId -> { entries: [...] }
 const pageSearchIndexWatched = new Set(); // pageIds with an active nodechange handler
 
+// Dirty-page notifications: whenever a watched (i.e. previously indexed) page
+// changes, tell the relay so its incremental reindexer can refresh just that
+// page's disk-index slice instead of waiting for the next full rebuild.
+// Throttled to one notification per page per 30s (nodechange fires per edit).
+// Delivery: postMessage to ui.html, which forwards {type:"page_dirty"} over
+// the EXISTING relay WebSocket (the plugin main thread has no socket).
+const PAGE_DIRTY_THROTTLE_MS = 30_000;
+const pageDirtyLastSentAt = new Map(); // pageId -> epoch ms
+function notifyPageDirty(page, pageId) {
+  const now = Date.now();
+  const last = pageDirtyLastSentAt.get(pageId) || 0;
+  if (now - last < PAGE_DIRTY_THROTTLE_MS) return;
+  pageDirtyLastSentAt.set(pageId, now);
+  let pageName = "";
+  try {
+    pageName = page.name || "";
+  } catch (e) {}
+  try {
+    figma.ui.postMessage({ type: "page-dirty", pageId: pageId, pageName: pageName });
+  } catch (e) {}
+}
+
 function watchPageForIndexInvalidation(page) {
   if (pageSearchIndexWatched.has(page.id)) return true;
   try {
     const pageId = page.id;
     page.on("nodechange", () => {
       pageSearchIndexCache.delete(pageId);
+      notifyPageDirty(page, pageId);
     });
     pageSearchIndexWatched.add(pageId);
     return true;
@@ -918,25 +941,124 @@ function watchPageForIndexInvalidation(page) {
   }
 }
 
+// Every scene node type the public plugin API knows about. Used by the
+// criteria-fallback enumeration below: findAllWithCriteria with an explicit
+// type list SKIPS nodes of unknown (new/beta) types instead of throwing.
+const KNOWN_SCENE_NODE_TYPES = [
+  "FRAME", "SECTION", "GROUP", "COMPONENT", "COMPONENT_SET", "INSTANCE",
+  "TEXT", "RECTANGLE", "ELLIPSE", "LINE", "VECTOR", "STAR", "POLYGON",
+  "BOOLEAN_OPERATION", "SLICE", "WIDGET", "STICKY", "CONNECTOR",
+  "SHAPE_WITH_TEXT", "TABLE", "EMBED", "LINK_UNFURL", "MEDIA",
+  "CODE_BLOCK", "STAMP", "HIGHLIGHT", "WASHI_TAPE",
+];
+
 // Walk every node of a (loaded) page once and record what search needs.
-// Can throw on pages containing a node type this plugin API can't classify
-// (see diagnose_pages) — the caller lets that propagate.
+//
+// Fast path: findAll (native, honors skipInvisibleInstanceChildren). On pages
+// containing a node type the public plugin API can't classify (new/beta
+// feature nodes → "Unknown node type … in getPublicNodeType", see
+// diagnose_pages) findAll throws and would lose the ENTIRE page. Measured on
+// such a page, `children` access throws too (even at the page level, when the
+// unknown node is a direct child), so a per-node recursive walk cannot even
+// start — but findAllWithCriteria with an explicit list of KNOWN types works
+// and simply skips the unknown nodes. So the fallback is a FLAT enumeration
+// via findAllWithCriteria(KNOWN_SCENE_NODE_TYPES), with each node's path
+// rebuilt from its parent chain (every access guarded). The tens of
+// thousands of healthy nodes on such a page still get indexed; only the
+// unknown-typed nodes (and property reads that fail) are skipped.
 function buildPageSearchIndex(page) {
+  try {
+    const entries = [];
+    page.findAll((n) => {
+      entries.push({
+        id: n.id,
+        name: n.name,
+        type: n.type,
+        characters:
+          n.type === "TEXT" && typeof n.characters === "string"
+            ? n.characters
+            : null,
+        path: nodePathString(n, page),
+      });
+      return false; // collect nothing; we only use the traversal
+    });
+    return { entries: entries, builtAt: Date.now(), skippedNodes: 0, firstError: null };
+  } catch (findAllError) {
+    return collectPageEntriesViaCriteria(page, findAllError);
+  }
+}
+
+// Criteria-based fallback enumeration for pages where findAll / children
+// access throws (see buildPageSearchIndex). Returns the same index shape plus
+// enumeration/skippedUnknown markers so callers can flag the page as partial.
+// If findAllWithCriteria itself throws, the error propagates — the page then
+// counts as a real failure, not a partial.
+function collectPageEntriesViaCriteria(page, causeError) {
   const entries = [];
-  page.findAll((n) => {
+  let skippedNodes = 0;
+  let firstError = causeError
+    ? (causeError.message ? String(causeError.message) : String(causeError))
+    : null;
+  const noteError = (e) => {
+    if (!firstError) firstError = e && e.message ? String(e.message) : String(e);
+  };
+  const nodes = page.findAllWithCriteria({ types: KNOWN_SCENE_NODE_TYPES });
+  // Rebuild each node's ancestor path from its parent chain. Memoized per
+  // container id; every property access is guarded (a parent may itself be
+  // an unknown-typed node whose reads throw).
+  const pathMemo = new Map(); // container id -> "PageName > … > containerName"
+  pathMemo.set(page.id, page.name);
+  const containerPath = (container) => {
+    let id = null;
+    try { id = container.id; } catch (e) { noteError(e); return page.name; }
+    const hit = pathMemo.get(id);
+    if (hit !== undefined) return hit;
+    let name = "";
+    try { name = typeof container.name === "string" ? container.name : ""; } catch (e) { noteError(e); }
+    let parent = null;
+    try { parent = container.parent; } catch (e) { noteError(e); }
+    const base = parent ? containerPath(parent) : page.name;
+    const full = base + " > " + name;
+    pathMemo.set(id, full);
+    return full;
+  };
+  for (const n of nodes) {
+    let type = null;
+    try {
+      type = n.type;
+    } catch (e) {
+      skippedNodes++;
+      noteError(e);
+      continue;
+    }
+    let name = "";
+    try { name = typeof n.name === "string" ? n.name : ""; } catch (e) { noteError(e); }
+    let characters = null;
+    if (type === "TEXT") {
+      try {
+        if (typeof n.characters === "string") characters = n.characters;
+      } catch (e) { noteError(e); }
+    }
+    let parent = null;
+    try { parent = n.parent; } catch (e) { noteError(e); }
     entries.push({
       id: n.id,
-      name: n.name,
-      type: n.type,
-      characters:
-        n.type === "TEXT" && typeof n.characters === "string"
-          ? n.characters
-          : null,
-      path: nodePathString(n, page),
+      name: name,
+      type: type,
+      characters: characters,
+      path: parent ? containerPath(parent) : page.name,
     });
-    return false; // collect nothing; we only use the traversal
-  });
-  return { entries: entries, builtAt: Date.now() };
+  }
+  return {
+    entries: entries,
+    builtAt: Date.now(),
+    skippedNodes: skippedNodes,
+    firstError: firstError,
+    enumeration: "criteria-fallback",
+    // Unknown-typed nodes are silently absent from findAllWithCriteria — we
+    // cannot count them, only flag that they exist on this page.
+    skippedUnknown: true,
+  };
 }
 
 // Return the page's search index, building (load + walk) it on a cache miss.
@@ -1077,7 +1199,7 @@ async function searchNodes(params) {
     }
   }
 
-  return {
+  const result = {
     pageId: page.id,
     pageName: page.name,
     totalMatches: nameFound.length + textFound.length,
@@ -1085,6 +1207,14 @@ async function searchNodes(params) {
     fromCache: fromCache,
     matches: matches,
   };
+  if (index.skippedNodes || index.skippedUnknown) {
+    // Partial index: unknown-typed / unreadable nodes were skipped in the walk.
+    result.skippedNodes = index.skippedNodes || 0;
+    result.skippedError = index.firstError;
+    if (index.enumeration) result.enumeration = index.enumeration;
+    if (index.skippedUnknown) result.skippedUnknown = true;
+  }
+  return result;
 }
 
 // Dump ONE page's full search index ({id,name,type,characters,path} per node)
@@ -1104,6 +1234,12 @@ async function dumpPageIndex(params) {
     nodeCount: built.index.entries.length,
     builtAt: built.index.builtAt,
     fromCache: built.fromCache,
+    // PARTIAL page dump markers: unknown-typed / unreadable nodes were
+    // skipped (public-API-unknown node types) but everything else is included.
+    skippedNodes: built.index.skippedNodes || 0,
+    skippedError: built.index.firstError || null,
+    enumeration: built.index.enumeration || "findAll",
+    skippedUnknown: !!built.index.skippedUnknown,
     entries: built.index.entries,
   };
 }
@@ -1142,17 +1278,49 @@ async function getFileOutline() {
           entry.childCount > MAX_CHILDREN_PER_PAGE
             ? p.children.slice(0, MAX_CHILDREN_PER_PAGE)
             : p.children;
-        entry.children = slice.map((c) => ({
-          id: c.id,
-          name: c.name,
-          type: c.type,
-        }));
+        // Per-child guards: one unclassifiable child (public-API-unknown node
+        // type, see diagnose_pages) must not hide the rest of the page.
+        entry.children = [];
+        let skipped = 0;
+        for (const c of slice) {
+          try {
+            entry.children.push({ id: c.id, name: c.name, type: c.type });
+          } catch (e) {
+            skipped++;
+            if (!entry.skippedError) entry.skippedError = e && e.message ? String(e.message) : String(e);
+          }
+        }
+        if (skipped > 0) entry.skippedChildren = skipped;
         if (entry.childCount > MAX_CHILDREN_PER_PAGE) entry.truncated = true;
       } catch (e) {
-        // Page with a node type this plugin API can't classify (see diagnose_pages).
-        entry.childCount = null;
-        entry.children = [];
-        entry.childrenReadable = false;
+        // children access throws when an unknown-typed node is a DIRECT child
+        // of the page (measured; "Unknown node type … in get_children").
+        // Criteria fallback: enumerate known-typed descendants and keep only
+        // the page's direct children — unknown-typed children are absent.
+        try {
+          const all = p.findAllWithCriteria({ types: KNOWN_SCENE_NODE_TYPES });
+          const top = [];
+          for (const c of all) {
+            let parent = null;
+            try { parent = c.parent; } catch (e2) { continue; }
+            if (parent !== p) continue;
+            try {
+              top.push({ id: c.id, name: c.name, type: c.type });
+            } catch (e2) {
+              entry.skippedChildren = (entry.skippedChildren || 0) + 1;
+            }
+          }
+          entry.childCount = top.length; // known-typed children only
+          entry.children = top.slice(0, MAX_CHILDREN_PER_PAGE);
+          if (top.length > MAX_CHILDREN_PER_PAGE) entry.truncated = true;
+          entry.enumeration = "criteria-fallback";
+          entry.skippedUnknown = true;
+          entry.skippedError = e && e.message ? String(e.message) : String(e);
+        } catch (e2) {
+          entry.childCount = null;
+          entry.children = [];
+          entry.childrenReadable = false;
+        }
       }
       return entry;
     }),
@@ -6151,22 +6319,56 @@ async function setNodeKeywords(params) {
 async function harvestKeywordAnnotations() {
   await figma.loadAllPagesAsync();
   let nodes;
+  let skippedNodes = 0;
+  let skippedError = null;
   try {
     nodes = figma.root.findAllWithCriteria({
       sharedPluginData: { namespace: PROJECT_CONTEXT_NAMESPACE, keys: [SEARCH_KEYWORDS_KEY] },
     });
   } catch (e) {
-    nodes = figma.root.findAll(
-      (n) => !!n.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY)
-    );
+    // Criteria unsupported OR the walk hit a public-API-unknown node type
+    // ("Unknown node type … in getPublicNodeType"). A findAll (or manual
+    // children-recursion) fallback would die on the same node — children
+    // access throws too when the unknown node is a direct child (measured).
+    // Fall back to enumerating all KNOWN-typed nodes and checking each one's
+    // sharedPluginData, guarded per node.
+    if (!skippedError) skippedError = e && e.message ? String(e.message) : String(e);
+    const all = figma.root.findAllWithCriteria({ types: KNOWN_SCENE_NODE_TYPES });
+    nodes = [];
+    for (const node of all) {
+      try {
+        if (node.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY)) {
+          nodes.push(node);
+        }
+      } catch (err) {
+        skippedNodes++;
+        if (!skippedError) skippedError = err && err.message ? String(err.message) : String(err);
+      }
+    }
   }
   const annotated = [];
   for (const node of nodes) {
-    const keywords = parseNodeKeywords(node.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY));
+    let keywords;
+    try {
+      keywords = parseNodeKeywords(node.getSharedPluginData(PROJECT_CONTEXT_NAMESPACE, SEARCH_KEYWORDS_KEY));
+    } catch (e) {
+      skippedNodes++;
+      if (!skippedError) skippedError = e && e.message ? String(e.message) : String(e);
+      continue;
+    }
     if (!keywords.length) continue;
-    annotated.push({ nodeId: node.id, nodeName: node.name || "", keywords });
+    let nodeName = "";
+    try {
+      nodeName = node.name || "";
+    } catch (e) {}
+    annotated.push({ nodeId: node.id, nodeName: nodeName, keywords });
   }
-  return { fileName: figma.root.name, nodeCount: annotated.length, nodes: annotated };
+  const result = { fileName: figma.root.name, nodeCount: annotated.length, nodes: annotated };
+  if (skippedNodes) {
+    result.skippedNodes = skippedNodes;
+    result.skippedError = skippedError;
+  }
+  return result;
 }
 
 // ── 임의 스크립트 실행 (플러그인 미지원 기능 메꾸기) ──

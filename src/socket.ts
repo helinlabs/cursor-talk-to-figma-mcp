@@ -25,6 +25,12 @@ import {
   listProjectIndexSummaries,
   type ProjectIndex,
 } from "./shared/search-index";
+import {
+  recordRelayError,
+  loadRelayErrors,
+  clearRelayErrors,
+  summarizeRelayErrors,
+} from "./shared/errors-store";
 
 import { PROTOCOL_VERSION } from "./shared/version";
 const BINARY_MAGIC = new Uint8Array([0x54, 0x54, 0x46, 0x42]); // "TTFB"
@@ -514,6 +520,16 @@ function sendInternalCommand(
   });
 }
 
+// Project identity for a channel (matches snapshotProjects' grouping key so
+// it lines up with resolveProjectChannel and the disk index file names).
+function channelProjectInfo(channelName: string): { key: string; name: string } {
+  const doc = channelDocs.get(channelName);
+  return {
+    key: doc?.fileKey || doc?.documentName || channelName,
+    name: doc?.documentName || channelName,
+  };
+}
+
 // Total in-flight requests on a channel's Figma plugin(s), i.e. real user
 // traffic the indexer must yield to.
 function channelQueueDepth(channelName: string): number {
@@ -551,7 +567,11 @@ interface IndexProjectProgress {
   name: string;
   pages: Array<{ id: string; name: string }>;
   nextIndex: number;
+  // Page could not be dumped at all (load/command failure) — it is NOT in the index.
   failures: Array<{ pageId: string; pageName: string; error: string }>;
+  // Page was indexed, but some unreadable node subtrees were skipped
+  // (public-API-unknown node types) — it IS in the index, minus those nodes.
+  partial: Array<{ pageId: string; pageName: string; skippedNodes: number; error: string | null }>;
 }
 
 const indexer = {
@@ -595,6 +615,7 @@ function saveIndexProgress(): void {
         pages: p.pages,
         nextIndex: p.nextIndex,
         failures: p.failures,
+        partial: p.partial,
       })),
     }, null, 2));
     renameSync(tmp, PROGRESS_FILE);
@@ -637,9 +658,12 @@ function indexStatus(): any {
       totalPages: p.pages.length,
       scannedPages: p.nextIndex,
       failures: p.failures,
+      partial: p.partial,
     })),
     // What is on disk (survives restarts), independent of the current job.
     diskIndexes: listProjectIndexSummaries(),
+    // Dirty-page incremental reindexer (5-minute cycle; see below).
+    dirty: dirtyStatus(),
   };
 }
 
@@ -676,7 +700,7 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
       for (const project of scope) {
         const saved = resumable.find((p) => p.projectKey === project.projectKey);
         if (saved) {
-          indexer.projects.push({ ...saved, name: project.name || saved.name, failures: saved.failures ?? [] });
+          indexer.projects.push({ ...saved, name: project.name || saved.name, failures: saved.failures ?? [], partial: (saved as any).partial ?? [] });
           continue;
         }
         try {
@@ -687,15 +711,19 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
             pages: (listing?.pages || []).map((p: any) => ({ id: p.id, name: p.name })),
             nextIndex: 0,
             failures: [],
+            partial: [],
           });
         } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
           indexer.projects.push({
             projectKey: project.projectKey,
             name: project.name || project.projectKey,
             pages: [],
             nextIndex: 0,
-            failures: [{ pageId: "-", pageName: "(list_pages)", error: err instanceof Error ? err.message : String(err) }],
+            failures: [{ pageId: "-", pageName: "(list_pages)", error: message }],
+            partial: [],
           });
+          recordRelayError({ source: "indexer", project: project.name || project.projectKey, command: "list_pages", message });
         }
       }
       indexer.totalPages = indexer.projects.reduce((sum, p) => sum + p.pages.length, 0);
@@ -762,8 +790,30 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
           if (existing !== -1) idx.pages[existing] = pageIndex;
           else idx.pages.push(pageIndex);
           saveProjectIndex(idx); // checkpoint: partial index survives restarts
+          if (dump.skippedNodes > 0 || dump.skippedUnknown) {
+            // PARTIAL page: it IS in the index, minus unknown-typed/unreadable
+            // nodes — not a failure (the old whole-page-failure path is now
+            // reserved for pages whose load/dump itself failed).
+            pick.p.partial.push({
+              pageId: page.id,
+              pageName: page.name,
+              skippedNodes: dump.skippedNodes || 0,
+              error: dump.skippedError ?? null,
+            });
+            recordRelayError({
+              source: "indexer",
+              project: pick.p.name,
+              pageId: page.id,
+              pageName: page.name,
+              command: "dump_page_index",
+              message: `partial page index (${dump.enumeration || "findAll"}): ${dump.skippedError || "unknown-typed nodes skipped"}`,
+              detail: "미지 노드 타입: Figma 데스크톱 앱 업데이트로 해소될 수 있음",
+            });
+          }
         } catch (err) {
-          pick.p.failures.push({ pageId: page.id, pageName: page.name, error: err instanceof Error ? err.message : String(err) });
+          const message = err instanceof Error ? err.message : String(err);
+          pick.p.failures.push({ pageId: page.id, pageName: page.name, error: message });
+          recordRelayError({ source: "indexer", project: pick.p.name, pageId: page.id, pageName: page.name, command: "dump_page_index", message });
         }
         indexer.durations.push(Date.now() - t0);
         pick.p.nextIndex++;
@@ -775,7 +825,9 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
           idx.pages = idx.pages.filter((pg) => liveIds.has(pg.pageId));
           idx.builtAt = Date.now();
           saveProjectIndex(idx);
-          pushEvent({ kind: "index_project_done", projectKey: pick.p.projectKey, name: pick.p.name, pages: idx.pages.length, nodes: idx.nodeCount, failures: pick.p.failures.length });
+          pushEvent({ kind: "index_project_done", projectKey: pick.p.projectKey, name: pick.p.name, pages: idx.pages.length, nodes: idx.nodeCount, failures: pick.p.failures.length, partial: pick.p.partial.length });
+          // A completed full build supersedes dirty marks made before it began.
+          clearDirtyPages(pick.p.projectKey, indexer.startedAt);
           // Re-harvest keyword annotations from the document (the SoR: node
           // sharedPluginData) and rebuild this project's cache slice — entries
           // that exist only in the cache but not on any node are dropped. All
@@ -784,10 +836,21 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
             const harvest = await sendInternalCommand(pick.channel, "harvest_keyword_annotations", {}, INDEX_STEP_TIMEOUT_MS);
             const { total } = replaceProjectAnnotations(pick.p.projectKey, harvest?.nodes || []);
             pushEvent({ kind: "annotations_harvest", projectKey: pick.p.projectKey, nodes: harvest?.nodeCount ?? 0, keywords: total });
+            if (harvest?.skippedNodes > 0 || harvest?.skippedError) {
+              recordRelayError({
+                source: "indexer",
+                project: pick.p.name,
+                command: "harvest_keyword_annotations",
+                message: `partial harvest: ${harvest.skippedError || `${harvest.skippedNodes} node(s) skipped`}`,
+                detail: "미지 노드 타입: Figma 데스크톱 앱 업데이트로 해소될 수 있음",
+              });
+            }
           } catch (err) {
             // Harvest failure must not fail the index job; the cache keeps its
             // previous slice until the next successful harvest.
-            pushEvent({ kind: "annotations_harvest_failed", projectKey: pick.p.projectKey, error: err instanceof Error ? err.message : String(err) });
+            const message = err instanceof Error ? err.message : String(err);
+            pushEvent({ kind: "annotations_harvest_failed", projectKey: pick.p.projectKey, error: message });
+            recordRelayError({ source: "indexer", project: pick.p.name, command: "harvest_keyword_annotations", message });
           }
         }
         saveIndexProgress(); // checkpoint the cursor after EVERY step
@@ -837,6 +900,131 @@ function scheduleDailyIndex(): void {
   }, delay);
 }
 scheduleDailyIndex();
+
+// ---------------------------------------------------------------------------
+// Dirty-page incremental reindexer.
+//
+// The plugin notifies the relay ({type:"page_dirty"}) whenever a previously
+// indexed page changes (nodechange, throttled to 30s per page on the plugin
+// side). Dirty pages are collected here and every 5 minutes — skipped while a
+// full rebuild is running — only those pages are re-dumped and merged into
+// the project's disk index, shrinking the staleness window between full
+// rebuilds. Marks survive only in memory (worst case after a relay restart:
+// the page stays stale until the next full rebuild, as before).
+// ---------------------------------------------------------------------------
+
+const INCREMENTAL_INTERVAL_MS = 5 * 60_000;
+
+interface DirtyPageMark { pageId: string; pageName: string; markedAt: number }
+// projectKey -> pageId -> mark
+const dirtyPages = new Map<string, Map<string, DirtyPageMark>>();
+const incremental = {
+  running: false,
+  lastRunAt: null as number | null,
+  lastUpdatedPages: 0,
+};
+
+function markPageDirty(projectKey: string, pageId: string, pageName: string): void {
+  let pages = dirtyPages.get(projectKey);
+  if (!pages) {
+    pages = new Map();
+    dirtyPages.set(projectKey, pages);
+  }
+  pages.set(pageId, { pageId, pageName, markedAt: Date.now() });
+}
+
+// Drop dirty marks made BEFORE the given timestamp (a completed full build
+// already re-scanned those pages); newer marks are kept.
+function clearDirtyPages(projectKey: string, olderThan: number): void {
+  const pages = dirtyPages.get(projectKey);
+  if (!pages) return;
+  for (const [pageId, mark] of pages) {
+    if (mark.markedAt < olderThan) pages.delete(pageId);
+  }
+  if (!pages.size) dirtyPages.delete(projectKey);
+}
+
+function dirtyStatus(): any {
+  return {
+    pendingPages: [...dirtyPages.values()].reduce((sum, pages) => sum + pages.size, 0),
+    projects: [...dirtyPages.entries()].map(([projectKey, pages]) => ({
+      projectKey,
+      pages: [...pages.values()],
+    })),
+    lastRunAt: incremental.lastRunAt,
+    lastUpdatedPages: incremental.lastUpdatedPages,
+    running: incremental.running,
+  };
+}
+
+async function runIncrementalReindex(): Promise<void> {
+  if (incremental.running || indexer.state === "running") return;
+  if (!dirtyPages.size) return;
+  incremental.running = true;
+  let updated = 0;
+  try {
+    for (const [projectKey, pages] of [...dirtyPages.entries()]) {
+      const channel = resolveProjectChannel(projectKey);
+      if (!channel) continue; // plugin offline — keep marks for the next cycle
+      const idx = loadProjectIndex(projectKey);
+      if (!idx) {
+        // Nothing on disk to refresh; the next full build covers these pages.
+        dirtyPages.delete(projectKey);
+        continue;
+      }
+      for (const [pageId, mark] of [...pages.entries()]) {
+        // Re-read state each step: a full rebuild may start while we await.
+        if ((indexer.state as "idle" | "running") === "running") return; // full rebuild took over
+        if (channelQueueDepth(channel) > 0) break; // real traffic first; retry next cycle
+        try {
+          const dump = await sendInternalCommand(channel, "dump_page_index", { pageId }, INDEX_STEP_TIMEOUT_MS);
+          const pageIndex = {
+            pageId: dump.pageId,
+            pageName: dump.pageName,
+            builtAt: dump.builtAt ?? Date.now(),
+            nodeCount: dump.nodeCount ?? (dump.entries?.length || 0),
+            entries: dump.entries || [],
+          };
+          const existing = idx.pages.findIndex((pg) => pg.pageId === pageIndex.pageId);
+          if (existing !== -1) idx.pages[existing] = pageIndex;
+          else idx.pages.push(pageIndex);
+          saveProjectIndex(idx); // bumps updatedAt
+          updated++;
+          pages.delete(pageId);
+          pushEvent({ kind: "index_incremental", projectKey, pageId, pageName: pageIndex.pageName, nodes: pageIndex.nodeCount });
+          if (dump.skippedNodes > 0 || dump.skippedUnknown) {
+            recordRelayError({
+              source: "indexer",
+              project: idx.projectName || projectKey,
+              pageId,
+              pageName: pageIndex.pageName,
+              command: "dump_page_index",
+              message: `partial page index (${dump.enumeration || "findAll"}): ${dump.skippedError || "unknown-typed nodes skipped"}`,
+              detail: "미지 노드 타입: Figma 데스크톱 앱 업데이트로 해소될 수 있음",
+            });
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          pages.delete(pageId); // no endless retry loop; the next dirty mark or full build retries
+          recordRelayError({ source: "indexer", project: idx.projectName || projectKey, pageId, pageName: mark.pageName, command: "dump_page_index", message });
+          if (/page not found/i.test(message)) {
+            // Deleted page: drop its stale slice from the disk index too.
+            idx.pages = idx.pages.filter((pg) => pg.pageId !== pageId);
+            saveProjectIndex(idx);
+          }
+        }
+        await sleep(INDEX_STEP_IDLE_MS);
+      }
+      if (!pages.size) dirtyPages.delete(projectKey);
+    }
+  } finally {
+    incremental.running = false;
+    incremental.lastRunAt = Date.now();
+    incremental.lastUpdatedPages = updated;
+  }
+}
+
+setInterval(() => void runIncrementalReindex(), INCREMENTAL_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
 
@@ -948,7 +1136,20 @@ const server = Bun.serve({
         ok: true,
         protocolVersion: PROTOCOL_VERSION,
         index: { lastBuiltAt: indexer.lastCompletedAt, running: indexer.state === "running" },
+        errors: summarizeRelayErrors(),
       }), { headers: JSON_HEADERS });
+    }
+
+    // --- Error ledger: recurring errors are improvement candidates ----------
+    if (url.pathname === "/errors" && req.method === "GET") {
+      const limit = Number(url.searchParams.get("limit")) || undefined;
+      const source = url.searchParams.get("source") || undefined;
+      return new Response(JSON.stringify({ errors: loadRelayErrors({ limit, source }) }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    if (url.pathname === "/errors" && req.method === "DELETE") {
+      const cleared = clearRelayErrors();
+      return new Response(JSON.stringify({ cleared }), { headers: JSON_HEADERS });
     }
 
     // --- Background index: status / rebuild ---------------------------------
@@ -1055,9 +1256,20 @@ const server = Bun.serve({
           return new Response(JSON.stringify({ error: "code is required" }), { status: 400, headers: JSON_HEADERS });
         }
         const result = await sendInternalCommand(channel, "run_script", { code, params: body?.params }, 120_000);
+        if (result && result.ok === false) {
+          recordRelayError({
+            source: "script",
+            project: channelProjectInfo(channel).name,
+            command: "run_script",
+            message: result.error?.message ? String(result.error.message) : "script failed",
+            detail: result.error?.stack ? String(result.error.stack) : undefined,
+          });
+        }
         return new Response(JSON.stringify(result, null, 2), { headers: JSON_HEADERS });
       } catch (err) {
-        return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
+        const message = err instanceof Error ? err.message : String(err);
+        recordRelayError({ source: "script", project: channelProjectInfo(channel).name, command: "run_script", message });
+        return new Response(JSON.stringify({ error: message }), { status: 502, headers: JSON_HEADERS });
       }
     }
 
@@ -1338,6 +1550,12 @@ const server = Bun.serve({
             recordFigmaOutcome(request.figma, true);
             requests.delete(data.id);
             pushEvent({ kind: "timeout", requesterId: request.requesterId, clientId: figmaMeta?.id, channel: request.channel, commandId: request.id, command: request.command });
+            recordRelayError({
+              source: "command",
+              project: channelProjectInfo(request.channel).name,
+              command: request.command,
+              message: "command timed out (controller-reported request_timeout)",
+            });
             pushChannels();
           }
           return;
@@ -1390,6 +1608,20 @@ const server = Bun.serve({
           pushEvent({ kind: "document", clientId: meta?.id, channel: channelName, document: data.document });
           pushChannels();
           armAutoIndex(); // (re)arm the settle timer for the auto index build
+          return;
+        }
+
+        // --- Dirty-page notification from the Figma plugin -------------------
+        // A previously indexed page changed; queue it for the incremental
+        // reindexer (5-minute cycle). Plugin-side throttled to 30s per page.
+        if (data.type === "page_dirty") {
+          const channelName = data.channel;
+          const channelClients = channels.get(channelName);
+          if (!channelName || !channelClients || !channelClients.has(ws)) return;
+          if (typeof data.pageId !== "string" || !data.pageId) return;
+          const project = channelProjectInfo(channelName);
+          markPageDirty(project.key, data.pageId, typeof data.pageName === "string" ? data.pageName : "");
+          pushEvent({ kind: "page_dirty", clientId: meta?.id, channel: channelName, projectKey: project.key, pageId: data.pageId, pageName: data.pageName });
           return;
         }
 
@@ -1577,6 +1809,17 @@ const server = Bun.serve({
             };
             if (meta) meta.activeRequests = Math.max(0, meta.activeRequests - 1);
             recordFigmaOutcome(ws, false);
+            // Ledger: errors on relayed plugin commands. Relay-internal
+            // requests (indexer) are excluded — their callers record with
+            // richer context (page, project) themselves.
+            if (isError && request.requesterId !== "relay-internal") {
+              recordRelayError({
+                source: "command",
+                project: channelProjectInfo(channelName).name,
+                command: request.command,
+                message: typeof data.message.error === "string" ? data.message.error : JSON.stringify(data.message.error),
+              });
+            }
             pushEvent({
               kind: "result",
               clientId: meta?.id,
@@ -1648,6 +1891,10 @@ const server = Bun.serve({
         }
       } catch (err) {
         console.error("Error handling message:", err);
+        recordRelayError({
+          source: "relay",
+          message: `websocket message handling failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
       }
     },
     close(ws: ServerWebSocket<any>) {
@@ -1663,6 +1910,12 @@ const server = Bun.serve({
           if (figmaMeta) figmaMeta.activeRequests = Math.max(0, figmaMeta.activeRequests - 1);
           requests.delete(id);
         } else if (request.figma === ws) {
+          recordRelayError({
+            source: "command",
+            project: channelProjectInfo(request.channel).name,
+            command: request.command,
+            message: "Figma plugin disconnected while executing the request",
+          });
           if (request.onInternalResult) {
             request.onInternalResult({ id, error: "Figma plugin disconnected while executing the request" });
           } else if (request.requester && request.requester.readyState === WebSocket.OPEN) {
