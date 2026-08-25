@@ -4,6 +4,19 @@ import { Server, ServerWebSocket } from "bun";
 import { readFileSync } from "fs";
 import { createHash } from "crypto";
 
+const PROTOCOL_VERSION = "2.0.0";
+
+function isProtocolCompatible(version: unknown): boolean {
+  if (typeof version !== "string") return false;
+  const expectedMajor = Number(PROTOCOL_VERSION.split(".")[0]);
+  const receivedMajor = Number(version.split(".")[0]);
+  return Number.isInteger(receivedMajor) && receivedMajor === expectedMajor;
+}
+
+function protocolMismatchMessage(received: unknown): string {
+  return `Talk-to-Figma protocol mismatch: relay=${PROTOCOL_VERSION}, client=${received || "missing"}. Update/rebuild the MCP server and re-run the Figma development plugin, then reconnect.`;
+}
+
 // Build id served to the plugin UI (GET /plugin-version): a content hash of the
 // on-disk plugin files. Lets the plugin show which code is loaded WITHOUT
 // baking a version into the source (nothing committed per build). Computed per
@@ -32,8 +45,29 @@ interface ClientMeta {
   role: "unknown" | "controller" | "figma" | "monitor";
   channel: string | null;
   connectedAt: number;
+  lastSeenAt: number;
   isMonitor: boolean;
   lastCommand?: string;
+  requesterId?: string;
+  activeRequests: number;
+  recentTimeouts: boolean[];
+  unstable: boolean;
+  applicationHeartbeat: boolean;
+  protocolVersion?: string;
+  protocolVerified: boolean;
+}
+
+interface RequestMeta {
+  id: string;
+  channel: string;
+  command: string;
+  requester: ServerWebSocket<any>;
+  requesterId: string;
+  figma?: ServerWebSocket<any>;
+  queuedAt: number;
+  dispatchedAt?: number;
+  startedAt?: number;
+  batchId?: string;
 }
 
 // Per-socket metadata (id, inferred role, current channel, …)
@@ -41,6 +75,8 @@ const clientMeta = new Map<ServerWebSocket<any>, ClientMeta>();
 
 // Sockets that opened the web console and want the live event stream
 const monitors = new Set<ServerWebSocket<any>>();
+const requests = new Map<string, RequestMeta>();
+const bulkJobs = new Map<string, any>();
 
 // Ring buffer of recent events so a freshly-opened console sees history.
 // The browser console keeps a much larger buffer; this is just the backlog
@@ -58,6 +94,54 @@ const MAX_EMPTY = 50;
 
 // name -> document identity announced by the Figma plugin on that channel
 const channelDocs = new Map<string, any>();
+const channelAnnouncedAt = new Map<string, number>();
+
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_TIMEOUT_MS = 45_000;
+const UNSTABLE_WINDOW = 10;
+const UNSTABLE_TIMEOUT_RATE = 0.5;
+
+function touch(ws: ServerWebSocket<any>): void {
+  const meta = clientMeta.get(ws);
+  if (meta) meta.lastSeenAt = Date.now();
+}
+
+function recordFigmaOutcome(ws: ServerWebSocket<any> | undefined, timedOut: boolean): void {
+  if (!ws) return;
+  const meta = clientMeta.get(ws);
+  if (!meta) return;
+  meta.recentTimeouts.push(timedOut);
+  if (meta.recentTimeouts.length > UNSTABLE_WINDOW) meta.recentTimeouts.shift();
+  const rate = meta.recentTimeouts.filter(Boolean).length / meta.recentTimeouts.length;
+  meta.unstable = meta.recentTimeouts.length >= UNSTABLE_WINDOW && rate >= UNSTABLE_TIMEOUT_RATE;
+  if (meta.unstable) {
+    pushEvent({ kind: "unstable", clientId: meta.id, channel: meta.channel, timeoutRate: rate });
+    ws.close(4002, "Figma connection classified as unstable");
+  }
+}
+
+function leaveChannel(ws: ServerWebSocket<any>, channelName: string): void {
+  const clients = channels.get(channelName);
+  if (!clients) return;
+  clients.delete(ws);
+  if (clients.size === 0) {
+    emptyChannels.set(channelName, Date.now());
+    pruneEmptyChannels();
+  }
+}
+
+function chooseFigma(channelName: string): ServerWebSocket<any> | undefined {
+  return [...(channels.get(channelName) ?? [])]
+    .filter((client) => {
+      const meta = clientMeta.get(client);
+      return client.readyState === WebSocket.OPEN && meta?.role === "figma" && !meta.unstable;
+    })
+    .sort((a, b) => {
+      const am = clientMeta.get(a)!;
+      const bm = clientMeta.get(b)!;
+      return am.activeRequests - bm.activeRequests || bm.connectedAt - am.connectedAt;
+    })[0];
+}
 
 function pruneEmptyChannels(): void {
   if (emptyChannels.size <= MAX_EMPTY) return;
@@ -108,7 +192,16 @@ function snapshotChannels(): any[] {
     const members: any[] = [];
     clients.forEach((c) => {
       const m = clientMeta.get(c);
-      if (m) members.push({ id: m.id, role: m.role, connectedAt: m.connectedAt });
+      if (m) members.push({
+        id: m.id,
+        role: m.role,
+        connectedAt: m.connectedAt,
+        lastSeenAt: m.lastSeenAt,
+        requesterId: m.requesterId ?? null,
+        activeRequests: m.activeRequests,
+        unstable: m.unstable,
+        protocolVersion: m.protocolVersion ?? null,
+      });
     });
     out.push({
       channel: name,
@@ -117,13 +210,55 @@ function snapshotChannels(): any[] {
       empty: members.length === 0,
       emptiedAt: emptyChannels.get(name) ?? null,
       document: channelDocs.get(name) ?? null,
+      announcedAt: channelAnnouncedAt.get(name) ?? null,
+      queueDepth: members.reduce((sum, member) => sum + (member.activeRequests || 0), 0),
     });
   });
   return out;
 }
 
+function snapshotProjects(): any[] {
+  const groups = new Map<string, any[]>();
+  for (const channel of snapshotChannels()) {
+    if (!channel.document) continue;
+    const key = channel.document.fileKey || channel.document.documentName || channel.channel;
+    const list = groups.get(key) ?? [];
+    list.push(channel);
+    groups.set(key, list);
+  }
+  return [...groups.entries()].map(([projectKey, connections]) => {
+    const live = connections.filter((connection) =>
+      connection.clients.some((client: any) => client.role === "figma" && !client.unstable)
+    );
+    const newest = [...live].sort((a, b) => (b.announcedAt || 0) - (a.announcedAt || 0))[0] ?? null;
+    const leastLoaded = [...live].sort((a, b) => {
+      const ac = a.clients.filter((client: any) => client.role === "controller").length;
+      const bc = b.clients.filter((client: any) => client.role === "controller").length;
+      return ac - bc || a.queueDepth - b.queueDepth || (b.announcedAt || 0) - (a.announcedAt || 0);
+    })[0] ?? null;
+    const document = (newest || connections[0]).document;
+    return {
+      projectKey,
+      name: document.documentName,
+      fileKey: document.fileKey ?? null,
+      connectionCount: live.length,
+      totalConnectionCount: connections.length,
+      representativeChannel: newest?.channel ?? null,
+      recommendedChannel: leastLoaded?.channel ?? null,
+      busy: live.reduce((sum, connection) => sum + connection.queueDepth, 0),
+      connections,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function pushChannels(): void {
-  const data = JSON.stringify({ kind: "channels", channels: snapshotChannels() });
+  const data = JSON.stringify({
+    kind: "channels",
+    protocolVersion: PROTOCOL_VERSION,
+    channels: snapshotChannels(),
+    projects: snapshotProjects(),
+    bulkJobs: [...bulkJobs.values()],
+  });
   monitors.forEach((m) => {
     if (m.readyState === WebSocket.OPEN) m.send(data);
   });
@@ -137,7 +272,13 @@ function handleConnection(ws: ServerWebSocket<any>) {
     role: "unknown",
     channel: null,
     connectedAt: Date.now(),
+    lastSeenAt: Date.now(),
     isMonitor: false,
+    activeRequests: 0,
+    recentTimeouts: [],
+    unstable: false,
+    applicationHeartbeat: false,
+    protocolVerified: false,
   };
   clientMeta.set(ws, meta);
 
@@ -194,7 +335,30 @@ const server = Bun.serve({
 
     // JSON list of channels + their document identity (for controllers/tools)
     if (url.pathname === "/channels") {
-      return new Response(JSON.stringify({ channels: snapshotChannels() }, null, 2), {
+      return new Response(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, channels: snapshotChannels(), projects: snapshotProjects() }, null, 2), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    if (url.pathname === "/projects") {
+      return new Response(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, projects: snapshotProjects() }, null, 2), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    if (url.pathname === "/status") {
+      return new Response(JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        projects: snapshotProjects(),
+        requestsInFlight: requests.size,
+        bulkJobs: [...bulkJobs.values()],
+      }, null, 2), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
@@ -204,7 +368,7 @@ const server = Bun.serve({
 
     // Build id of the on-disk plugin files (for the plugin UI's version badge).
     if (url.pathname === "/plugin-version") {
-      return new Response(JSON.stringify({ build: pluginVersion() }), {
+      return new Response(JSON.stringify({ build: pluginVersion(), protocolVersion: PROTOCOL_VERSION }), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
@@ -221,10 +385,89 @@ const server = Bun.serve({
   },
   websocket: {
     open: handleConnection,
+    pong(ws: ServerWebSocket<any>) {
+      // For Figma, require the application-level heartbeat from the plugin UI.
+      // A protocol pong can still arrive while a backgrounded UI is frozen.
+      if (!clientMeta.get(ws)?.applicationHeartbeat) touch(ws);
+    },
     message(ws: ServerWebSocket<any>, message: string | Buffer) {
       try {
         const data = JSON.parse(message as string);
         const meta = clientMeta.get(ws);
+        touch(ws);
+
+        if (data.type === "heartbeat") {
+          if (meta) {
+            if (data.requesterId) meta.requesterId = String(data.requesterId);
+            if (data.role === "figma") meta.applicationHeartbeat = true;
+          }
+          ws.send(JSON.stringify({ type: "heartbeat_ack", ts: Date.now() }));
+          return;
+        }
+
+        if (data.type === "hello") {
+          if (meta) {
+            meta.requesterId = data.requesterId ? String(data.requesterId) : meta.requesterId;
+            if (data.role === "controller" || data.role === "figma") meta.role = data.role;
+            if (data.role === "figma") meta.applicationHeartbeat = true;
+            meta.protocolVersion = typeof data.protocolVersion === "string" ? data.protocolVersion : undefined;
+            meta.protocolVerified = isProtocolCompatible(data.protocolVersion);
+            if (!meta.protocolVerified) {
+              const message = protocolMismatchMessage(data.protocolVersion);
+              ws.send(JSON.stringify({
+                type: "system",
+                event: "protocol_mismatch",
+                message,
+                expectedProtocolVersion: PROTOCOL_VERSION,
+                receivedProtocolVersion: data.protocolVersion ?? null,
+              }));
+              pushEvent({ kind: "protocol_mismatch", clientId: meta.id, requesterId: meta.requesterId, receivedProtocolVersion: data.protocolVersion ?? null, expectedProtocolVersion: PROTOCOL_VERSION });
+              ws.close(4003, "Protocol version mismatch");
+              return;
+            }
+          }
+          pushChannels();
+          return;
+        }
+
+        if (data.type === "bulk_status") {
+          const job = { ...data.job, requesterId: meta?.requesterId ?? meta?.id, updatedAt: Date.now() };
+          if (job.id) bulkJobs.set(job.id, job);
+          pushEvent({ kind: "bulk", ...job });
+          pushChannels();
+          return;
+        }
+
+        if (data.type === "execution_started") {
+          const request = requests.get(data.id);
+          if (request && request.figma === ws) {
+            request.startedAt = Date.now();
+            pushEvent({
+              kind: "started",
+              clientId: meta?.id,
+              requesterId: request.requesterId,
+              channel: request.channel,
+              commandId: request.id,
+              command: request.command,
+              waitMs: request.startedAt - request.queuedAt,
+              batchId: request.batchId,
+            });
+          }
+          return;
+        }
+
+        if (data.type === "request_timeout") {
+          const request = requests.get(data.id);
+          if (request && request.requester === ws) {
+            const figmaMeta = request.figma ? clientMeta.get(request.figma) : undefined;
+            if (figmaMeta) figmaMeta.activeRequests = Math.max(0, figmaMeta.activeRequests - 1);
+            recordFigmaOutcome(request.figma, true);
+            requests.delete(data.id);
+            pushEvent({ kind: "timeout", requesterId: request.requesterId, clientId: figmaMeta?.id, channel: request.channel, commandId: request.id, command: request.command });
+            pushChannels();
+          }
+          return;
+        }
 
         // --- Monitoring console registration ---------------------------------
         if (data.type === "monitor") {
@@ -235,7 +478,10 @@ const server = Bun.serve({
           monitors.add(ws);
           ws.send(JSON.stringify({
             kind: "snapshot",
+            protocolVersion: PROTOCOL_VERSION,
             channels: snapshotChannels(),
+            projects: snapshotProjects(),
+            bulkJobs: [...bulkJobs.values()],
             log: eventLog,
           }));
           console.log(`\n👁  Monitor connected (${meta?.id})`);
@@ -264,6 +510,7 @@ const server = Bun.serve({
           const channelClients = channels.get(channelName);
           if (!channelName || !channelClients || !channelClients.has(ws)) return;
           channelDocs.set(channelName, data.document);
+          channelAnnouncedAt.set(channelName, Date.now());
           if (meta) meta.role = "figma"; // only the plugin announces a document
           console.log(`\n📄 Channel "${channelName}" → document:`, JSON.stringify(data.document));
           pushEvent({ kind: "document", clientId: meta?.id, channel: channelName, document: data.document });
@@ -281,6 +528,18 @@ const server = Bun.serve({
         console.log(`Full message:`, JSON.stringify(data, null, 2));
 
         if (data.type === "join") {
+          if (!meta?.protocolVerified) {
+            const message = protocolMismatchMessage(meta?.protocolVersion);
+            ws.send(JSON.stringify({
+              type: "system",
+              event: "protocol_mismatch",
+              message,
+              expectedProtocolVersion: PROTOCOL_VERSION,
+              receivedProtocolVersion: meta?.protocolVersion ?? null,
+            }));
+            ws.close(4003, "Protocol version mismatch");
+            return;
+          }
           const channelName = data.channel;
           if (!channelName || typeof channelName !== "string") {
             ws.send(JSON.stringify({
@@ -289,6 +548,8 @@ const server = Bun.serve({
             }));
             return;
           }
+
+          if (meta?.channel && meta.channel !== channelName) leaveChannel(ws, meta.channel);
 
           // Create channel if it doesn't exist
           if (!channels.has(channelName)) {
@@ -301,6 +562,7 @@ const server = Bun.serve({
           emptyChannels.delete(channelName); // active again
           if (meta) {
             meta.channel = channelName;
+            meta.requesterId = data.requesterId || data.message?.params?.requesterId || meta.requesterId;
             // Infer role from the join message shape so it's known immediately
             // (before any command/response traffic):
             //   - MCP server / console tester join with message.command === "join"
@@ -369,60 +631,98 @@ const server = Bun.serve({
             return;
           }
 
-          // Log command / response traffic for the monitoring console and
-          // infer the sender's role from the message shape.
           if (data.message?.command) {
             if (meta) {
               meta.role = "controller";
               meta.lastCommand = data.message.command;
             }
+            const requestId = data.message.id || data.id;
+            const figma = chooseFigma(channelName);
+            if (!figma) {
+              ws.send(JSON.stringify({
+                type: "broadcast",
+                channel: channelName,
+                message: { id: requestId, error: "No healthy Figma plugin is available for this project", result: {} },
+              }));
+              return;
+            }
+            const figmaMeta = clientMeta.get(figma)!;
+            const queuedAt = Date.now();
+            const request: RequestMeta = {
+              id: requestId,
+              channel: channelName,
+              command: data.message.command,
+              requester: ws,
+              requesterId: meta?.requesterId ?? meta?.id ?? "unknown",
+              figma,
+              queuedAt,
+              dispatchedAt: queuedAt,
+              batchId: data.message.params?.batchId,
+            };
+            requests.set(requestId, request);
+            figmaMeta.activeRequests++;
             pushEvent({
               kind: "command",
               clientId: meta?.id,
+              requesterId: request.requesterId,
+              figmaClientId: figmaMeta.id,
               channel: channelName,
-              commandId: data.message.id,
+              commandId: requestId,
               command: data.message.command,
               params: truncate(data.message.params),
+              batchId: request.batchId,
+              queueDepth: figmaMeta.activeRequests,
             });
+            figma.send(JSON.stringify({
+              type: "broadcast",
+              message: data.message,
+              sender: request.requesterId,
+              channel: channelName,
+            }));
+            pushChannels();
+            return;
           } else if (
             data.message?.result !== undefined ||
             data.message?.error !== undefined
           ) {
             if (meta) meta.role = "figma";
             const isError = data.message.error !== undefined && data.message.error !== null;
+            const requestId = data.message.id || data.id;
+            const request = requests.get(requestId);
+            if (!request || request.figma !== ws) return;
+            const completedAt = Date.now();
+            const startedAt = request.startedAt ?? request.dispatchedAt ?? request.queuedAt;
+            const timing = {
+              waitMs: startedAt - request.queuedAt,
+              executionMs: completedAt - startedAt,
+              totalMs: completedAt - request.queuedAt,
+            };
+            if (meta) meta.activeRequests = Math.max(0, meta.activeRequests - 1);
+            recordFigmaOutcome(ws, false);
             pushEvent({
               kind: "result",
               clientId: meta?.id,
+              requesterId: request.requesterId,
               channel: channelName,
-              commandId: data.message.id,
+              commandId: requestId,
+              command: request.command,
               ok: !isError,
               result: truncate(data.message.result),
               error: data.message.error,
+              timing,
+              batchId: request.batchId,
             });
-          }
-
-          // Broadcast to all OTHER clients in the channel (not the sender)
-          // This prevents echo and ensures proper request-response flow
-          let broadcastCount = 0;
-          channelClients.forEach((client) => {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-              broadcastCount++;
-              const broadcastMessage = {
+            if (request.requester.readyState === WebSocket.OPEN) {
+              request.requester.send(JSON.stringify({
                 type: "broadcast",
-                message: data.message,
-                sender: "peer",
-                channel: channelName
-              };
-              console.log(`\n=== Broadcasting to peer #${broadcastCount} ===`);
-              console.log(JSON.stringify(broadcastMessage, null, 2));
-              client.send(JSON.stringify(broadcastMessage));
+                message: { ...data.message, timing },
+                sender: meta?.id ?? "figma",
+                channel: channelName,
+              }));
             }
-          });
-
-          if (broadcastCount === 0) {
-            console.log(`⚠️  No other clients in channel "${channelName}" to receive message!`);
-          } else {
-            console.log(`✓ Broadcast to ${broadcastCount} peer(s) in channel "${channelName}"`);
+            requests.delete(requestId);
+            pushChannels();
+            return;
           }
         }
 
@@ -445,11 +745,10 @@ const server = Bun.serve({
             commandType: data.message?.data?.commandType,
           });
 
-          channelClients.forEach((client) => {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify(data));
-            }
-          });
+          const request = requests.get(data.id);
+          if (request && request.figma === ws && request.requester.readyState === WebSocket.OPEN) {
+            request.requester.send(JSON.stringify(data));
+          }
         }
       } catch (err) {
         console.error("Error handling message:", err);
@@ -459,6 +758,23 @@ const server = Bun.serve({
       const meta = clientMeta.get(ws);
 
       monitors.delete(ws);
+
+      for (const [id, request] of requests) {
+        if (request.requester === ws) {
+          const figmaMeta = request.figma ? clientMeta.get(request.figma) : undefined;
+          if (figmaMeta) figmaMeta.activeRequests = Math.max(0, figmaMeta.activeRequests - 1);
+          requests.delete(id);
+        } else if (request.figma === ws) {
+          if (request.requester.readyState === WebSocket.OPEN) {
+            request.requester.send(JSON.stringify({
+              type: "broadcast",
+              channel: request.channel,
+              message: { id, error: "Figma plugin disconnected while executing the request", result: {} },
+            }));
+          }
+          requests.delete(id);
+        }
+      }
 
       // Remove client from their channel(s) and notify peers
       channels.forEach((clients, channelName) => {
@@ -523,6 +839,21 @@ const server = Bun.serve({
     }
   }
 });
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [client, meta] of clientMeta) {
+    if (meta.role === "monitor") continue;
+    if (now - meta.lastSeenAt > HEARTBEAT_TIMEOUT_MS) {
+      pushEvent({ kind: "heartbeat_timeout", clientId: meta.id, requesterId: meta.requesterId, channel: meta.channel });
+      client.close(4001, "Heartbeat timeout");
+      continue;
+    }
+    try {
+      client.ping(String(now));
+    } catch {}
+  }
+}, HEARTBEAT_INTERVAL_MS);
 
 console.log(`WebSocket server running on port ${server.port}`);
 console.log(`Web console available at http://localhost:${server.port}/console`);

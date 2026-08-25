@@ -57,7 +57,7 @@ requires re-running the plugin inside Figma.
 The main server implementing the MCP protocol via `@modelcontextprotocol/sdk`. Exposes 50+ tools (create shapes, modify text, manage layouts, export images, etc.) and several AI prompts (design strategies). Communicates with Cursor over stdio and with the WebSocket relay via `ws`. Each request gets a UUID, is tracked in a `pendingRequests` Map with timeout/promise callbacks, and resolves when the plugin responds.
 
 ### WebSocket Relay (`src/socket.ts`)
-Lightweight Bun WebSocket server on port 3055 (configurable via `PORT` env). Routes messages between MCP server and Figma plugin using channel-based isolation. Clients call `join` to enter a channel; messages broadcast only within the same channel.
+Lightweight Bun WebSocket server on port 3055 (configurable via `PORT` env). Groups plugin connections by Figma file/project, selects one healthy low-load target per request, and tracks heartbeats, workload, timings, and bulk progress. Channels remain an internal compatibility layer.
 
 ### Figma Plugin (`src/cursor_mcp_plugin/`)
 Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via a dispatcher. `ui.html` is the plugin UI for WebSocket connection management. `manifest.json` declares permissions (dynamic-page access, localhost network). The plugin is **not built/bundled** — `code.js` is written directly as the runtime artifact.
@@ -105,7 +105,7 @@ Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via
 1. Run `bun setup` — installs dependencies and writes MCP config for both Cursor (`.cursor/mcp.json`) and Claude Code (`.mcp.json`)
 2. `./scripts/relayctl.sh install` — runs the relay as a launchd service (auto-start at login, auto-restart on crash). See "Running the Relay" above.
 3. In Figma: Plugins → Development → Link existing plugin → select `src/cursor_mcp_plugin/manifest.json`
-4. Run plugin in Figma, join a channel, then use tools from Cursor or Claude Code
+4. Run the plugin in Figma, then select it with `use_figma_project` from Cursor or Claude Code
 
 The MCP config written by `bun setup` uses the published package:
 

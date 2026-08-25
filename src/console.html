@@ -198,6 +198,7 @@
       import { FixedSizeList } from "react-window";
 
       const WS_URL = `ws://${location.host}`;
+      const PROTOCOL_VERSION = "2.0.0";
       const RING = 5000;          // browser-side ring buffer size
       const FLUSH_MS = 150;       // batch incoming events to avoid render storms
       const ROW_H = 26;
@@ -231,9 +232,13 @@
           case "connect": return `client ${e.clientId} connected`;
           case "disconnect": return `client ${e.clientId} left ${e.channel ? "#" + e.channel : ""}`;
           case "join": return `${e.clientId} joined #${e.channel} (${e.clientCount} in channel)`;
-          case "command": return `${e.command}  ${e.commandId ? "· " + e.commandId.slice(0, 8) : ""}`;
-          case "result": return `${e.ok ? "ok" : "ERROR: " + (e.error || "")}  ${e.commandId ? "· " + e.commandId.slice(0, 8) : ""}`;
+          case "command": return `${e.command} · ${e.requesterId || "unknown"} · queue ${e.queueDepth || 0}`;
+          case "started": return `${e.command} · waited ${e.waitMs || 0}ms · ${e.requesterId || "unknown"}`;
+          case "result": return `${e.ok ? "ok" : "ERROR: " + (e.error || "")} · wait ${e.timing?.waitMs || 0}ms · run ${e.timing?.executionMs || 0}ms · ${e.requesterId || "unknown"}`;
           case "progress": return `${e.commandType || ""} ${e.progress ?? ""}% ${e.status || ""} ${e.message || ""}`;
+          case "bulk": return `${e.id} · ${e.status} · ${e.completed || 0}/${e.total || 0} · ${e.requesterId || "unknown"}`;
+          case "timeout": return `${e.command || "request"} timed out · ${e.requesterId || "unknown"}`;
+          case "unstable": return `${e.clientId} unstable · timeout rate ${Math.round((e.timeoutRate || 0) * 100)}%`;
           case "document": return `${e.document?.documentName || "(untitled)"} · ${e.document?.page || ""}`;
           case "channel_closed": return `figma left → evicted ${e.evicted} client(s)`;
           default: return JSON.stringify(e);
@@ -574,8 +579,8 @@
             )}
             {dupFigma && (
               <div className="warn-banner">
-                ⚠ {figmaCount} Figma plugins on one channel — commands will run on
-                all of them and responses are nondeterministic. Use one document per channel.
+                {figmaCount} Figma plugins share this legacy channel. The relay routes each
+                command to the least-busy healthy plugin.
               </div>
             )}
             {c.clients.map((cl) => (
@@ -631,6 +636,48 @@
         );
       }
 
+      function Projects({ projects, bulkJobs, onPick }) {
+        return (
+          <>
+            <div className="section">
+              <h2>Figma Projects</h2>
+              {!projects.length && <div className="muted">No connected Figma projects.</div>}
+              {projects.map((project) => (
+                <div className="chan-card" key={project.projectKey} onClick={() => onPick(project.name)}>
+                  <div className="chan-head">
+                    <span className="doc-name">{project.name || "(untitled)"}</span>
+                    <span className="badge">{project.connectionCount} connected</span>
+                  </div>
+                  <div className="member">
+                    <code>busy {project.busy || 0} · recommended #{project.recommendedChannel || "—"}</code>
+                  </div>
+                  {project.connections.map((connection) => (
+                    <div className="member" key={connection.channel}>
+                      <span className="badge figma">#{connection.channel}</span>
+                      <code>{connection.queueDepth || 0} active · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+            <div className="section">
+              <h2>Bulk Operations</h2>
+              {!bulkJobs.length && <div className="muted">No bulk operations.</div>}
+              {[...bulkJobs].sort((a, b) => b.updatedAt - a.updatedAt).map((job) => (
+                <div className="chan-card" key={job.id} onClick={() => onPick(job.id)}>
+                  <div className="chan-head">
+                    <code>{job.id.slice(0, 8)}</code>
+                    <span className="badge">{job.status}</span>
+                  </div>
+                  <div className="member"><code>{job.completed || 0}/{job.total || 0} complete · {job.failed || 0} failed</code></div>
+                  <div className="member"><code>{job.requesterId || "unknown requester"}</code></div>
+                </div>
+              ))}
+            </div>
+          </>
+        );
+      }
+
       // ----- Test call panel (uses its own peer WebSocket) -------------------
       // ----- Swagger-style request explorer ---------------------------------
       function Field({ p, value, onChange }) {
@@ -678,7 +725,7 @@
         );
       }
 
-      function RequestExplorer({ channels }) {
+      function RequestExplorer({ projects }) {
         const [channel, setChannel] = useState("");
         const [command, setCommand] = useState("get_document_info");
         const [values, setValues] = useState({});
@@ -686,6 +733,7 @@
         const [result, setResult] = useState(null);
         const wsRef = useRef(null);
         const stateRef = useRef({ channel: null, joined: false, pending: new Map() });
+        const connections = useMemo(() => projects.filter((p) => p.recommendedChannel), [projects]);
 
         const spec = useMemo(() => COMMAND_CATALOG.find((c) => c.command === command), [command]);
         const grouped = useMemo(() => {
@@ -694,13 +742,12 @@
           return m;
         }, []);
 
-        // default channel = first one that has a figma client
+        // default project = first live project; relay already chose its least-loaded connection
         useEffect(() => {
-          if (!channel && channels.length) {
-            const figma = channels.find((c) => c.clients.some((cl) => cl.role === "figma"));
-            setChannel((figma || channels[0]).channel);
+          if (!channel && connections.length) {
+            setChannel(connections[0].recommendedChannel);
           }
-        }, [channels, channel]);
+        }, [connections, channel]);
 
         // reset form to defaults when the command changes
         useEffect(() => {
@@ -738,10 +785,16 @@
             st.channel = target; st.joined = false; st.pending = new Map();
             const to = setTimeout(() => reject(new Error("connect/join timeout")), 8000);
             // join as a controller (so the server labels us controller, not figma)
-            ws.onopen = () => ws.send(JSON.stringify({ type: "join", channel: target, id: genId(), message: { command: "join" } }));
+            ws.onopen = () => {
+              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: PROTOCOL_VERSION }));
+              ws.send(JSON.stringify({ type: "join", channel: target, requesterId: "dashboard", id: genId(), message: { command: "join" } }));
+            };
             ws.onerror = () => { clearTimeout(to); reject(new Error("socket error")); };
             ws.onmessage = (ev) => {
               let d; try { d = JSON.parse(ev.data); } catch { return; }
+              if (d.type === "system" && d.event === "protocol_mismatch") {
+                clearTimeout(to); reject(new Error(d.message)); return;
+              }
               if (!st.joined && d.type === "system" && d.message && d.message.result) {
                 st.joined = true; clearTimeout(to); resolve(); return;
               }
@@ -795,12 +848,12 @@
           <div className="explorer">
             <div className="exp-top">
               <div className="exp-field">
-                <label>Channel</label>
+                <label>Figma Project</label>
                 <select value={channel} onChange={(e) => setChannel(e.target.value)}>
-                  {channels.length === 0 && <option value="">(no channels)</option>}
-                  {channels.map((c) => (
-                    <option key={c.channel} value={c.channel}>
-                      #{c.channel}{c.document ? ` — ${c.document.documentName}` : ""} ({c.count})
+                  {connections.length === 0 && <option value="">(no projects)</option>}
+                  {connections.map((project) => (
+                    <option key={project.projectKey} value={project.recommendedChannel}>
+                      {project.name} ({project.connectionCount} connections · busy {project.busy || 0})
                     </option>
                   ))}
                 </select>
@@ -845,7 +898,7 @@
       }
 
       // ----- Virtualized log list -------------------------------------------
-      const KINDS = ["command", "result", "join", "connect", "disconnect", "progress", "document", "channel_closed"];
+      const KINDS = ["command", "started", "result", "bulk", "timeout", "unstable", "heartbeat_timeout", "join", "connect", "disconnect", "progress", "document", "channel_closed"];
 
       function LogPanel({ getEvents, version, filter, setFilter }) {
         const [enabled, setEnabled] = useState(() => new Set(KINDS));
@@ -864,6 +917,8 @@
             return (e.command || "").toLowerCase().includes(f)
               || (e.channel || "").toLowerCase().includes(f)
               || (e.commandId || "").toLowerCase().includes(f)
+              || (e.requesterId || "").toLowerCase().includes(f)
+              || (e.batchId || e.id || "").toLowerCase().includes(f)
               || summarize(e).toLowerCase().includes(f);
           });
         // eslint-disable-next-line
@@ -899,7 +954,7 @@
         return (
           <>
             <div className="toolbar">
-              <input type="text" placeholder="filter… (or click a channel)" value={filter} onChange={(e) => setFilter(e.target.value)} />
+              <input type="text" placeholder="filter… channel / requester / command / bulk id" value={filter} onChange={(e) => setFilter(e.target.value)} />
               {filter && <button className="ghost" style={{ padding: "4px 8px" }} onClick={() => setFilter("")}>clear</button>}
               {KINDS.map((k) => (
                 <label className="chk" key={k}>
@@ -937,6 +992,8 @@
       function App() {
         const [connected, setConnected] = useState(false);
         const [channels, setChannels] = useState([]);
+        const [projects, setProjects] = useState([]);
+        const [bulkJobs, setBulkJobs] = useState([]);
         const bufRef = useRef([]);       // ring buffer of events
         const queueRef = useRef([]);     // pending events between flushes
         const pausedRef = useRef(false);
@@ -963,11 +1020,15 @@
               let msg; try { msg = JSON.parse(ev.data); } catch { return; }
               if (msg.kind === "snapshot") {
                 setChannels(msg.channels || []);
+                setProjects(msg.projects || []);
+                setBulkJobs(msg.bulkJobs || []);
                 (msg.log || []).forEach((e) => { e._i = ++seqRef.current; });
                 bufRef.current = (msg.log || []).slice(-RING);
                 setVersion((v) => v + 1);
               } else if (msg.kind === "channels") {
                 setChannels(msg.channels || []);
+                setProjects(msg.projects || []);
+                setBulkJobs(msg.bulkJobs || []);
               } else if (msg.kind === "event") {
                 if (!pausedRef.current) queueRef.current.push(msg.event);
               }
@@ -1010,12 +1071,13 @@
             </div>
             <div className="main">
               <div className="sidebar">
+                <Projects projects={projects} bulkJobs={bulkJobs} onPick={(value) => { setFilter(value); setView("logs"); }} />
                 <Channels channels={channels} onPick={(ch) => { setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">
                 {view === "logs"
                   ? <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
-                  : <RequestExplorer channels={channels} />}
+                  : <RequestExplorer projects={projects} />}
               </div>
             </div>
           </>

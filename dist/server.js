@@ -8,6 +8,7 @@ import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
 import * as fs from "fs";
 import * as path from "path";
+var PROTOCOL_VERSION = "2.0.0";
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -23,6 +24,11 @@ var logger = {
 var ws = null;
 var pendingRequests = /* @__PURE__ */ new Map();
 var currentChannel = null;
+var desiredChannel = null;
+var selectedProject = null;
+var fatalProtocolError = null;
+var requesterId = process.env.TALK_TO_FIGMA_REQUESTER_ID || process.env.CODEX_THREAD_ID || process.env.CURSOR_SESSION_ID || `mcp-${process.pid}`;
+var bulkJobs = /* @__PURE__ */ new Map();
 var server = new McpServer({
   name: "TalkToFigmaMCP",
   version: "1.0.0"
@@ -2055,7 +2061,7 @@ This strategy enables transferring content and property overrides from a source 
 - Confirm text content and style overrides have transferred successfully
 
 ## Key Tips
-- Always join the appropriate channel first with \`join_channel()\`
+- Select the appropriate Figma file first with \`use_figma_project()\` (channel ids are internal)
 - When working with multiple targets, check the full selection with \`get_selection()\`
 - Preserve component relationships by using instance overrides rather than direct text manipulation`
           }
@@ -2555,10 +2561,29 @@ function connectToFigma(port = 3055) {
   ws.on("open", () => {
     logger.info("Connected to Figma socket server");
     currentChannel = null;
+    fatalProtocolError = null;
+    ws?.send(JSON.stringify({ type: "hello", role: "controller", requesterId, protocolVersion: PROTOCOL_VERSION }));
+    if (desiredChannel) {
+      joinChannel(desiredChannel).catch(
+        (error) => logger.warn(`Could not resume project connection: ${error instanceof Error ? error.message : String(error)}`)
+      );
+    }
   });
   ws.on("message", (data) => {
     try {
       const json = JSON.parse(data);
+      if (json.type === "system" && json.event === "protocol_mismatch") {
+        fatalProtocolError = String(json.message || `Protocol mismatch. MCP=${PROTOCOL_VERSION}`);
+        currentChannel = null;
+        desiredChannel = null;
+        pendingRequests.forEach((request, id) => {
+          clearTimeout(request.timeout);
+          request.reject(new Error(fatalProtocolError));
+          pendingRequests.delete(id);
+        });
+        logger.error(fatalProtocolError);
+        return;
+      }
       if (json.type === "progress_update") {
         const progressData = json.message.data;
         const requestId = json.id || "";
@@ -2570,6 +2595,9 @@ function connectToFigma(port = 3055) {
             if (pendingRequests.has(requestId)) {
               logger.error(`Request ${requestId} timed out after extended period of inactivity`);
               pendingRequests.delete(requestId);
+              if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "request_timeout", id: requestId, channel: request.channel, requesterId }));
+              }
               request.reject(new Error("Request to Figma timed out"));
             }
           }, 6e4);
@@ -2596,16 +2624,18 @@ function connectToFigma(port = 3055) {
       const myResponse = json.message;
       logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
       logger.log("myResponse" + JSON.stringify(myResponse));
-      if (myResponse.id && pendingRequests.has(myResponse.id) && myResponse.result) {
+      if (myResponse?.id && pendingRequests.has(myResponse.id) && (myResponse.result !== void 0 || myResponse.error !== void 0)) {
         const request = pendingRequests.get(myResponse.id);
         clearTimeout(request.timeout);
         if (myResponse.error) {
           logger.error(`Error from Figma: ${myResponse.error}`);
           request.reject(new Error(myResponse.error));
         } else {
-          if (myResponse.result) {
-            request.resolve(myResponse.result);
+          let result = myResponse.result;
+          if (myResponse.timing && result && typeof result === "object") {
+            result = { ...result, _timing: myResponse.timing };
           }
+          request.resolve(result);
         }
         pendingRequests.delete(myResponse.id);
       } else {
@@ -2626,8 +2656,12 @@ function connectToFigma(port = 3055) {
       request.reject(new Error("Connection closed"));
       pendingRequests.delete(id);
     }
-    logger.info("Attempting to reconnect in 2 seconds...");
-    setTimeout(() => connectToFigma(port), 2e3);
+    if (fatalProtocolError) {
+      logger.error(`Reconnect paused: ${fatalProtocolError}`);
+    } else {
+      logger.info("Attempting to reconnect in 2 seconds...");
+      setTimeout(() => connectToFigma(port), 2e3);
+    }
   });
 }
 async function joinChannel(channelName) {
@@ -2637,14 +2671,53 @@ async function joinChannel(channelName) {
   try {
     await sendCommandToFigma("join", { channel: channelName });
     currentChannel = channelName;
+    desiredChannel = channelName;
     logger.info(`Joined channel: ${channelName}`);
   } catch (error) {
     logger.error(`Failed to join channel: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
 }
-function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
+async function relayProjects() {
+  const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/projects" : `https://${serverUrl}/projects`;
+  const response = await fetch(httpUrl);
+  if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
+  return (await response.json()).projects || [];
+}
+async function selectProject(query) {
+  const projects = await relayProjects();
+  const live = projects.filter((project2) => project2.connectionCount > 0 && project2.recommendedChannel);
+  if (!live.length) throw new Error("No live Figma projects are connected");
+  let matches = live;
+  if (query) {
+    const normalized = query.toLowerCase();
+    matches = live.filter(
+      (project2) => [project2.name, project2.fileKey, project2.projectKey].some((value) => String(value || "").toLowerCase().includes(normalized))
+    );
+  }
+  if (matches.length !== 1) {
+    throw new Error(query ? `Project query matched ${matches.length} projects: ${matches.map((project2) => project2.name).join(", ") || "none"}` : `Choose a project first: ${live.map((project2) => project2.name).join(", ")}`);
+  }
+  const project = matches[0];
+  await joinChannel(project.recommendedChannel);
+  selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
+  return project;
+}
+async function ensureProjectSelected() {
+  if (currentChannel) return;
+  if (selectedProject) {
+    await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
+    return;
+  }
+  await selectProject();
+}
+async function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
+  if (command !== "join") await ensureProjectSelected();
   return new Promise((resolve2, reject) => {
+    if (fatalProtocolError) {
+      reject(new Error(fatalProtocolError));
+      return;
+    }
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectToFigma();
       reject(new Error("Not connected to Figma. Attempting to connect..."));
@@ -2659,6 +2732,7 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
     const request = {
       id,
       type: command === "join" ? "join" : "message",
+      requesterId,
       ...command === "join" ? { channel: params.channel } : { channel: currentChannel },
       message: {
         id,
@@ -2673,6 +2747,9 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
     const timeout = setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "request_timeout", id, channel: currentChannel, requesterId }));
+        }
         logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1e3} seconds`);
         reject(new Error("Request to Figma timed out"));
       }
@@ -2681,13 +2758,27 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
       resolve: resolve2,
       reject,
       timeout,
-      lastActivity: Date.now()
+      lastActivity: Date.now(),
+      command,
+      channel: currentChannel
     });
     logger.info(`Sending command to Figma: ${command}`);
     logger.debug(`Request details: ${JSON.stringify(request)}`);
     ws.send(JSON.stringify(request));
   });
 }
+setInterval(() => {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "heartbeat",
+      role: "controller",
+      requesterId,
+      protocolVersion: PROTOCOL_VERSION,
+      channel: currentChannel,
+      ts: Date.now()
+    }));
+  }
+}, 1e4);
 server.tool(
   "list_pages",
   "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
@@ -2806,6 +2897,141 @@ server.tool(
     } catch (error) {
       return { content: [{ type: "text", text: `Error scanning design usage: ${error instanceof Error ? error.message : String(error)}` }] };
     }
+  }
+);
+function publishBulk(job) {
+  job.updatedAt = Date.now();
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "bulk_status",
+      requesterId,
+      job: {
+        id: job.id,
+        status: job.status,
+        total: job.items.length,
+        completed: job.completed,
+        failed: job.failed,
+        currentIndex: job.currentIndex,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt
+      }
+    }));
+  }
+}
+async function runBulk(job) {
+  job.status = "running";
+  publishBulk(job);
+  for (let index = 0; index < job.items.length; index++) {
+    if (job.cancelRequested) {
+      job.status = "cancelled";
+      job.currentIndex = null;
+      publishBulk(job);
+      return;
+    }
+    job.currentIndex = index;
+    publishBulk(job);
+    const item = job.items[index];
+    try {
+      const result = await sendCommandToFigma(item.command, { ...item.params || {}, batchId: job.id });
+      job.results[index] = { ok: true, result };
+      job.completed++;
+    } catch (error) {
+      job.results[index] = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      job.failed++;
+    }
+    publishBulk(job);
+  }
+  job.currentIndex = null;
+  job.status = job.failed ? "error" : "completed";
+  publishBulk(job);
+}
+server.tool(
+  "list_figma_projects",
+  "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients.",
+  {},
+  async () => {
+    try {
+      return { content: [{ type: "text", text: JSON.stringify({ current: selectedProject, projects: await relayProjects() }, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error listing Figma projects: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "use_figma_project",
+  "Connect this MCP client to a Figma project by project name or file key. No channel name is needed; the least-loaded healthy plugin connection is selected automatically.",
+  { project: z.string().describe("Figma project/document name or file key") },
+  async ({ project }) => {
+    try {
+      const selected = await selectProject(project);
+      return { content: [{ type: "text", text: JSON.stringify({
+        connected: true,
+        project: selectedProject,
+        connectionCount: selected.connectionCount,
+        busy: selected.busy
+      }, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error selecting Figma project: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+server.tool(
+  "get_figma_workload",
+  "Show connected projects, plugin connection counts, active request counts, and queued work.",
+  {},
+  async () => {
+    const projects = await relayProjects();
+    return { content: [{ type: "text", text: JSON.stringify({ requesterId, current: selectedProject, projects }, null, 2) }] };
+  }
+);
+server.tool(
+  "start_bulk_operations",
+  "Start a cancellable bulk job. Items run in order and progress is available immediately through get_bulk_operation; the dashboard groups all item progress under the returned bulk id.",
+  {
+    items: z.array(z.object({
+      command: z.string().describe("Figma command name"),
+      params: z.record(z.unknown()).optional()
+    })).min(1)
+  },
+  async ({ items }) => {
+    const job = {
+      id: uuidv4(),
+      status: "queued",
+      items,
+      completed: 0,
+      failed: 0,
+      currentIndex: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      results: [],
+      cancelRequested: false
+    };
+    bulkJobs.set(job.id, job);
+    publishBulk(job);
+    void runBulk(job);
+    return { content: [{ type: "text", text: JSON.stringify({ id: job.id, status: job.status, total: job.items.length }) }] };
+  }
+);
+server.tool(
+  "get_bulk_operation",
+  "Get progress, per-item results, wait time, and execution time for a bulk job.",
+  { id: z.string() },
+  async ({ id }) => {
+    const job = bulkJobs.get(id);
+    return { content: [{ type: "text", text: JSON.stringify(job || { error: "Bulk job not found", id }, null, 2) }] };
+  }
+);
+server.tool(
+  "cancel_bulk_operation",
+  "Cancel a bulk job at the next item boundary. The currently executing Figma command is allowed to finish safely; remaining items will not start.",
+  { id: z.string() },
+  async ({ id }) => {
+    const job = bulkJobs.get(id);
+    if (!job) return { content: [{ type: "text", text: JSON.stringify({ error: "Bulk job not found", id }) }] };
+    job.cancelRequested = true;
+    if (job.status === "queued" || job.status === "running") job.status = "cancelling";
+    publishBulk(job);
+    return { content: [{ type: "text", text: JSON.stringify({ id, status: job.status }) }] };
   }
 );
 server.tool(
