@@ -11,6 +11,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
+import {
+  type SearchAnnotation,
+  normalizeKeywordKey,
+  upsertSearchAnnotation,
+  removeSearchAnnotations,
+  findAnnotationsForKeys,
+} from "../shared/annotations-store";
 
 const PROTOCOL_VERSION = "2.2.0";
 
@@ -3693,15 +3700,16 @@ server.tool(
 
 server.tool(
   "search_nodes",
-  "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) — by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something — use this tool first, then drill into the returned node/page ids. Pages are searched sequentially (current page first, then file order) and the search stops as soon as `limit` matches are found. NOTE: the FIRST search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy} (text matches also carry a matchedText snippet); name matches sort before text matches. Optionally filter by node types or restrict to one page.",
+  "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) — by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something — use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once — Korean/English, joined/spaced, product name vs feature name (e.g. ['짐챗','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). Pages are searched sequentially (current page first, then file order) and the search stops as soon as `limit` matches are found. NOTE: the FIRST search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
   {
-    query: z.string().describe("Substring to match (case-insensitive) against node names and/or TEXT content."),
+    query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
+    queries: z.array(z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['짐챗','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
     match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
     types: z.array(z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
     pageId: z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
     limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200)."),
   },
-  async ({ query, match, types, pageId, limit }: any) => {
+  async ({ query, queries, match, types, pageId, limit }: any) => {
     try {
       // The plugin-side command searches ONE page per call; the file-wide loop
       // lives here. That keeps every single command well under its timeout
@@ -3711,6 +3719,30 @@ server.tool(
       const PER_PAGE_TIMEOUT_MS = 30000;
       const mode = match === "name" || match === "text" ? match : "both";
       const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+      const allQueries: string[] = [
+        ...(typeof query === "string" ? [query] : []),
+        ...(Array.isArray(queries) ? queries.filter((q: any) => typeof q === "string") : []),
+      ].filter((q) => q.trim().length > 0);
+      if (!allQueries.length) {
+        return { content: [{ type: "text", text: "Error searching nodes: provide `query` and/or `queries`" }] };
+      }
+
+      // Learned keyword annotations for this project go on top of the results
+      // (matchedBy: "annotation"), independent of `limit`. Ensure a project is
+      // selected first so the lookup is scoped correctly.
+      await ensureProjectSelected();
+      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const annotationMatches = findAnnotationsForKeys(
+        projectKey,
+        allQueries.map(normalizeKeywordKey)
+      ).map((a: SearchAnnotation) => ({
+        id: a.nodeId,
+        name: a.nodeName,
+        matchedBy: "annotation",
+        matchedQuery: a.keyword,
+        ...(a.note ? { note: a.note } : {}),
+        addedAt: a.addedAt,
+      }));
 
       let pageOrder: Array<{ id: string; name: string }>;
       if (pageId) {
@@ -3746,7 +3778,7 @@ server.tool(
         try {
           const pageResult = (await sendCommandToFigma(
             "search_nodes",
-            { query, match: mode, types, pageId: page.id, limit: remaining },
+            { queries: allQueries, match: mode, types, pageId: page.id, limit: remaining },
             PER_PAGE_TIMEOUT_MS
           )) as any;
           totalMatches += pageResult?.totalMatches || 0;
@@ -3764,13 +3796,13 @@ server.tool(
       }
 
       const result: any = {
-        query,
+        queries: allQueries,
         match: mode,
         totalMatches,
         truncated,
         totalScannedPages,
         totalPages: pageOrder.length,
-        matches,
+        matches: [...annotationMatches, ...matches],
       };
       if (truncated) {
         // totalMatches only covers scanned pages when we stopped early.
@@ -3780,6 +3812,49 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "add_search_annotation",
+  "Register a learned keyword→node link for the CURRENT project so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. The node's existence is verified and its name stored. Same keyword+node updates in place.",
+  {
+    keyword: z.string().describe("The search keyword this node should be found under (the term the search failed on). Original spelling is kept; matching is case- and whitespace-insensitive."),
+    nodeId: z.string().describe("The confirmed node id the keyword should resolve to."),
+    note: z.string().optional().describe("Optional context for future readers (why this node, source of the confirmation)."),
+  },
+  async ({ keyword, nodeId, note }: any) => {
+    try {
+      if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+      // Verify the node exists in the current project and capture its name.
+      const info = (await sendCommandToFigma("get_node_info", { nodeId, fields: ["id"], maxDepth: 0 })) as any;
+      const nodeName = String(info?.name ?? "");
+      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const annotation = upsertSearchAnnotation({ keyword: keyword.trim(), projectKey, nodeId, nodeName, note });
+      return { content: [{ type: "text", text: JSON.stringify({ saved: true, annotation }) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error adding search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "remove_search_annotation",
+  "Remove learned keyword→node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG — remove it so searches stop surfacing it. Omit nodeId to remove every annotation stored under the keyword.",
+  {
+    keyword: z.string().describe("The keyword whose annotation(s) to remove (case- and whitespace-insensitive)."),
+    nodeId: z.string().optional().describe("Remove only the annotation pointing at this node; omit to remove ALL annotations for the keyword."),
+  },
+  async ({ keyword, nodeId }: any) => {
+    try {
+      if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+      await ensureProjectSelected();
+      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const removed = removeSearchAnnotations({ keyword: keyword.trim(), projectKey, nodeId });
+      return { content: [{ type: "text", text: JSON.stringify({ removed }) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );

@@ -8,10 +8,82 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
+import * as fs2 from "fs";
+import * as path2 from "path";
+import * as os2 from "os";
+import { createServer as createHttpServer } from "http";
+
+// src/shared/annotations-store.ts
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { createServer as createHttpServer } from "http";
+var ANNOTATIONS_FILE = path.join(
+  os.homedir(),
+  ".talk-to-figma",
+  "index",
+  "annotations.json"
+);
+function normalizeKeywordKey(keyword) {
+  return keyword.toLowerCase().replace(/\s+/g, "");
+}
+function loadSearchAnnotations() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(ANNOTATIONS_FILE, "utf8"));
+    if (Array.isArray(raw?.annotations)) {
+      return raw.annotations.filter(
+        (a) => a && typeof a.keywordKey === "string" && typeof a.projectKey === "string" && typeof a.nodeId === "string"
+      );
+    }
+  } catch (error) {
+  }
+  return [];
+}
+function saveSearchAnnotations(annotations) {
+  const dir = path.dirname(ANNOTATIONS_FILE);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.annotations.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify({ annotations }, null, 2));
+  fs.renameSync(tmp, ANNOTATIONS_FILE);
+}
+function upsertSearchAnnotation(input) {
+  const annotations = loadSearchAnnotations();
+  const keywordKey = normalizeKeywordKey(input.keyword);
+  const annotation = {
+    keyword: input.keyword,
+    keywordKey,
+    projectKey: input.projectKey,
+    nodeId: input.nodeId,
+    nodeName: input.nodeName,
+    ...input.note ? { note: input.note } : {},
+    addedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const idx = annotations.findIndex(
+    (a) => a.keywordKey === keywordKey && a.projectKey === input.projectKey && a.nodeId === input.nodeId
+  );
+  if (idx !== -1) annotations[idx] = annotation;
+  else annotations.push(annotation);
+  saveSearchAnnotations(annotations);
+  return annotation;
+}
+function removeSearchAnnotations(input) {
+  const annotations = loadSearchAnnotations();
+  const keywordKey = normalizeKeywordKey(input.keyword);
+  const kept = annotations.filter(
+    (a) => !(a.keywordKey === keywordKey && a.projectKey === input.projectKey && (!input.nodeId || a.nodeId === input.nodeId))
+  );
+  const removed = annotations.length - kept.length;
+  if (removed > 0) saveSearchAnnotations(kept);
+  return removed;
+}
+function findAnnotationsForKeys(projectKey, keys) {
+  if (!keys.length) return [];
+  const keySet = new Set(keys);
+  return loadSearchAnnotations().filter(
+    (a) => a.projectKey === projectKey && keySet.has(a.keywordKey)
+  );
+}
+
+// src/talk_to_figma_mcp/server.ts
 var PROTOCOL_VERSION = "2.2.0";
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
@@ -25,11 +97,11 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
-var STATE_DIR = path.join(os.homedir(), ".talk-to-figma");
-var STATE_FILE = path.join(STATE_DIR, "state.json");
+var STATE_DIR = path2.join(os2.homedir(), ".talk-to-figma");
+var STATE_FILE = path2.join(STATE_DIR, "state.json");
 function loadPersistedSelectedProject() {
   try {
-    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const raw = JSON.parse(fs2.readFileSync(STATE_FILE, "utf8"));
     const project = raw?.selectedProject;
     if (project && typeof project === "object" && typeof project.name === "string") {
       return {
@@ -44,8 +116,8 @@ function loadPersistedSelectedProject() {
 }
 function persistSelectedProject(project) {
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+    fs2.mkdirSync(STATE_DIR, { recursive: true });
+    fs2.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
   } catch (error) {
     logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1022,14 +1094,14 @@ Failed: ${JSON.stringify(failures)}` : "")
         if (!outputPath && options.remoteExportBase) {
           const extension = fmt.toLowerCase();
           const name = `${uuidv4()}.${extension}`;
-          const resolved = path.join(exportDirectory, name);
-          fs.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+          const resolved = path2.join(exportDirectory, name);
+          fs2.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
+            fs2.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
           } else {
-            fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
+            fs2.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
           }
-          const stat = fs.statSync(resolved);
+          const stat = fs2.statSync(resolved);
           const summary = {
             saved: true,
             url: `${options.remoteExportBase}/files/${name}`,
@@ -1045,14 +1117,14 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify(summary) }] };
         }
         if (outputPath) {
-          const resolved = path.resolve(outputPath);
-          fs.mkdirSync(path.dirname(resolved), { recursive: true });
+          const resolved = path2.resolve(outputPath);
+          fs2.mkdirSync(path2.dirname(resolved), { recursive: true });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs.writeFileSync(resolved, result.svg, "utf8");
+            fs2.writeFileSync(resolved, result.svg, "utf8");
           } else {
-            fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+            fs2.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
           }
-          const stat = fs.statSync(resolved);
+          const stat = fs2.statSync(resolved);
           const summary = {
             saved: true,
             path: resolved,
@@ -2881,19 +2953,40 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "search_nodes",
-    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. Pages are searched sequentially (current page first, then file order) and the search stops as soon as `limit` matches are found. NOTE: the FIRST search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy} (text matches also carry a matchedText snippet); name matches sort before text matches. Optionally filter by node types or restrict to one page.",
+    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once \u2014 Korean/English, joined/spaced, product name vs feature name (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). Pages are searched sequentially (current page first, then file order) and the search stops as soon as `limit` matches are found. NOTE: the FIRST search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
     {
-      query: z.string().describe("Substring to match (case-insensitive) against node names and/or TEXT content."),
+      query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
+      queries: z.array(z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
       match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
       types: z.array(z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
       pageId: z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
       limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200).")
     },
-    async ({ query, match, types, pageId, limit }) => {
+    async ({ query, queries, match, types, pageId, limit }) => {
       try {
         const PER_PAGE_TIMEOUT_MS = 3e4;
         const mode = match === "name" || match === "text" ? match : "both";
         const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+        const allQueries = [
+          ...typeof query === "string" ? [query] : [],
+          ...Array.isArray(queries) ? queries.filter((q) => typeof q === "string") : []
+        ].filter((q) => q.trim().length > 0);
+        if (!allQueries.length) {
+          return { content: [{ type: "text", text: "Error searching nodes: provide `query` and/or `queries`" }] };
+        }
+        await ensureProjectSelected();
+        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const annotationMatches = findAnnotationsForKeys(
+          projectKey,
+          allQueries.map(normalizeKeywordKey)
+        ).map((a) => ({
+          id: a.nodeId,
+          name: a.nodeName,
+          matchedBy: "annotation",
+          matchedQuery: a.keyword,
+          ...a.note ? { note: a.note } : {},
+          addedAt: a.addedAt
+        }));
         let pageOrder;
         if (pageId) {
           pageOrder = [{ id: pageId, name: "" }];
@@ -2925,7 +3018,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
           try {
             const pageResult = await sendCommandToFigma(
               "search_nodes",
-              { query, match: mode, types, pageId: page.id, limit: remaining },
+              { queries: allQueries, match: mode, types, pageId: page.id, limit: remaining },
               PER_PAGE_TIMEOUT_MS
             );
             totalMatches += pageResult?.totalMatches || 0;
@@ -2940,13 +3033,13 @@ This detailed process ensures you correctly interpret the reaction data, prepare
           }
         }
         const result = {
-          query,
+          queries: allQueries,
           match: mode,
           totalMatches,
           truncated,
           totalScannedPages,
           totalPages: pageOrder.length,
-          matches
+          matches: [...annotationMatches, ...matches]
         };
         if (truncated) {
           result.note = `Stopped after ${totalScannedPages}/${pageOrder.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
@@ -2955,6 +3048,46 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "add_search_annotation",
+    "Register a learned keyword\u2192node link for the CURRENT project so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. The node's existence is verified and its name stored. Same keyword+node updates in place.",
+    {
+      keyword: z.string().describe("The search keyword this node should be found under (the term the search failed on). Original spelling is kept; matching is case- and whitespace-insensitive."),
+      nodeId: z.string().describe("The confirmed node id the keyword should resolve to."),
+      note: z.string().optional().describe("Optional context for future readers (why this node, source of the confirmation).")
+    },
+    async ({ keyword, nodeId, note }) => {
+      try {
+        if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+        const info = await sendCommandToFigma("get_node_info", { nodeId, fields: ["id"], maxDepth: 0 });
+        const nodeName = String(info?.name ?? "");
+        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const annotation = upsertSearchAnnotation({ keyword: keyword.trim(), projectKey, nodeId, nodeName, note });
+        return { content: [{ type: "text", text: JSON.stringify({ saved: true, annotation }) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error adding search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "remove_search_annotation",
+    "Remove learned keyword\u2192node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG \u2014 remove it so searches stop surfacing it. Omit nodeId to remove every annotation stored under the keyword.",
+    {
+      keyword: z.string().describe("The keyword whose annotation(s) to remove (case- and whitespace-insensitive)."),
+      nodeId: z.string().optional().describe("Remove only the annotation pointing at this node; omit to remove ALL annotations for the keyword.")
+    },
+    async ({ keyword, nodeId }) => {
+      try {
+        if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+        await ensureProjectSelected();
+        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const removed = removeSearchAnnotations({ keyword: keyword.trim(), projectKey, nodeId });
+        return { content: [{ type: "text", text: JSON.stringify({ removed }) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
@@ -3329,19 +3462,19 @@ var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
 var httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 var httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
-var exportDirectory = process.env.FIGMA_EXPORT_DIR || path.join(os.homedir(), ".macfleet", "figma-exports");
+var exportDirectory = process.env.FIGMA_EXPORT_DIR || path2.join(os2.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
 var exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0 ? configuredExportTTLHours : 24;
 var exportTTL = exportTTLHours * 60 * 60 * 1e3;
 var exportNamePattern = /^[0-9a-f-]{36}\.(png|jpg|svg|pdf)$/;
 function cleanupExports() {
-  if (!fs.existsSync(exportDirectory)) return;
+  if (!fs2.existsSync(exportDirectory)) return;
   const cutoff = Date.now() - exportTTL;
-  for (const name of fs.readdirSync(exportDirectory)) {
+  for (const name of fs2.readdirSync(exportDirectory)) {
     if (!exportNamePattern.test(name)) continue;
-    const file = path.join(exportDirectory, name);
+    const file = path2.join(exportDirectory, name);
     try {
-      if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
+      if (fs2.statSync(file).mtimeMs < cutoff) fs2.unlinkSync(file);
     } catch (error) {
       logger.warn(`Could not clean export ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -3360,11 +3493,11 @@ function serveExport(req, res, pathname) {
     res.writeHead(404).end("not found");
     return true;
   }
-  const file = path.join(exportDirectory, name);
+  const file = path2.join(exportDirectory, name);
   try {
-    const stat = fs.statSync(file);
+    const stat = fs2.statSync(file);
     if (!stat.isFile() || Date.now() - stat.mtimeMs > exportTTL) {
-      if (stat.isFile()) fs.unlinkSync(file);
+      if (stat.isFile()) fs2.unlinkSync(file);
       res.writeHead(404).end("not found");
       return true;
     }
@@ -3374,7 +3507,7 @@ function serveExport(req, res, pathname) {
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff"
     });
-    fs.createReadStream(file).pipe(res);
+    fs2.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
   }
@@ -3395,7 +3528,7 @@ async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
   }
-  fs.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+  fs2.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
   cleanupExports();
   const cleanupTimer = setInterval(cleanupExports, Math.min(exportTTL, 60 * 60 * 1e3));
   cleanupTimer.unref();

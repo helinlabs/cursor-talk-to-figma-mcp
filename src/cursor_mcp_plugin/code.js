@@ -819,12 +819,39 @@ function nodePathString(node, page) {
   return parts.join(" > ");
 }
 
-// Snippet of the matched TEXT characters: up to 40 chars of context on each side.
-function textMatchSnippet(characters, q) {
-  const idx = characters.toLowerCase().indexOf(q);
-  if (idx === -1) return null;
-  const start = Math.max(0, idx - 40);
-  const end = Math.min(characters.length, idx + q.length + 40);
+// Find where a query matches inside `haystack`, case-insensitively, either as
+// a plain substring or with ALL whitespace stripped from both sides — so
+// "gym chat" matches a "GymChat" layer and vice versa. Returns a
+// {start, end} range in the ORIGINAL string, or null.
+function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
+  const lower = haystack.toLowerCase();
+  const idx = lower.indexOf(qLower);
+  if (idx !== -1) return { start: idx, end: idx + qLower.length };
+  if (!qLowerNoSpace) return null;
+  // Whitespace-stripped comparison, mapping stripped indices back to originals.
+  const map = [];
+  let stripped = "";
+  for (let i = 0; i < lower.length; i++) {
+    const ch = lower[i];
+    if (!/\s/.test(ch)) {
+      stripped += ch;
+      map.push(i);
+    }
+  }
+  const sIdx = stripped.indexOf(qLowerNoSpace);
+  if (sIdx === -1) return null;
+  return {
+    start: map[sIdx],
+    end: map[sIdx + qLowerNoSpace.length - 1] + 1,
+  };
+}
+
+// Snippet of the matched TEXT characters: up to 40 chars of context on each
+// side of the {start, end} match range.
+function textMatchSnippet(characters, range) {
+  if (!range) return null;
+  const start = Math.max(0, range.start - 40);
+  const end = Math.min(characters.length, range.end + 40);
   return (
     (start > 0 ? "…" : "") +
     characters.slice(start, end) +
@@ -891,9 +918,28 @@ function buildPageSearchIndex(page) {
 // risk on 25-page files) and the relay can interleave other clients' commands
 // between pages instead of being blocked for the entire file walk.
 async function searchNodes(params) {
-  const { query, types, pageId, limit, match } = params || {};
-  if (!query || typeof query !== "string") {
-    throw new Error("Missing query parameter");
+  const { query, queries, types, pageId, limit, match } = params || {};
+  // Accept a single `query` and/or multiple `queries` (variant spellings of
+  // the same concept, e.g. 짐챗 / GymChat / Gym Chat). OR-matched.
+  const rawQueries = [];
+  if (typeof query === "string") rawQueries.push(query);
+  if (Array.isArray(queries)) {
+    for (const item of queries) {
+      if (typeof item === "string") rawQueries.push(item);
+    }
+  }
+  // Precompute per-query lowercase and whitespace-stripped-lowercase needles.
+  const needles = [];
+  const seen = new Set();
+  for (const raw of rawQueries) {
+    const qLower = raw.toLowerCase();
+    const qLowerNoSpace = qLower.replace(/\s+/g, "");
+    if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue; // skip empty/dupes
+    seen.add(qLowerNoSpace);
+    needles.push({ raw: raw, qLower: qLower, qLowerNoSpace: qLowerNoSpace });
+  }
+  if (!needles.length) {
+    throw new Error("Missing query/queries parameter");
   }
   if (!pageId) {
     throw new Error(
@@ -902,7 +948,6 @@ async function searchNodes(params) {
   }
   const mode = match === "name" || match === "text" ? match : "both";
   const max = Math.max(1, Math.min(Number(limit) || 50, 200));
-  const q = query.toLowerCase();
 
   const page = await figma.getNodeByIdAsync(pageId);
   if (!page || page.type !== "PAGE") {
@@ -930,58 +975,69 @@ async function searchNodes(params) {
   const typeSet =
     Array.isArray(types) && types.length > 0 ? new Set(types) : null;
   // Collected separately so name matches sort before text matches.
+  // Each hit records which query variant matched (first winner in given order).
   const nameFound = [];
   const textFound = [];
   for (const entry of index.entries) {
-    if (
-      mode !== "text" &&
-      (!typeSet || typeSet.has(entry.type)) &&
-      entry.name.toLowerCase().indexOf(q) !== -1
-    ) {
-      nameFound.push(entry);
-      continue;
+    let matched = false;
+    if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
+      for (const needle of needles) {
+        if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
+          nameFound.push({ entry: entry, matchedQuery: needle.raw });
+          matched = true;
+          break;
+        }
+      }
     }
-    if (
-      mode !== "name" &&
-      entry.characters !== null &&
-      entry.characters.toLowerCase().indexOf(q) !== -1
-    ) {
-      textFound.push(entry);
+    if (!matched && mode !== "name" && entry.characters !== null) {
+      for (const needle of needles) {
+        const range = findNormalizedMatch(
+          entry.characters,
+          needle.qLower,
+          needle.qLowerNoSpace
+        );
+        if (range) {
+          textFound.push({ entry: entry, matchedQuery: needle.raw, range: range });
+          break;
+        }
+      }
     }
   }
 
   const matches = [];
   let truncated = false;
-  for (const entry of nameFound) {
+  for (const found of nameFound) {
     if (matches.length >= max) {
       truncated = true;
       break;
     }
     matches.push({
-      id: entry.id,
-      name: entry.name,
-      type: entry.type,
+      id: found.entry.id,
+      name: found.entry.name,
+      type: found.entry.type,
       pageId: page.id,
       pageName: page.name,
-      path: entry.path,
+      path: found.entry.path,
       matchedBy: "name",
+      matchedQuery: found.matchedQuery,
     });
   }
   if (!truncated) {
-    for (const entry of textFound) {
+    for (const found of textFound) {
       if (matches.length >= max) {
         truncated = true;
         break;
       }
       matches.push({
-        id: entry.id,
-        name: entry.name,
-        type: entry.type,
+        id: found.entry.id,
+        name: found.entry.name,
+        type: found.entry.type,
         pageId: page.id,
         pageName: page.name,
-        path: entry.path,
+        path: found.entry.path,
         matchedBy: "text",
-        matchedText: textMatchSnippet(entry.characters, q),
+        matchedQuery: found.matchedQuery,
+        matchedText: textMatchSnippet(found.entry.characters, found.range),
       });
     }
   }
