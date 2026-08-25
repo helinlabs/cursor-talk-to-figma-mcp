@@ -1,10 +1,23 @@
 #!/usr/bin/env bun
 
 import { Server, ServerWebSocket } from "bun";
-import { readFileSync } from "fs";
-import { createHash } from "crypto";
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from "fs";
+import { createHash, randomUUID } from "crypto";
+import * as path from "path";
+import {
+  loadSearchAnnotations,
+  upsertSearchAnnotation,
+  removeSearchAnnotations,
+} from "./shared/annotations-store";
+import {
+  INDEX_DIR,
+  loadProjectIndex,
+  saveProjectIndex,
+  listProjectIndexSummaries,
+  type ProjectIndex,
+} from "./shared/search-index";
 
-const PROTOCOL_VERSION = "2.0.0";
+import { PROTOCOL_VERSION } from "./shared/version";
 
 function isProtocolCompatible(version: unknown): boolean {
   if (typeof version !== "string") return false;
@@ -61,13 +74,15 @@ interface RequestMeta {
   id: string;
   channel: string;
   command: string;
-  requester: ServerWebSocket<any>;
+  // null for relay-internal requests (indexer); results go to onInternalResult.
+  requester: ServerWebSocket<any> | null;
   requesterId: string;
   figma?: ServerWebSocket<any>;
   queuedAt: number;
   dispatchedAt?: number;
   startedAt?: number;
   batchId?: string;
+  onInternalResult?: (message: { id: string; result?: any; error?: any }) => void;
 }
 
 // Per-socket metadata (id, inferred role, current channel, …)
@@ -265,6 +280,378 @@ function pushChannels(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Relay-internal commands: the relay itself acts as a controller and sends a
+// command to the plugin of a channel, resolving on the response. Used by the
+// incremental indexer and console helpers. Uses the same RequestMeta pipeline
+// as real controllers, so queueDepth accounting and stability tracking apply.
+// ---------------------------------------------------------------------------
+
+function sendInternalCommand(
+  channelName: string,
+  command: string,
+  params: any = {},
+  timeoutMs = 30_000
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const figma = chooseFigma(channelName);
+    if (!figma) {
+      reject(new Error(`No healthy Figma plugin on channel "${channelName}"`));
+      return;
+    }
+    const figmaMeta = clientMeta.get(figma)!;
+    const id = randomUUID();
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      requests.delete(id);
+      figmaMeta.activeRequests = Math.max(0, figmaMeta.activeRequests - 1);
+      recordFigmaOutcome(figma, true);
+      reject(new Error(`Internal command ${command} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const request: RequestMeta = {
+      id,
+      channel: channelName,
+      command,
+      requester: null,
+      requesterId: "relay-internal",
+      figma,
+      queuedAt: Date.now(),
+      dispatchedAt: Date.now(),
+      onInternalResult: (message) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (message.error !== undefined && message.error !== null) {
+          reject(new Error(typeof message.error === "string" ? message.error : JSON.stringify(message.error)));
+        } else {
+          resolve(message.result);
+        }
+      },
+    };
+    requests.set(id, request);
+    figmaMeta.activeRequests++;
+    figma.send(JSON.stringify({
+      type: "broadcast",
+      message: { id, command, params },
+      sender: "relay-internal",
+      channel: channelName,
+    }));
+  });
+}
+
+// Total in-flight requests on a channel's Figma plugin(s), i.e. real user
+// traffic the indexer must yield to.
+function channelQueueDepth(channelName: string): number {
+  let depth = 0;
+  for (const client of channels.get(channelName) ?? []) {
+    const m = clientMeta.get(client);
+    if (m?.role === "figma") depth += m.activeRequests;
+  }
+  return depth;
+}
+
+// ---------------------------------------------------------------------------
+// Incremental background indexer.
+//
+// Scans every live project page-by-page (one `dump_page_index` plugin command
+// = one step) and persists the result to ~/.talk-to-figma/index/ so the MCP
+// server's search_nodes can answer from disk. Never scans in one shot: scope
+// is fixed at job start (live projects × list_pages), each step checkpoints a
+// partial index + cursor to disk (progress.json), and a restart resumes from
+// the cursor. Between steps the indexer sleeps briefly and defers any project
+// whose channel has real traffic (queueDepth > 0), so live commands always
+// interleave.
+//
+// Triggers: ① 60s after plugin announces settle (auto, once per relay run)
+// ② daily at 04:00 KST ③ POST /index/rebuild (optionally ?project=).
+// ---------------------------------------------------------------------------
+
+const PROGRESS_FILE = path.join(INDEX_DIR, "progress.json");
+const INDEX_STEP_IDLE_MS = 300; // idle gap between steps for live traffic
+const INDEX_BUSY_RETRY_MS = 500; // wait when every channel is busy
+const INDEX_STEP_TIMEOUT_MS = 30_000; // cold page load measured at <=11s
+
+interface IndexProjectProgress {
+  projectKey: string;
+  name: string;
+  pages: Array<{ id: string; name: string }>;
+  nextIndex: number;
+  failures: Array<{ pageId: string; pageName: string; error: string }>;
+}
+
+const indexer = {
+  state: "idle" as "idle" | "running",
+  trigger: null as string | null,
+  startedAt: 0,
+  scannedPages: 0,
+  totalPages: 0,
+  projects: [] as IndexProjectProgress[],
+  currentStep: null as null | { projectKey: string; pageId: string; pageName: string },
+  durations: [] as number[],
+  lastError: null as string | null,
+  lastCompletedAt: null as number | null,
+  autoTriggered: false,
+  autoTimer: null as ReturnType<typeof setTimeout> | null,
+};
+
+function loadIndexProgress(): { lastCompletedAt: number | null; projects: IndexProjectProgress[] } {
+  try {
+    const raw = JSON.parse(readFileSync(PROGRESS_FILE, "utf8"));
+    return {
+      lastCompletedAt: typeof raw.lastCompletedAt === "number" ? raw.lastCompletedAt : null,
+      projects: Array.isArray(raw.projects) ? raw.projects : [],
+    };
+  } catch {
+    return { lastCompletedAt: null, projects: [] };
+  }
+}
+
+function saveIndexProgress(): void {
+  try {
+    mkdirSync(INDEX_DIR, { recursive: true });
+    const tmp = `${PROGRESS_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({
+      running: indexer.state === "running",
+      startedAt: indexer.startedAt || null,
+      lastCompletedAt: indexer.lastCompletedAt,
+      projects: indexer.projects.map((p) => ({
+        projectKey: p.projectKey,
+        name: p.name,
+        pages: p.pages,
+        nextIndex: p.nextIndex,
+        failures: p.failures,
+      })),
+    }, null, 2));
+    renameSync(tmp, PROGRESS_FILE);
+  } catch (err) {
+    console.error("Could not persist index progress:", err);
+  }
+}
+
+indexer.lastCompletedAt = loadIndexProgress().lastCompletedAt;
+
+function resolveProjectChannel(projectKey: string): string | null {
+  const project = snapshotProjects().find((p) => p.projectKey === projectKey);
+  return project?.recommendedChannel ?? null;
+}
+
+function indexEta(): { avgPageMs: number | null; etaMs: number | null } {
+  if (!indexer.durations.length) return { avgPageMs: null, etaMs: null };
+  const avg = indexer.durations.reduce((a, b) => a + b, 0) / indexer.durations.length;
+  const remaining = indexer.totalPages - indexer.scannedPages;
+  return { avgPageMs: Math.round(avg), etaMs: Math.round(avg * Math.max(0, remaining)) };
+}
+
+function indexStatus(): any {
+  const { avgPageMs, etaMs } = indexEta();
+  return {
+    state: indexer.state,
+    trigger: indexer.trigger,
+    startedAt: indexer.startedAt || null,
+    elapsedMs: indexer.state === "running" ? Date.now() - indexer.startedAt : null,
+    scannedPages: indexer.scannedPages,
+    totalPages: indexer.totalPages,
+    currentStep: indexer.currentStep,
+    avgPageMs,
+    etaMs,
+    lastError: indexer.lastError,
+    lastCompletedAt: indexer.lastCompletedAt,
+    jobProjects: indexer.projects.map((p) => ({
+      projectKey: p.projectKey,
+      name: p.name,
+      totalPages: p.pages.length,
+      scannedPages: p.nextIndex,
+      failures: p.failures,
+    })),
+    // What is on disk (survives restarts), independent of the current job.
+    diskIndexes: listProjectIndexSummaries(),
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?: boolean }): { started: boolean; reason?: string } {
+  if (indexer.state === "running") return { started: false, reason: "an index job is already running" };
+  const live = snapshotProjects().filter((p) => p.connectionCount > 0 && p.recommendedChannel);
+  let scope = live;
+  if (opts.projectFilter) {
+    const f = opts.projectFilter.toLowerCase();
+    scope = live.filter((p) => p.projectKey === opts.projectFilter || String(p.name || "").toLowerCase().includes(f));
+  }
+  if (!scope.length) return { started: false, reason: "no live matching Figma projects" };
+
+  indexer.state = "running";
+  indexer.trigger = opts.trigger;
+  indexer.startedAt = Date.now();
+  indexer.scannedPages = 0;
+  indexer.totalPages = 0;
+  indexer.projects = [];
+  indexer.currentStep = null;
+  indexer.durations = [];
+  indexer.lastError = null;
+
+  const resumable = opts.resume ? loadIndexProgress().projects.filter((p) => p.nextIndex < (p.pages?.length ?? 0)) : [];
+
+  void (async () => {
+    try {
+      // Fix the scope: enumerate pages per live project (resume uses the
+      // checkpointed page list + cursor instead of a fresh listing).
+      for (const project of scope) {
+        const saved = resumable.find((p) => p.projectKey === project.projectKey);
+        if (saved) {
+          indexer.projects.push({ ...saved, name: project.name || saved.name, failures: saved.failures ?? [] });
+          continue;
+        }
+        try {
+          const listing = await sendInternalCommand(project.recommendedChannel, "list_pages", { withChildCounts: false }, INDEX_STEP_TIMEOUT_MS);
+          indexer.projects.push({
+            projectKey: project.projectKey,
+            name: project.name || project.projectKey,
+            pages: (listing?.pages || []).map((p: any) => ({ id: p.id, name: p.name })),
+            nextIndex: 0,
+            failures: [],
+          });
+        } catch (err) {
+          indexer.projects.push({
+            projectKey: project.projectKey,
+            name: project.name || project.projectKey,
+            pages: [],
+            nextIndex: 0,
+            failures: [{ pageId: "-", pageName: "(list_pages)", error: err instanceof Error ? err.message : String(err) }],
+          });
+        }
+      }
+      indexer.totalPages = indexer.projects.reduce((sum, p) => sum + p.pages.length, 0);
+      saveIndexProgress();
+      pushEvent({ kind: "index_job", status: "started", trigger: opts.trigger, totalPages: indexer.totalPages, projects: indexer.projects.map((p) => p.name) });
+
+      // In-memory working copies of the project index files.
+      const working = new Map<string, ProjectIndex>();
+      const getWorking = (p: IndexProjectProgress): ProjectIndex => {
+        let idx = working.get(p.projectKey);
+        if (!idx) {
+          idx = loadProjectIndex(p.projectKey) ?? {
+            projectKey: p.projectKey,
+            projectName: p.name,
+            builtAt: null,
+            updatedAt: 0,
+            pageCount: 0,
+            nodeCount: 0,
+            pages: [],
+          };
+          idx.projectName = p.name;
+          working.set(p.projectKey, idx);
+        }
+        return idx;
+      };
+
+      while (true) {
+        const pending = indexer.projects.filter((p) => p.nextIndex < p.pages.length);
+        if (!pending.length) break;
+        // Pick the first pending project whose channel is live AND idle;
+        // busy channels are deferred so real traffic goes first.
+        let pick: { p: IndexProjectProgress; channel: string } | null = null;
+        let anyLive = false;
+        for (const p of pending) {
+          const channel = resolveProjectChannel(p.projectKey);
+          if (!channel) continue;
+          anyLive = true;
+          if (channelQueueDepth(channel) > 0) continue;
+          pick = { p, channel };
+          break;
+        }
+        if (!pick) {
+          if (!anyLive) {
+            indexer.lastError = "no live Figma plugin remains for the pending projects; job suspended (will resume on the next trigger)";
+            break;
+          }
+          await sleep(INDEX_BUSY_RETRY_MS);
+          continue;
+        }
+        const page = pick.p.pages[pick.p.nextIndex];
+        indexer.currentStep = { projectKey: pick.p.projectKey, pageId: page.id, pageName: page.name };
+        const t0 = Date.now();
+        try {
+          const dump = await sendInternalCommand(pick.channel, "dump_page_index", { pageId: page.id }, INDEX_STEP_TIMEOUT_MS);
+          const idx = getWorking(pick.p);
+          const pageIndex = {
+            pageId: dump.pageId,
+            pageName: dump.pageName,
+            builtAt: dump.builtAt ?? Date.now(),
+            nodeCount: dump.nodeCount ?? (dump.entries?.length || 0),
+            entries: dump.entries || [],
+          };
+          const existing = idx.pages.findIndex((pg) => pg.pageId === pageIndex.pageId);
+          if (existing !== -1) idx.pages[existing] = pageIndex;
+          else idx.pages.push(pageIndex);
+          saveProjectIndex(idx); // checkpoint: partial index survives restarts
+        } catch (err) {
+          pick.p.failures.push({ pageId: page.id, pageName: page.name, error: err instanceof Error ? err.message : String(err) });
+        }
+        indexer.durations.push(Date.now() - t0);
+        pick.p.nextIndex++;
+        indexer.scannedPages++;
+        if (pick.p.nextIndex >= pick.p.pages.length) {
+          // Project finished: stamp builtAt and drop pages that no longer exist.
+          const idx = getWorking(pick.p);
+          const liveIds = new Set(pick.p.pages.map((pg) => pg.id));
+          idx.pages = idx.pages.filter((pg) => liveIds.has(pg.pageId));
+          idx.builtAt = Date.now();
+          saveProjectIndex(idx);
+          pushEvent({ kind: "index_project_done", projectKey: pick.p.projectKey, name: pick.p.name, pages: idx.pages.length, nodes: idx.nodeCount, failures: pick.p.failures.length });
+        }
+        saveIndexProgress(); // checkpoint the cursor after EVERY step
+        indexer.currentStep = null;
+        await sleep(INDEX_STEP_IDLE_MS);
+      }
+      if (!indexer.lastError) indexer.lastCompletedAt = Date.now();
+      pushEvent({ kind: "index_job", status: indexer.lastError ? "suspended" : "completed", trigger: opts.trigger, scannedPages: indexer.scannedPages, totalPages: indexer.totalPages, error: indexer.lastError });
+    } catch (err) {
+      indexer.lastError = err instanceof Error ? err.message : String(err);
+      pushEvent({ kind: "index_job", status: "failed", trigger: opts.trigger, error: indexer.lastError });
+    } finally {
+      indexer.state = "idle";
+      indexer.currentStep = null;
+      saveIndexProgress();
+    }
+  })();
+
+  return { started: true };
+}
+
+// Trigger ①: auto-start 60s after the last plugin announce (i.e. once the set
+// of connected files has settled), once per relay run. Also resumes any job
+// that was interrupted by a relay restart (checkpointed cursor).
+const AUTO_INDEX_SETTLE_MS = 60_000;
+function armAutoIndex(): void {
+  if (indexer.autoTriggered) return;
+  if (indexer.autoTimer) clearTimeout(indexer.autoTimer);
+  indexer.autoTimer = setTimeout(() => {
+    if (indexer.autoTriggered || indexer.state === "running") return;
+    const result = startIndexJob({ trigger: "startup", resume: true });
+    if (result.started) indexer.autoTriggered = true;
+  }, AUTO_INDEX_SETTLE_MS);
+}
+
+// Trigger ②: daily at 04:00 KST (Asia/Seoul is fixed UTC+9, no DST).
+function scheduleDailyIndex(): void {
+  const now = new Date();
+  const kstNow = new Date(now.getTime() + 9 * 3600_000);
+  const next = new Date(kstNow);
+  next.setUTCHours(4, 0, 0, 0); // 04:00 in the shifted (KST-as-UTC) frame
+  if (next.getTime() <= kstNow.getTime()) next.setUTCDate(next.getUTCDate() + 1);
+  const delay = next.getTime() - kstNow.getTime();
+  setTimeout(() => {
+    startIndexJob({ trigger: "daily-0400kst", resume: true });
+    scheduleDailyIndex();
+  }, delay);
+}
+scheduleDailyIndex();
+
+// ---------------------------------------------------------------------------
 
 function handleConnection(ws: ServerWebSocket<any>) {
   const meta: ClientMeta = {
@@ -298,13 +685,17 @@ const server = Bun.serve({
   hostname: process.env.HOST || "127.0.0.1",
   // uncomment this to allow connections in windows wsl
   // hostname: "0.0.0.0",
-  fetch(req: Request, server: Server) {
+  async fetch(req: Request, server: Server) {
+    const JSON_HEADERS = {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+    };
     // Handle CORS preflight
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
       });
@@ -351,6 +742,87 @@ const server = Bun.serve({
           "Access-Control-Allow-Origin": "*",
         },
       });
+    }
+
+    // Lightweight liveness probe (for admin dashboards / monitoring).
+    if (url.pathname === "/health") {
+      return new Response(JSON.stringify({
+        ok: true,
+        protocolVersion: PROTOCOL_VERSION,
+        index: { lastBuiltAt: indexer.lastCompletedAt, running: indexer.state === "running" },
+      }), { headers: JSON_HEADERS });
+    }
+
+    // --- Background index: status / rebuild ---------------------------------
+    if (url.pathname === "/index/status") {
+      return new Response(JSON.stringify(indexStatus(), null, 2), { headers: JSON_HEADERS });
+    }
+
+    if (url.pathname === "/index/rebuild" && req.method === "POST") {
+      const project = url.searchParams.get("project") || undefined;
+      const result = startIndexJob({ trigger: "manual", projectFilter: project });
+      return new Response(JSON.stringify(result, null, 2), {
+        status: result.started ? 202 : 409,
+        headers: JSON_HEADERS,
+      });
+    }
+
+    // Plugin-side page cache status for a project (on-demand, for the console).
+    if (url.pathname === "/index/cache-status") {
+      const projectKey = url.searchParams.get("project") || "";
+      const channel = resolveProjectChannel(projectKey);
+      if (!channel) {
+        return new Response(JSON.stringify({ error: `No live Figma plugin for project "${projectKey}"` }), { status: 404, headers: JSON_HEADERS });
+      }
+      try {
+        const status = await sendInternalCommand(channel, "get_search_cache_status", {}, 15_000);
+        return new Response(JSON.stringify(status, null, 2), { headers: JSON_HEADERS });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
+      }
+    }
+
+    // --- Keyword annotations (shared file with the MCP server) --------------
+    if (url.pathname === "/search/annotations") {
+      if (req.method === "GET") {
+        return new Response(JSON.stringify({ annotations: loadSearchAnnotations() }, null, 2), { headers: JSON_HEADERS });
+      }
+      if (req.method === "POST") {
+        try {
+          const body: any = await req.json();
+          const keyword = String(body?.keyword || "").trim();
+          const projectKey = String(body?.projectKey || "").trim();
+          const nodeId = String(body?.nodeId || "").trim();
+          if (!keyword || !projectKey || !nodeId) {
+            return new Response(JSON.stringify({ error: "keyword, projectKey and nodeId are required" }), { status: 400, headers: JSON_HEADERS });
+          }
+          // Best-effort node name lookup via the live plugin (optional).
+          let nodeName = String(body?.nodeName || "");
+          if (!nodeName) {
+            const channel = resolveProjectChannel(projectKey);
+            if (channel) {
+              try {
+                const info = await sendInternalCommand(channel, "get_node_info", { nodeId, fields: ["id"], maxDepth: 0 }, 15_000);
+                nodeName = String(info?.name ?? "");
+              } catch {}
+            }
+          }
+          const annotation = upsertSearchAnnotation({ keyword, projectKey, nodeId, nodeName, note: body?.note ? String(body.note) : undefined });
+          return new Response(JSON.stringify({ saved: true, annotation }, null, 2), { headers: JSON_HEADERS });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 400, headers: JSON_HEADERS });
+        }
+      }
+      if (req.method === "DELETE") {
+        const keyword = url.searchParams.get("keyword") || "";
+        const projectKey = url.searchParams.get("projectKey") || "";
+        const nodeId = url.searchParams.get("nodeId") || undefined;
+        if (!keyword || !projectKey) {
+          return new Response(JSON.stringify({ error: "keyword and projectKey query params are required" }), { status: 400, headers: JSON_HEADERS });
+        }
+        const removed = removeSearchAnnotations({ keyword, projectKey, nodeId });
+        return new Response(JSON.stringify({ removed }, null, 2), { headers: JSON_HEADERS });
+      }
     }
 
     if (url.pathname === "/status") {
@@ -516,6 +988,7 @@ const server = Bun.serve({
           console.log(`\n📄 Channel "${channelName}" → document:`, JSON.stringify(data.document));
           pushEvent({ kind: "document", clientId: meta?.id, channel: channelName, document: data.document });
           pushChannels();
+          armAutoIndex(); // (re)arm the settle timer for the auto index build
           return;
         }
 
@@ -713,7 +1186,9 @@ const server = Bun.serve({
               timing,
               batchId: request.batchId,
             });
-            if (request.requester.readyState === WebSocket.OPEN) {
+            if (request.onInternalResult) {
+              request.onInternalResult(data.message);
+            } else if (request.requester && request.requester.readyState === WebSocket.OPEN) {
               request.requester.send(JSON.stringify({
                 type: "broadcast",
                 message: { ...data.message, timing },
@@ -747,7 +1222,7 @@ const server = Bun.serve({
           });
 
           const request = requests.get(data.id);
-          if (request && request.figma === ws && request.requester.readyState === WebSocket.OPEN) {
+          if (request && request.figma === ws && request.requester && request.requester.readyState === WebSocket.OPEN) {
             request.requester.send(JSON.stringify(data));
           }
         }
@@ -766,7 +1241,9 @@ const server = Bun.serve({
           if (figmaMeta) figmaMeta.activeRequests = Math.max(0, figmaMeta.activeRequests - 1);
           requests.delete(id);
         } else if (request.figma === ws) {
-          if (request.requester.readyState === WebSocket.OPEN) {
+          if (request.onInternalResult) {
+            request.onInternalResult({ id, error: "Figma plugin disconnected while executing the request" });
+          } else if (request.requester && request.requester.readyState === WebSocket.OPEN) {
             request.requester.send(JSON.stringify({
               type: "broadcast",
               channel: request.channel,

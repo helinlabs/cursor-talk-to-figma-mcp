@@ -30,11 +30,148 @@ var import_types = require("@modelcontextprotocol/sdk/types.js");
 var import_zod = require("zod");
 var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
+var fs3 = __toESM(require("fs"), 1);
+var path3 = __toESM(require("path"), 1);
+var os3 = __toESM(require("os"), 1);
+var import_http = require("http");
+
+// src/shared/annotations-store.ts
 var fs = __toESM(require("fs"), 1);
 var path = __toESM(require("path"), 1);
 var os = __toESM(require("os"), 1);
-var import_http = require("http");
-var PROTOCOL_VERSION = "2.0.0";
+var ANNOTATIONS_FILE = path.join(
+  os.homedir(),
+  ".talk-to-figma",
+  "index",
+  "annotations.json"
+);
+function normalizeKeywordKey(keyword) {
+  return keyword.toLowerCase().replace(/\s+/g, "");
+}
+function loadSearchAnnotations() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(ANNOTATIONS_FILE, "utf8"));
+    if (Array.isArray(raw?.annotations)) {
+      return raw.annotations.filter(
+        (a) => a && typeof a.keywordKey === "string" && typeof a.projectKey === "string" && typeof a.nodeId === "string"
+      );
+    }
+  } catch (error) {
+  }
+  return [];
+}
+function saveSearchAnnotations(annotations) {
+  const dir = path.dirname(ANNOTATIONS_FILE);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.annotations.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify({ annotations }, null, 2));
+  fs.renameSync(tmp, ANNOTATIONS_FILE);
+}
+function upsertSearchAnnotation(input) {
+  const annotations = loadSearchAnnotations();
+  const keywordKey = normalizeKeywordKey(input.keyword);
+  const annotation = {
+    keyword: input.keyword,
+    keywordKey,
+    projectKey: input.projectKey,
+    nodeId: input.nodeId,
+    nodeName: input.nodeName,
+    ...input.note ? { note: input.note } : {},
+    addedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const idx = annotations.findIndex(
+    (a) => a.keywordKey === keywordKey && a.projectKey === input.projectKey && a.nodeId === input.nodeId
+  );
+  if (idx !== -1) annotations[idx] = annotation;
+  else annotations.push(annotation);
+  saveSearchAnnotations(annotations);
+  return annotation;
+}
+function removeSearchAnnotations(input) {
+  const annotations = loadSearchAnnotations();
+  const keywordKey = normalizeKeywordKey(input.keyword);
+  const kept = annotations.filter(
+    (a) => !(a.keywordKey === keywordKey && a.projectKey === input.projectKey && (!input.nodeId || a.nodeId === input.nodeId))
+  );
+  const removed = annotations.length - kept.length;
+  if (removed > 0) saveSearchAnnotations(kept);
+  return removed;
+}
+function findAnnotationsForKeys(projectKey, keys) {
+  if (!keys.length) return [];
+  const keySet = new Set(keys);
+  return loadSearchAnnotations().filter(
+    (a) => a.projectKey === projectKey && keySet.has(a.keywordKey)
+  );
+}
+
+// src/shared/search-index.ts
+var fs2 = __toESM(require("fs"), 1);
+var path2 = __toESM(require("path"), 1);
+var os2 = __toESM(require("os"), 1);
+var INDEX_DIR = path2.join(os2.homedir(), ".talk-to-figma", "index");
+function sanitizeKey(projectKey) {
+  return projectKey.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown";
+}
+function projectIndexPath(projectKey) {
+  return path2.join(INDEX_DIR, `project-${sanitizeKey(projectKey)}.json`);
+}
+function loadProjectIndex(projectKey) {
+  try {
+    const raw = JSON.parse(fs2.readFileSync(projectIndexPath(projectKey), "utf8"));
+    if (raw && typeof raw.projectKey === "string" && Array.isArray(raw.pages)) {
+      return raw;
+    }
+  } catch (error) {
+  }
+  return null;
+}
+function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
+  const lower = haystack.toLowerCase();
+  const idx = lower.indexOf(qLower);
+  if (idx !== -1) return { start: idx, end: idx + qLower.length };
+  if (!qLowerNoSpace) return null;
+  const map = [];
+  let stripped = "";
+  for (let i = 0; i < lower.length; i++) {
+    const ch = lower[i];
+    if (!/\s/.test(ch)) {
+      stripped += ch;
+      map.push(i);
+    }
+  }
+  const sIdx = stripped.indexOf(qLowerNoSpace);
+  if (sIdx === -1) return null;
+  return { start: map[sIdx], end: map[sIdx + qLowerNoSpace.length - 1] + 1 };
+}
+function textMatchSnippet(characters, range) {
+  if (!range) return null;
+  const start = Math.max(0, range.start - 40);
+  const end = Math.min(characters.length, range.end + 40);
+  return (start > 0 ? "\u2026" : "") + characters.slice(start, end) + (end < characters.length ? "\u2026" : "");
+}
+function buildNeedles(queries) {
+  const needles = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const raw of queries) {
+    const qLower = raw.toLowerCase();
+    const qLowerNoSpace = qLower.replace(/\s+/g, "");
+    if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue;
+    seen.add(qLowerNoSpace);
+    needles.push({ raw, qLower, qLowerNoSpace });
+  }
+  return needles;
+}
+
+// src/shared/version.ts
+var PROTOCOL_VERSION = "2.2.0";
+function protocolMajor(version) {
+  if (typeof version !== "string") return null;
+  const major = Number(version.split(".")[0]);
+  return Number.isInteger(major) ? major : null;
+}
+
+// src/talk_to_figma_mcp/server.ts
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -47,6 +184,31 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
+var STATE_DIR = path3.join(os3.homedir(), ".talk-to-figma");
+var STATE_FILE = path3.join(STATE_DIR, "state.json");
+function loadPersistedSelectedProject() {
+  try {
+    const raw = JSON.parse(fs3.readFileSync(STATE_FILE, "utf8"));
+    const project = raw?.selectedProject;
+    if (project && typeof project === "object" && typeof project.name === "string") {
+      return {
+        projectKey: String(project.projectKey || ""),
+        name: project.name,
+        fileKey: project.fileKey ?? null
+      };
+    }
+  } catch (error) {
+  }
+  return null;
+}
+function persistSelectedProject(project) {
+  try {
+    fs3.mkdirSync(STATE_DIR, { recursive: true });
+    fs3.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+  } catch (error) {
+    logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 function createMcpServer(options = {}) {
   let ws = null;
   let disposed = false;
@@ -55,13 +217,13 @@ function createMcpServer(options = {}) {
   const pendingRequests = /* @__PURE__ */ new Map();
   let currentChannel = null;
   let desiredChannel = null;
-  let selectedProject = null;
+  let selectedProject = loadPersistedSelectedProject();
   let fatalProtocolError = null;
   const requesterId = process.env.TALK_TO_FIGMA_REQUESTER_ID || process.env.CODEX_THREAD_ID || process.env.CURSOR_SESSION_ID || `mcp-${process.pid}`;
   const bulkJobs = /* @__PURE__ */ new Map();
   const server = new import_mcp.McpServer({
     name: "TalkToFigmaMCP",
-    version: "1.0.0"
+    version: PROTOCOL_VERSION
   });
   const args = process.argv.slice(2);
   const serverArg = args.find((arg) => arg.startsWith("--server="));
@@ -69,7 +231,7 @@ function createMcpServer(options = {}) {
   const WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
   server.tool(
     "get_document_info",
-    "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
+    "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it. If you know (part of) the name of what you're looking for, use search_nodes first instead of inspecting pages one by one; for a one-call overview of all pages use get_file_outline.",
     {
       pageId: import_zod.z.string().optional().describe("Inspect this page instead of the current one (see list_pages for ids).")
     },
@@ -1019,14 +1181,14 @@ Failed: ${JSON.stringify(failures)}` : "")
         if (!outputPath && options.remoteExportBase) {
           const extension = fmt.toLowerCase();
           const name = `${(0, import_uuid.v4)()}.${extension}`;
-          const resolved = path.join(exportDirectory, name);
-          fs.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+          const resolved = path3.join(exportDirectory, name);
+          fs3.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
+            fs3.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
           } else {
-            fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
+            fs3.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
           }
-          const stat = fs.statSync(resolved);
+          const stat = fs3.statSync(resolved);
           const summary = {
             saved: true,
             url: `${options.remoteExportBase}/files/${name}`,
@@ -1042,14 +1204,14 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify(summary) }] };
         }
         if (outputPath) {
-          const resolved = path.resolve(outputPath);
-          fs.mkdirSync(path.dirname(resolved), { recursive: true });
+          const resolved = path3.resolve(outputPath);
+          fs3.mkdirSync(path3.dirname(resolved), { recursive: true });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs.writeFileSync(resolved, result.svg, "utf8");
+            fs3.writeFileSync(resolved, result.svg, "utf8");
           } else {
-            fs.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+            fs3.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
           }
-          const stat = fs.statSync(resolved);
+          const stat = fs3.statSync(resolved);
           const summary = {
             saved: true,
             path: resolved,
@@ -1612,7 +1774,7 @@ Example Login Screen Structure:
   );
   server.tool(
     "scan_text_nodes",
-    "Scan all text nodes in the selected Figma node",
+    "Scan all text nodes in the selected Figma node. Expensive on whole pages \u2014 if you are looking for a node by name, use search_nodes first and scan only the matched subtree.",
     {
       nodeId: import_zod.z.string().describe("ID of the node to scan"),
       chunkSize: import_zod.z.number().int().positive().optional().describe("Nodes processed per chunk (default 50). Larger = fewer round-trips/progress updates."),
@@ -2757,11 +2919,14 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       throw error;
     }
   }
-  async function relayProjects() {
+  async function relayProjectsPayload() {
     const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/projects" : `https://${serverUrl}/projects`;
     const response = await fetch(httpUrl);
     if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
-    return (await response.json()).projects || [];
+    return await response.json();
+  }
+  async function relayProjects() {
+    return (await relayProjectsPayload()).projects || [];
   }
   async function selectProject(query) {
     const projects = await relayProjects();
@@ -2775,18 +2940,23 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       );
     }
     if (matches.length !== 1) {
-      throw new Error(query ? `Project query matched ${matches.length} projects: ${matches.map((project2) => project2.name).join(", ") || "none"}` : `Choose a project first: ${live.map((project2) => project2.name).join(", ")}`);
+      throw new Error(query ? `Project query matched ${matches.length} projects: ${matches.map((project2) => project2.name).join(", ") || "none"}` : `Choose a project first \u2014 call use_figma_project with one of: ${live.map((project2) => project2.name).join(", ")}`);
     }
     const project = matches[0];
     await joinChannel(project.recommendedChannel);
     selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
+    persistSelectedProject(selectedProject);
     return project;
   }
   async function ensureProjectSelected() {
     if (currentChannel) return;
     if (selectedProject) {
-      await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
-      return;
+      try {
+        await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
+        return;
+      } catch (error) {
+        logger.warn(`Previously selected project "${selectedProject.name}" is not available: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     await selectProject();
   }
@@ -2860,7 +3030,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   }, 1e4);
   server.tool(
     "list_pages",
-    "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
+    "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info. If you know (part of) a node's name, use search_nodes first; for pages plus their top-level children in one call, use get_file_outline.",
     {},
     async () => {
       try {
@@ -2868,6 +3038,247 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "search_nodes",
+    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once \u2014 Korean/English, joined/spaced, product name vs feature name (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found \u2014 the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
+    {
+      query: import_zod.z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
+      queries: import_zod.z.array(import_zod.z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
+      match: import_zod.z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
+      types: import_zod.z.array(import_zod.z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
+      pageId: import_zod.z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
+      limit: import_zod.z.number().int().positive().optional().describe("Max matches to return (default 50, max 200)."),
+      fresh: import_zod.z.boolean().optional().describe("Skip the relay-built disk index and search the live file page by page (slower). Use when the index may be stale for what you are looking for.")
+    },
+    async ({ query, queries, match, types, pageId, limit, fresh }) => {
+      try {
+        const PER_PAGE_TIMEOUT_MS = 3e4;
+        const mode = match === "name" || match === "text" ? match : "both";
+        const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+        const allQueries = [
+          ...typeof query === "string" ? [query] : [],
+          ...Array.isArray(queries) ? queries.filter((q) => typeof q === "string") : []
+        ].filter((q) => q.trim().length > 0);
+        if (!allQueries.length) {
+          return { content: [{ type: "text", text: "Error searching nodes: provide `query` and/or `queries`" }] };
+        }
+        await ensureProjectSelected();
+        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const annotationMatches = findAnnotationsForKeys(
+          projectKey,
+          allQueries.map(normalizeKeywordKey)
+        ).map((a) => ({
+          id: a.nodeId,
+          name: a.nodeName,
+          matchedBy: "annotation",
+          matchedQuery: a.keyword,
+          ...a.note ? { note: a.note } : {},
+          addedAt: a.addedAt
+        }));
+        if (!fresh && !pageId) {
+          const projectIndex = loadProjectIndex(projectKey);
+          if (projectIndex && projectIndex.pages.length > 0) {
+            const needles = buildNeedles(allQueries);
+            const typeSet = Array.isArray(types) && types.length > 0 ? new Set(types) : null;
+            const matches2 = [];
+            let totalMatches2 = 0;
+            let truncated2 = false;
+            for (const page of projectIndex.pages) {
+              const nameFound = [];
+              const textFound = [];
+              for (const entry of page.entries) {
+                let matched = false;
+                if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
+                  for (const needle of needles) {
+                    if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
+                      nameFound.push({ entry, matchedQuery: needle.raw });
+                      matched = true;
+                      break;
+                    }
+                  }
+                }
+                if (!matched && mode !== "name" && entry.characters !== null) {
+                  for (const needle of needles) {
+                    const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace);
+                    if (range) {
+                      textFound.push({ entry, matchedQuery: needle.raw, range });
+                      break;
+                    }
+                  }
+                }
+              }
+              totalMatches2 += nameFound.length + textFound.length;
+              for (const found of nameFound) {
+                if (matches2.length >= max) {
+                  truncated2 = true;
+                  break;
+                }
+                matches2.push({
+                  id: found.entry.id,
+                  name: found.entry.name,
+                  type: found.entry.type,
+                  pageId: page.pageId,
+                  pageName: page.pageName,
+                  path: found.entry.path,
+                  matchedBy: "name",
+                  matchedQuery: found.matchedQuery
+                });
+              }
+              if (!truncated2) {
+                for (const found of textFound) {
+                  if (matches2.length >= max) {
+                    truncated2 = true;
+                    break;
+                  }
+                  matches2.push({
+                    id: found.entry.id,
+                    name: found.entry.name,
+                    type: found.entry.type,
+                    pageId: page.pageId,
+                    pageName: page.pageName,
+                    path: found.entry.path,
+                    matchedBy: "text",
+                    matchedQuery: found.matchedQuery,
+                    matchedText: textMatchSnippet(found.entry.characters, found.range)
+                  });
+                }
+              }
+            }
+            const result2 = {
+              queries: allQueries,
+              match: mode,
+              source: "index",
+              indexedAt: projectIndex.builtAt ?? projectIndex.updatedAt,
+              totalMatches: totalMatches2,
+              truncated: truncated2,
+              totalScannedPages: projectIndex.pages.length,
+              totalPages: projectIndex.pages.length,
+              matches: [...annotationMatches, ...matches2]
+            };
+            if (truncated2) {
+              result2.note = `Only the first ${max} matches are returned (totalMatches counts all index hits). The result came from the disk index built at ${new Date(result2.indexedAt).toISOString()}; pass fresh: true to search the live file instead.`;
+            }
+            return { content: [{ type: "text", text: JSON.stringify(result2) }] };
+          }
+        }
+        let pageOrder;
+        if (pageId) {
+          pageOrder = [{ id: pageId, name: "" }];
+        } else {
+          const pageList = await sendCommandToFigma(
+            "list_pages",
+            { withChildCounts: false },
+            PER_PAGE_TIMEOUT_MS
+          );
+          const pages = pageList?.pages || [];
+          const currentId = pageList?.currentPageId;
+          pageOrder = [
+            ...pages.filter((p) => p.id === currentId),
+            ...pages.filter((p) => p.id !== currentId)
+          ];
+        }
+        const matches = [];
+        const unreadablePages = [];
+        let totalMatches = 0;
+        let totalScannedPages = 0;
+        let truncated = false;
+        for (const page of pageOrder) {
+          const remaining = max - matches.length;
+          if (remaining <= 0) {
+            truncated = true;
+            break;
+          }
+          totalScannedPages++;
+          try {
+            const pageResult = await sendCommandToFigma(
+              "search_nodes",
+              { queries: allQueries, match: mode, types, pageId: page.id, limit: remaining },
+              PER_PAGE_TIMEOUT_MS
+            );
+            totalMatches += pageResult?.totalMatches || 0;
+            if (Array.isArray(pageResult?.matches)) matches.push(...pageResult.matches);
+            if (pageResult?.truncated) truncated = true;
+          } catch (error) {
+            unreadablePages.push({
+              id: page.id,
+              name: page.name,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+        }
+        const result = {
+          queries: allQueries,
+          match: mode,
+          source: "live",
+          totalMatches,
+          truncated,
+          totalScannedPages,
+          totalPages: pageOrder.length,
+          matches: [...annotationMatches, ...matches]
+        };
+        if (truncated) {
+          result.note = `Stopped after ${totalScannedPages}/${pageOrder.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
+        }
+        if (unreadablePages.length) result.unreadablePages = unreadablePages;
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "add_search_annotation",
+    "Register a learned keyword\u2192node link for the CURRENT project so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. The node's existence is verified and its name stored. Same keyword+node updates in place.",
+    {
+      keyword: import_zod.z.string().describe("The search keyword this node should be found under (the term the search failed on). Original spelling is kept; matching is case- and whitespace-insensitive."),
+      nodeId: import_zod.z.string().describe("The confirmed node id the keyword should resolve to."),
+      note: import_zod.z.string().optional().describe("Optional context for future readers (why this node, source of the confirmation).")
+    },
+    async ({ keyword, nodeId, note }) => {
+      try {
+        if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+        const info = await sendCommandToFigma("get_node_info", { nodeId, fields: ["id"], maxDepth: 0 });
+        const nodeName = String(info?.name ?? "");
+        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const annotation = upsertSearchAnnotation({ keyword: keyword.trim(), projectKey, nodeId, nodeName, note });
+        return { content: [{ type: "text", text: JSON.stringify({ saved: true, annotation }) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error adding search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "remove_search_annotation",
+    "Remove learned keyword\u2192node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG \u2014 remove it so searches stop surfacing it. Omit nodeId to remove every annotation stored under the keyword.",
+    {
+      keyword: import_zod.z.string().describe("The keyword whose annotation(s) to remove (case- and whitespace-insensitive)."),
+      nodeId: import_zod.z.string().optional().describe("Remove only the annotation pointing at this node; omit to remove ALL annotations for the keyword.")
+    },
+    async ({ keyword, nodeId }) => {
+      try {
+        if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+        await ensureProjectSelected();
+        const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+        const removed = removeSearchAnnotations({ keyword: keyword.trim(), projectKey, nodeId });
+        return { content: [{ type: "text", text: JSON.stringify({ removed }) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "get_file_outline",
+    "Get an outline of the ENTIRE file in one call: every page with its top-level children (id, name, type). Replaces calling get_document_info once per page. Children are capped at 200 per page (marked truncated). NOTE: this loads every page in the file, which can take tens of seconds on large files the first time. If you are looking for something by name, prefer search_nodes.",
+    {},
+    async () => {
+      try {
+        const result = await sendCommandToFigma("get_file_outline", {}, 12e4);
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error getting file outline: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
@@ -3026,13 +3437,55 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   }
   server.tool(
     "list_figma_projects",
-    "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients.",
+    "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients. The response starts with a versions summary ({mcp, relay}); use get_versions for the full per-plugin version picture.",
     {},
     async () => {
       try {
-        return { content: [{ type: "text", text: JSON.stringify({ current: selectedProject, projects: await relayProjects() }, null, 2) }] };
+        const payload = await relayProjectsPayload();
+        return { content: [{ type: "text", text: JSON.stringify({
+          versions: { mcp: PROTOCOL_VERSION, relay: payload.protocolVersion ?? null },
+          current: selectedProject,
+          projects: payload.projects || []
+        }, null, 2) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error listing Figma projects: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "get_versions",
+    "Report the protocol versions of every talk-to-figma surface: this MCP server, the relay, and each connected Figma plugin (per project/channel), plus whether any MAJOR versions mismatch. Use this first when behavior seems inconsistent between surfaces \u2014 a mismatch means one of them is running stale code.",
+    {},
+    async () => {
+      try {
+        const mcp = PROTOCOL_VERSION;
+        let relay = null;
+        let relayError;
+        const plugins = [];
+        try {
+          const payload = await relayProjectsPayload();
+          relay = payload.protocolVersion ?? null;
+          for (const project of payload.projects || []) {
+            for (const connection of project.connections || []) {
+              for (const client of connection.clients || []) {
+                if (client.role === "figma") {
+                  plugins.push({ project: project.name, channel: connection.channel, protocolVersion: client.protocolVersion ?? null });
+                }
+              }
+            }
+          }
+        } catch (error) {
+          relayError = error instanceof Error ? error.message : String(error);
+        }
+        const majors = new Set(
+          [mcp, relay, ...plugins.map((p) => p.protocolVersion)].map((v) => protocolMajor(v)).filter((m) => m !== null)
+        );
+        const result = { mcp, relay, plugins, mismatch: majors.size > 1 };
+        if (relayError) result.relayError = relayError;
+        if (result.mismatch) result.note = "MAJOR versions differ between surfaces \u2014 update/rebuild the stale one(s) and reconnect (the relay refuses mismatched clients at handshake, so a listed mismatch usually means a surface has not reconnected since an update).";
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error getting versions: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
@@ -3229,19 +3682,19 @@ var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
 var httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 var httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
-var exportDirectory = process.env.FIGMA_EXPORT_DIR || path.join(os.homedir(), ".macfleet", "figma-exports");
+var exportDirectory = process.env.FIGMA_EXPORT_DIR || path3.join(os3.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
 var exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0 ? configuredExportTTLHours : 24;
 var exportTTL = exportTTLHours * 60 * 60 * 1e3;
 var exportNamePattern = /^[0-9a-f-]{36}\.(png|jpg|svg|pdf)$/;
 function cleanupExports() {
-  if (!fs.existsSync(exportDirectory)) return;
+  if (!fs3.existsSync(exportDirectory)) return;
   const cutoff = Date.now() - exportTTL;
-  for (const name of fs.readdirSync(exportDirectory)) {
+  for (const name of fs3.readdirSync(exportDirectory)) {
     if (!exportNamePattern.test(name)) continue;
-    const file = path.join(exportDirectory, name);
+    const file = path3.join(exportDirectory, name);
     try {
-      if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
+      if (fs3.statSync(file).mtimeMs < cutoff) fs3.unlinkSync(file);
     } catch (error) {
       logger.warn(`Could not clean export ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -3260,11 +3713,11 @@ function serveExport(req, res, pathname) {
     res.writeHead(404).end("not found");
     return true;
   }
-  const file = path.join(exportDirectory, name);
+  const file = path3.join(exportDirectory, name);
   try {
-    const stat = fs.statSync(file);
+    const stat = fs3.statSync(file);
     if (!stat.isFile() || Date.now() - stat.mtimeMs > exportTTL) {
-      if (stat.isFile()) fs.unlinkSync(file);
+      if (stat.isFile()) fs3.unlinkSync(file);
       res.writeHead(404).end("not found");
       return true;
     }
@@ -3274,7 +3727,7 @@ function serveExport(req, res, pathname) {
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff"
     });
-    fs.createReadStream(file).pipe(res);
+    fs3.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
   }
@@ -3295,7 +3748,7 @@ async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
   }
-  fs.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+  fs3.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
   cleanupExports();
   const cleanupTimer = setInterval(cleanupExports, Math.min(exportTTL, 60 * 60 * 1e3));
   cleanupTimer.unref();

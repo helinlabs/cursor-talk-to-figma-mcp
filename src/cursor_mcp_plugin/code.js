@@ -175,13 +175,21 @@ async function handleCommand(command, params) {
     case "get_selection":
       return await getSelection();
     case "list_pages":
-      return await listPages();
+      return await listPages(params);
     case "set_current_page":
       return await setCurrentPage(params);
     case "get_node_by_key":
       return await getNodeByKey(params);
     case "diagnose_pages":
       return await diagnosePages(params);
+    case "search_nodes":
+      return await searchNodes(params);
+    case "dump_page_index":
+      return await dumpPageIndex(params);
+    case "get_search_cache_status":
+      return await getSearchCacheStatus();
+    case "get_file_outline":
+      return await getFileOutline();
     case "get_node_info":
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
@@ -771,7 +779,17 @@ async function getDocumentInfo(params) {
 }
 
 // List all pages in the file (enables discovery of non-open pages).
-async function listPages() {
+// Pass { withChildCounts: false } to skip loadAllPagesAsync (which loads every
+// page and is the expensive part on large files) when only ids/names are needed
+// — e.g. the server-side search_nodes page loop.
+async function listPages(params) {
+  const withChildCounts = !params || params.withChildCounts !== false;
+  if (!withChildCounts) {
+    return {
+      currentPageId: figma.currentPage.id,
+      pages: figma.root.children.map((p) => ({ id: p.id, name: p.name })),
+    };
+  }
   await figma.loadAllPagesAsync();
   return {
     currentPageId: figma.currentPage.id,
@@ -785,6 +803,331 @@ async function listPages() {
         entry.childCount = p.children.length;
       } catch (e) {
         entry.childCount = null;
+        entry.childrenReadable = false;
+      }
+      return entry;
+    }),
+  };
+}
+
+// Build a "Page > Section > ... > Parent" path string for a node (parents only,
+// node itself excluded) so a match can be located without extra round-trips.
+function nodePathString(node, page) {
+  const parts = [];
+  let cur = node.parent;
+  while (cur && cur.type !== "PAGE" && cur.type !== "DOCUMENT") {
+    parts.unshift(cur.name);
+    cur = cur.parent;
+  }
+  parts.unshift(page.name);
+  return parts.join(" > ");
+}
+
+// Find where a query matches inside `haystack`, case-insensitively, either as
+// a plain substring or with ALL whitespace stripped from both sides — so
+// "gym chat" matches a "GymChat" layer and vice versa. Returns a
+// {start, end} range in the ORIGINAL string, or null.
+function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
+  const lower = haystack.toLowerCase();
+  const idx = lower.indexOf(qLower);
+  if (idx !== -1) return { start: idx, end: idx + qLower.length };
+  if (!qLowerNoSpace) return null;
+  // Whitespace-stripped comparison, mapping stripped indices back to originals.
+  const map = [];
+  let stripped = "";
+  for (let i = 0; i < lower.length; i++) {
+    const ch = lower[i];
+    if (!/\s/.test(ch)) {
+      stripped += ch;
+      map.push(i);
+    }
+  }
+  const sIdx = stripped.indexOf(qLowerNoSpace);
+  if (sIdx === -1) return null;
+  return {
+    start: map[sIdx],
+    end: map[sIdx + qLowerNoSpace.length - 1] + 1,
+  };
+}
+
+// Snippet of the matched TEXT characters: up to 40 chars of context on each
+// side of the {start, end} match range.
+function textMatchSnippet(characters, range) {
+  if (!range) return null;
+  const start = Math.max(0, range.start - 40);
+  const end = Math.min(characters.length, range.end + 40);
+  return (
+    (start > 0 ? "…" : "") +
+    characters.slice(start, end) +
+    (end < characters.length ? "…" : "")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Per-page search index cache.
+//
+// Loading + walking a page is the dominant search cost (0.7–2s warm, 4–11s
+// cold per page, measured on a large production file). We therefore index a
+// page once — {id, name, type, characters (TEXT only), path} for every node —
+// and answer subsequent searches from the index in milliseconds.
+//
+// Invalidation: after indexing a page we subscribe to that page's "nodechange"
+// event (available per-page in dynamic-page mode, no loadAllPagesAsync needed)
+// and drop only that page's index on any change. If subscribing fails we do
+// NOT cache the page, so a stale index can never be served.
+// Memory is bounded: a few hundred KB per page at worst.
+// ---------------------------------------------------------------------------
+const pageSearchIndexCache = new Map(); // pageId -> { entries: [...] }
+const pageSearchIndexWatched = new Set(); // pageIds with an active nodechange handler
+
+function watchPageForIndexInvalidation(page) {
+  if (pageSearchIndexWatched.has(page.id)) return true;
+  try {
+    const pageId = page.id;
+    page.on("nodechange", () => {
+      pageSearchIndexCache.delete(pageId);
+    });
+    pageSearchIndexWatched.add(pageId);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Walk every node of a (loaded) page once and record what search needs.
+// Can throw on pages containing a node type this plugin API can't classify
+// (see diagnose_pages) — the caller lets that propagate.
+function buildPageSearchIndex(page) {
+  const entries = [];
+  page.findAll((n) => {
+    entries.push({
+      id: n.id,
+      name: n.name,
+      type: n.type,
+      characters:
+        n.type === "TEXT" && typeof n.characters === "string"
+          ? n.characters
+          : null,
+      path: nodePathString(n, page),
+    });
+    return false; // collect nothing; we only use the traversal
+  });
+  return { entries: entries, builtAt: Date.now() };
+}
+
+// Return the page's search index, building (load + walk) it on a cache miss.
+// Only caches when nodechange-based invalidation could be installed, so a
+// stale index is never served.
+async function getOrBuildPageSearchIndex(page) {
+  const cached = pageSearchIndexCache.get(page.id);
+  if (cached) return { index: cached, fromCache: true };
+  await page.loadAsync(); // dynamic-page documentAccess: load before findAll
+  const prevSkip = figma.skipInvisibleInstanceChildren;
+  figma.skipInvisibleInstanceChildren = true; // big speedup on instance-heavy files
+  let index;
+  try {
+    index = buildPageSearchIndex(page);
+  } finally {
+    figma.skipInvisibleInstanceChildren = prevSkip;
+  }
+  if (watchPageForIndexInvalidation(page)) {
+    pageSearchIndexCache.set(page.id, index);
+  }
+  return { index: index, fromCache: false };
+}
+
+// Search ONE page for nodes matching the query (case-insensitive) by NAME
+// and/or by TEXT content (a TEXT node's characters, i.e. the UI copy on
+// screen). The whole-file loop lives in the MCP server, which calls this once
+// per page — so a single command never has to load every page (120s-timeout
+// risk on 25-page files) and the relay can interleave other clients' commands
+// between pages instead of being blocked for the entire file walk.
+async function searchNodes(params) {
+  const { query, queries, types, pageId, limit, match } = params || {};
+  // Accept a single `query` and/or multiple `queries` (variant spellings of
+  // the same concept, e.g. 짐챗 / GymChat / Gym Chat). OR-matched.
+  const rawQueries = [];
+  if (typeof query === "string") rawQueries.push(query);
+  if (Array.isArray(queries)) {
+    for (const item of queries) {
+      if (typeof item === "string") rawQueries.push(item);
+    }
+  }
+  // Precompute per-query lowercase and whitespace-stripped-lowercase needles.
+  const needles = [];
+  const seen = new Set();
+  for (const raw of rawQueries) {
+    const qLower = raw.toLowerCase();
+    const qLowerNoSpace = qLower.replace(/\s+/g, "");
+    if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue; // skip empty/dupes
+    seen.add(qLowerNoSpace);
+    needles.push({ raw: raw, qLower: qLower, qLowerNoSpace: qLowerNoSpace });
+  }
+  if (!needles.length) {
+    throw new Error("Missing query/queries parameter");
+  }
+  if (!pageId) {
+    throw new Error(
+      "Missing pageId parameter (search_nodes searches one page per command; the MCP server iterates pages)"
+    );
+  }
+  const mode = match === "name" || match === "text" ? match : "both";
+  const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+  const page = await figma.getNodeByIdAsync(pageId);
+  if (!page || page.type !== "PAGE") {
+    throw new Error(`Page not found with ID: ${pageId}`);
+  }
+
+  const built = await getOrBuildPageSearchIndex(page);
+  const index = built.index;
+  const fromCache = built.fromCache;
+
+  const typeSet =
+    Array.isArray(types) && types.length > 0 ? new Set(types) : null;
+  // Collected separately so name matches sort before text matches.
+  // Each hit records which query variant matched (first winner in given order).
+  const nameFound = [];
+  const textFound = [];
+  for (const entry of index.entries) {
+    let matched = false;
+    if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
+      for (const needle of needles) {
+        if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
+          nameFound.push({ entry: entry, matchedQuery: needle.raw });
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched && mode !== "name" && entry.characters !== null) {
+      for (const needle of needles) {
+        const range = findNormalizedMatch(
+          entry.characters,
+          needle.qLower,
+          needle.qLowerNoSpace
+        );
+        if (range) {
+          textFound.push({ entry: entry, matchedQuery: needle.raw, range: range });
+          break;
+        }
+      }
+    }
+  }
+
+  const matches = [];
+  let truncated = false;
+  for (const found of nameFound) {
+    if (matches.length >= max) {
+      truncated = true;
+      break;
+    }
+    matches.push({
+      id: found.entry.id,
+      name: found.entry.name,
+      type: found.entry.type,
+      pageId: page.id,
+      pageName: page.name,
+      path: found.entry.path,
+      matchedBy: "name",
+      matchedQuery: found.matchedQuery,
+    });
+  }
+  if (!truncated) {
+    for (const found of textFound) {
+      if (matches.length >= max) {
+        truncated = true;
+        break;
+      }
+      matches.push({
+        id: found.entry.id,
+        name: found.entry.name,
+        type: found.entry.type,
+        pageId: page.id,
+        pageName: page.name,
+        path: found.entry.path,
+        matchedBy: "text",
+        matchedQuery: found.matchedQuery,
+        matchedText: textMatchSnippet(found.entry.characters, found.range),
+      });
+    }
+  }
+
+  return {
+    pageId: page.id,
+    pageName: page.name,
+    totalMatches: nameFound.length + textFound.length,
+    truncated: truncated,
+    fromCache: fromCache,
+    matches: matches,
+  };
+}
+
+// Dump ONE page's full search index ({id,name,type,characters,path} per node)
+// so the relay's incremental indexer can persist a disk index page by page.
+// Reuses (and warms) the same per-page cache as search_nodes.
+async function dumpPageIndex(params) {
+  const { pageId } = params || {};
+  if (!pageId) throw new Error("Missing pageId parameter");
+  const page = await figma.getNodeByIdAsync(pageId);
+  if (!page || page.type !== "PAGE") {
+    throw new Error(`Page not found with ID: ${pageId}`);
+  }
+  const built = await getOrBuildPageSearchIndex(page);
+  return {
+    pageId: page.id,
+    pageName: page.name,
+    nodeCount: built.index.entries.length,
+    builtAt: built.index.builtAt,
+    fromCache: built.fromCache,
+    entries: built.index.entries,
+  };
+}
+
+// Report the in-plugin page index cache: which pages are cached, how many
+// nodes each holds, and when each was built. Cheap (no page loads).
+async function getSearchCacheStatus() {
+  return {
+    currentPageId: figma.currentPage.id,
+    pages: figma.root.children.map((p) => {
+      const index = pageSearchIndexCache.get(p.id);
+      return {
+        pageId: p.id,
+        name: p.name,
+        cached: !!index,
+        nodeCount: index ? index.entries.length : null,
+        builtAt: index ? index.builtAt : null,
+      };
+    }),
+  };
+}
+
+// One-call outline of the whole file: every page plus its top-level children
+// (id/name/type only) — replaces N get_document_info calls (one per page).
+async function getFileOutline() {
+  await figma.loadAllPagesAsync();
+  const MAX_CHILDREN_PER_PAGE = 200;
+  return {
+    currentPageId: figma.currentPage.id,
+    pageCount: figma.root.children.length,
+    pages: figma.root.children.map((p) => {
+      const entry = { id: p.id, name: p.name };
+      try {
+        entry.childCount = p.children.length;
+        const slice =
+          entry.childCount > MAX_CHILDREN_PER_PAGE
+            ? p.children.slice(0, MAX_CHILDREN_PER_PAGE)
+            : p.children;
+        entry.children = slice.map((c) => ({
+          id: c.id,
+          name: c.name,
+          type: c.type,
+        }));
+        if (entry.childCount > MAX_CHILDREN_PER_PAGE) entry.truncated = true;
+      } catch (e) {
+        // Page with a node type this plugin API can't classify (see diagnose_pages).
+        entry.childCount = null;
+        entry.children = [];
         entry.childrenReadable = false;
       }
       return entry;

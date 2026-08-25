@@ -11,8 +11,21 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http";
+import {
+  type SearchAnnotation,
+  normalizeKeywordKey,
+  upsertSearchAnnotation,
+  removeSearchAnnotations,
+  findAnnotationsForKeys,
+} from "../shared/annotations-store";
+import {
+  loadProjectIndex,
+  buildNeedles,
+  findNormalizedMatch,
+  textMatchSnippet,
+} from "../shared/search-index";
 
-const PROTOCOL_VERSION = "2.0.0";
+import { PROTOCOL_VERSION, protocolMajor } from "../shared/version";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -73,6 +86,41 @@ type McpServerOptions = {
   remoteExportBase?: string;
 };
 
+// ---------------------------------------------------------------------------
+// Persisted state (survives MCP server restarts, e.g. client reconnects).
+// ---------------------------------------------------------------------------
+type SelectedProject = { projectKey: string; name: string; fileKey?: string | null };
+
+const STATE_DIR = path.join(os.homedir(), ".talk-to-figma");
+const STATE_FILE = path.join(STATE_DIR, "state.json");
+
+function loadPersistedSelectedProject(): SelectedProject | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const project = raw?.selectedProject;
+    if (project && typeof project === "object" && typeof project.name === "string") {
+      return {
+        projectKey: String(project.projectKey || ""),
+        name: project.name,
+        fileKey: project.fileKey ?? null,
+      };
+    }
+  } catch (error) {
+    // Missing/corrupt state file is fine — start unselected.
+  }
+  return null;
+}
+
+function persistSelectedProject(project: SelectedProject | null): void {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+  } catch (error) {
+    // Persistence is best-effort; never fail a command over it.
+    logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function createMcpServer(options: McpServerOptions = {}) {
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
@@ -91,7 +139,7 @@ const pendingRequests = new Map<string, {
 // Track which channel each client is in
 let currentChannel: string | null = null;
 let desiredChannel: string | null = null;
-let selectedProject: { projectKey: string; name: string; fileKey?: string | null } | null = null;
+let selectedProject: SelectedProject | null = loadPersistedSelectedProject();
 let fatalProtocolError: string | null = null;
 const requesterId =
   process.env.TALK_TO_FIGMA_REQUESTER_ID ||
@@ -122,7 +170,7 @@ const bulkJobs = new Map<string, BulkJob>();
 // Create MCP server
 const server = new McpServer({
   name: "TalkToFigmaMCP",
-  version: "1.0.0",
+  version: PROTOCOL_VERSION,
 });
 
 // Add command line argument parsing
@@ -134,7 +182,7 @@ const WS_URL = serverUrl === 'localhost' ? `ws://${serverUrl}` : `wss://${server
 // Document Info Tool
 server.tool(
   "get_document_info",
-  "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it.",
+  "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it. If you know (part of) the name of what you're looking for, use search_nodes first instead of inspecting pages one by one; for a one-call overview of all pages use get_file_outline.",
   {
     pageId: z.string().optional().describe("Inspect this page instead of the current one (see list_pages for ids)."),
   },
@@ -1949,7 +1997,7 @@ server.prompt(
 // Text Node Scanning Tool
 server.tool(
   "scan_text_nodes",
-  "Scan all text nodes in the selected Figma node",
+  "Scan all text nodes in the selected Figma node. Expensive on whole pages — if you are looking for a node by name, use search_nodes first and scan only the matched subtree.",
   {
     nodeId: z.string().describe("ID of the node to scan"),
     chunkSize: z.number().int().positive().optional().describe("Nodes processed per chunk (default 50). Larger = fewer round-trips/progress updates."),
@@ -3130,7 +3178,9 @@ type FigmaCommand =
   | "diagnose_pages"
   | "get_design_system_info"
   | "get_nodes_design_info"
-  | "scan_design_usage";
+  | "scan_design_usage"
+  | "search_nodes"
+  | "get_file_outline";
 
 type CommandParams = {
   get_document_info: Record<string, never>;
@@ -3506,11 +3556,15 @@ async function joinChannel(channelName: string): Promise<void> {
 }
 
 // Function to send commands to Figma
-async function relayProjects(): Promise<any[]> {
+async function relayProjectsPayload(): Promise<any> {
   const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/projects" : `https://${serverUrl}/projects`;
   const response = await fetch(httpUrl);
   if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
-  return ((await response.json()) as any).projects || [];
+  return (await response.json()) as any;
+}
+
+async function relayProjects(): Promise<any[]> {
+  return (await relayProjectsPayload()).projects || [];
 }
 
 async function selectProject(query?: string): Promise<any> {
@@ -3527,19 +3581,26 @@ async function selectProject(query?: string): Promise<any> {
   if (matches.length !== 1) {
     throw new Error(query
       ? `Project query matched ${matches.length} projects: ${matches.map((project: any) => project.name).join(", ") || "none"}`
-      : `Choose a project first: ${live.map((project: any) => project.name).join(", ")}`);
+      : `Choose a project first — call use_figma_project with one of: ${live.map((project: any) => project.name).join(", ")}`);
   }
   const project = matches[0];
   await joinChannel(project.recommendedChannel);
   selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
+  persistSelectedProject(selectedProject);
   return project;
 }
 
 async function ensureProjectSelected(): Promise<void> {
   if (currentChannel) return;
   if (selectedProject) {
-    await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
-    return;
+    try {
+      await selectProject(selectedProject.fileKey || selectedProject.projectKey || selectedProject.name);
+      return;
+    } catch (error) {
+      // The previously selected (possibly persisted) project is no longer
+      // live — fall through and auto-select if exactly one live project exists.
+      logger.warn(`Previously selected project "${selectedProject.name}" is not available: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   await selectProject();
 }
@@ -3635,7 +3696,7 @@ heartbeatTimer = setInterval(() => {
 
 server.tool(
   "list_pages",
-  "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info.",
+  "List all pages in the file (id, name, childCount) and the current page id. Use this to discover non-open pages, then set_current_page or pass pageId to get_document_info. If you know (part of) a node's name, use search_nodes first; for pages plus their top-level children in one call, use get_file_outline.",
   {},
   async () => {
     try {
@@ -3643,6 +3704,268 @@ server.tool(
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "search_nodes",
+  "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) — by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something — use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once — Korean/English, joined/spaced, product name vs feature name (e.g. ['짐챗','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found — the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
+  {
+    query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
+    queries: z.array(z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['짐챗','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
+    match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
+    types: z.array(z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
+    pageId: z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
+    limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200)."),
+    fresh: z.boolean().optional().describe("Skip the relay-built disk index and search the live file page by page (slower). Use when the index may be stale for what you are looking for."),
+  },
+  async ({ query, queries, match, types, pageId, limit, fresh }: any) => {
+    try {
+      // The plugin-side command searches ONE page per call; the file-wide loop
+      // lives here. That keeps every single command well under its timeout
+      // (cold page load measured at <=11s, so 30s/page is ample) and lets the
+      // relay interleave other clients' commands between pages instead of the
+      // plugin channel being monopolized for the whole file walk.
+      const PER_PAGE_TIMEOUT_MS = 30000;
+      const mode = match === "name" || match === "text" ? match : "both";
+      const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+      const allQueries: string[] = [
+        ...(typeof query === "string" ? [query] : []),
+        ...(Array.isArray(queries) ? queries.filter((q: any) => typeof q === "string") : []),
+      ].filter((q) => q.trim().length > 0);
+      if (!allQueries.length) {
+        return { content: [{ type: "text", text: "Error searching nodes: provide `query` and/or `queries`" }] };
+      }
+
+      // Learned keyword annotations for this project go on top of the results
+      // (matchedBy: "annotation"), independent of `limit`. Ensure a project is
+      // selected first so the lookup is scoped correctly.
+      await ensureProjectSelected();
+      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const annotationMatches = findAnnotationsForKeys(
+        projectKey,
+        allQueries.map(normalizeKeywordKey)
+      ).map((a: SearchAnnotation) => ({
+        id: a.nodeId,
+        name: a.nodeName,
+        matchedBy: "annotation",
+        matchedQuery: a.keyword,
+        ...(a.note ? { note: a.note } : {}),
+        addedAt: a.addedAt,
+      }));
+
+      // Index-first: if the relay's incremental indexer has persisted a disk
+      // index for this project (shared path on the same machine), answer from
+      // it in-process — no plugin round-trips at all. `fresh: true` or a
+      // pageId restriction falls back to the live page loop.
+      if (!fresh && !pageId) {
+        const projectIndex = loadProjectIndex(projectKey);
+        if (projectIndex && projectIndex.pages.length > 0) {
+          const needles = buildNeedles(allQueries);
+          const typeSet = Array.isArray(types) && types.length > 0 ? new Set(types) : null;
+          const matches: any[] = [];
+          let totalMatches = 0;
+          let truncated = false;
+          for (const page of projectIndex.pages) {
+            const nameFound: any[] = [];
+            const textFound: any[] = [];
+            for (const entry of page.entries) {
+              let matched = false;
+              if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
+                for (const needle of needles) {
+                  if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
+                    nameFound.push({ entry, matchedQuery: needle.raw });
+                    matched = true;
+                    break;
+                  }
+                }
+              }
+              if (!matched && mode !== "name" && entry.characters !== null) {
+                for (const needle of needles) {
+                  const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace);
+                  if (range) {
+                    textFound.push({ entry, matchedQuery: needle.raw, range });
+                    break;
+                  }
+                }
+              }
+            }
+            totalMatches += nameFound.length + textFound.length;
+            for (const found of nameFound) {
+              if (matches.length >= max) { truncated = true; break; }
+              matches.push({
+                id: found.entry.id,
+                name: found.entry.name,
+                type: found.entry.type,
+                pageId: page.pageId,
+                pageName: page.pageName,
+                path: found.entry.path,
+                matchedBy: "name",
+                matchedQuery: found.matchedQuery,
+              });
+            }
+            if (!truncated) {
+              for (const found of textFound) {
+                if (matches.length >= max) { truncated = true; break; }
+                matches.push({
+                  id: found.entry.id,
+                  name: found.entry.name,
+                  type: found.entry.type,
+                  pageId: page.pageId,
+                  pageName: page.pageName,
+                  path: found.entry.path,
+                  matchedBy: "text",
+                  matchedQuery: found.matchedQuery,
+                  matchedText: textMatchSnippet(found.entry.characters as string, found.range),
+                });
+              }
+            }
+          }
+          const result: any = {
+            queries: allQueries,
+            match: mode,
+            source: "index",
+            indexedAt: projectIndex.builtAt ?? projectIndex.updatedAt,
+            totalMatches,
+            truncated,
+            totalScannedPages: projectIndex.pages.length,
+            totalPages: projectIndex.pages.length,
+            matches: [...annotationMatches, ...matches],
+          };
+          if (truncated) {
+            result.note = `Only the first ${max} matches are returned (totalMatches counts all index hits). The result came from the disk index built at ${new Date(result.indexedAt).toISOString()}; pass fresh: true to search the live file instead.`;
+          }
+          return { content: [{ type: "text", text: JSON.stringify(result) }] };
+        }
+      }
+
+      let pageOrder: Array<{ id: string; name: string }>;
+      if (pageId) {
+        pageOrder = [{ id: pageId, name: "" }];
+      } else {
+        // Lightweight page listing: ids/names only, no loadAllPagesAsync.
+        const pageList = (await sendCommandToFigma(
+          "list_pages",
+          { withChildCounts: false },
+          PER_PAGE_TIMEOUT_MS
+        )) as any;
+        const pages: Array<{ id: string; name: string }> = pageList?.pages || [];
+        const currentId = pageList?.currentPageId;
+        // Current page first (most likely target, already loaded), then file order.
+        pageOrder = [
+          ...pages.filter((p) => p.id === currentId),
+          ...pages.filter((p) => p.id !== currentId),
+        ];
+      }
+
+      const matches: any[] = [];
+      const unreadablePages: Array<{ id: string; name: string; error?: string }> = [];
+      let totalMatches = 0;
+      let totalScannedPages = 0;
+      let truncated = false;
+      for (const page of pageOrder) {
+        const remaining = max - matches.length;
+        if (remaining <= 0) {
+          truncated = true;
+          break;
+        }
+        totalScannedPages++;
+        try {
+          const pageResult = (await sendCommandToFigma(
+            "search_nodes",
+            { queries: allQueries, match: mode, types, pageId: page.id, limit: remaining },
+            PER_PAGE_TIMEOUT_MS
+          )) as any;
+          totalMatches += pageResult?.totalMatches || 0;
+          if (Array.isArray(pageResult?.matches)) matches.push(...pageResult.matches);
+          if (pageResult?.truncated) truncated = true;
+        } catch (error) {
+          // A page containing an unclassifiable node type (see diagnose_pages)
+          // or a per-page timeout should not fail the whole search.
+          unreadablePages.push({
+            id: page.id,
+            name: page.name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const result: any = {
+        queries: allQueries,
+        match: mode,
+        source: "live",
+        totalMatches,
+        truncated,
+        totalScannedPages,
+        totalPages: pageOrder.length,
+        matches: [...annotationMatches, ...matches],
+      };
+      if (truncated) {
+        // totalMatches only covers scanned pages when we stopped early.
+        result.note = `Stopped after ${totalScannedPages}/${pageOrder.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
+      }
+      if (unreadablePages.length) result.unreadablePages = unreadablePages;
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "add_search_annotation",
+  "Register a learned keyword→node link for the CURRENT project so future search_nodes calls surface it on top (matchedBy: 'annotation'). Use this when a search did NOT find the right node but you identified it through another route (a task description, a Slack link, an operator's answer): register the keyword the search failed on, pointing at the confirmed node. The keyword is normalized (lowercase, whitespace removed) for lookup; the original spelling is preserved. The node's existence is verified and its name stored. Same keyword+node updates in place.",
+  {
+    keyword: z.string().describe("The search keyword this node should be found under (the term the search failed on). Original spelling is kept; matching is case- and whitespace-insensitive."),
+    nodeId: z.string().describe("The confirmed node id the keyword should resolve to."),
+    note: z.string().optional().describe("Optional context for future readers (why this node, source of the confirmation)."),
+  },
+  async ({ keyword, nodeId, note }: any) => {
+    try {
+      if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+      // Verify the node exists in the current project and capture its name.
+      const info = (await sendCommandToFigma("get_node_info", { nodeId, fields: ["id"], maxDepth: 0 })) as any;
+      const nodeName = String(info?.name ?? "");
+      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const annotation = upsertSearchAnnotation({ keyword: keyword.trim(), projectKey, nodeId, nodeName, note });
+      return { content: [{ type: "text", text: JSON.stringify({ saved: true, annotation }) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error adding search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "remove_search_annotation",
+  "Remove learned keyword→node annotation(s) for the CURRENT project. Use this when the operator (or any feedback) says an annotated answer was WRONG — remove it so searches stop surfacing it. Omit nodeId to remove every annotation stored under the keyword.",
+  {
+    keyword: z.string().describe("The keyword whose annotation(s) to remove (case- and whitespace-insensitive)."),
+    nodeId: z.string().optional().describe("Remove only the annotation pointing at this node; omit to remove ALL annotations for the keyword."),
+  },
+  async ({ keyword, nodeId }: any) => {
+    try {
+      if (!keyword || !keyword.trim()) throw new Error("keyword must be non-empty");
+      await ensureProjectSelected();
+      const projectKey = selectedProject?.projectKey || selectedProject?.fileKey || selectedProject?.name || "";
+      const removed = removeSearchAnnotations({ keyword: keyword.trim(), projectKey, nodeId });
+      return { content: [{ type: "text", text: JSON.stringify({ removed }) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_file_outline",
+  "Get an outline of the ENTIRE file in one call: every page with its top-level children (id, name, type). Replaces calling get_document_info once per page. Children are capped at 200 per page (marked truncated). NOTE: this loads every page in the file, which can take tens of seconds on large files the first time. If you are looking for something by name, prefer search_nodes.",
+  {},
+  async () => {
+    try {
+      const result = await sendCommandToFigma("get_file_outline", {}, 120000);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting file outline: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
@@ -3817,13 +4140,58 @@ async function runBulk(job: BulkJob): Promise<void> {
 
 server.tool(
   "list_figma_projects",
-  "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients.",
+  "List connected Figma projects and every live plugin connection. The relay identifies a project by Figma file key, marks the most recently announced connection as representative, and recommends the least-loaded connection for new MCP clients. The response starts with a versions summary ({mcp, relay}); use get_versions for the full per-plugin version picture.",
   {},
   async () => {
     try {
-      return { content: [{ type: "text", text: JSON.stringify({ current: selectedProject, projects: await relayProjects() }, null, 2) }] };
+      const payload = await relayProjectsPayload();
+      return { content: [{ type: "text", text: JSON.stringify({
+        versions: { mcp: PROTOCOL_VERSION, relay: payload.protocolVersion ?? null },
+        current: selectedProject,
+        projects: payload.projects || [],
+      }, null, 2) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error listing Figma projects: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_versions",
+  "Report the protocol versions of every talk-to-figma surface: this MCP server, the relay, and each connected Figma plugin (per project/channel), plus whether any MAJOR versions mismatch. Use this first when behavior seems inconsistent between surfaces — a mismatch means one of them is running stale code.",
+  {},
+  async () => {
+    try {
+      const mcp = PROTOCOL_VERSION;
+      let relay: string | null = null;
+      let relayError: string | undefined;
+      const plugins: Array<{ project: string; channel: string; protocolVersion: string | null }> = [];
+      try {
+        const payload = await relayProjectsPayload();
+        relay = payload.protocolVersion ?? null;
+        for (const project of payload.projects || []) {
+          for (const connection of project.connections || []) {
+            for (const client of connection.clients || []) {
+              if (client.role === "figma") {
+                plugins.push({ project: project.name, channel: connection.channel, protocolVersion: client.protocolVersion ?? null });
+              }
+            }
+          }
+        }
+      } catch (error) {
+        relayError = error instanceof Error ? error.message : String(error);
+      }
+      const majors = new Set(
+        [mcp, relay, ...plugins.map((p) => p.protocolVersion)]
+          .map((v) => protocolMajor(v))
+          .filter((m): m is number => m !== null)
+      );
+      const result: any = { mcp, relay, plugins, mismatch: majors.size > 1 };
+      if (relayError) result.relayError = relayError;
+      if (result.mismatch) result.note = "MAJOR versions differ between surfaces — update/rebuild the stale one(s) and reconnect (the relay refuses mismatched clients at handshake, so a listed mismatch usually means a surface has not reconnected since an update).";
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting versions: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
