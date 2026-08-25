@@ -56,8 +56,11 @@ async function sendProgressUpdate(
   return update;
 }
 
-// Show UI
-figma.showUI(__html__, { width: 350, height: 600 });
+// Show UI — compact by default (a slim status bar); the UI asks for a resize
+// when the operator expands it (see the "resize" message below).
+var UI_COMPACT_SIZE = { width: 240, height: 120 };
+var UI_EXPANDED_SIZE = { width: 350, height: 600 };
+figma.showUI(__html__, UI_COMPACT_SIZE);
 
 // Initialize anonymous analytics client_id (persisted via clientStorage)
 (async () => {
@@ -123,6 +126,14 @@ figma.ui.onmessage = async (msg) => {
     case "preview-control":
       setLivePreviewEnabled(!!msg.enabled);
       break;
+    case "resize": {
+      // Compact bar <-> full UI toggle. Clamp to Figma's supported minimums
+      // (width >= 70, height >= 0) and a sane maximum.
+      var w = Math.max(70, Math.min(1200, Number(msg.width) || UI_COMPACT_SIZE.width));
+      var h = Math.max(40, Math.min(1200, Number(msg.height) || UI_COMPACT_SIZE.height));
+      figma.ui.resize(w, h);
+      break;
+    }
   }
 };
 

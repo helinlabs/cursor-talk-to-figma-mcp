@@ -353,10 +353,71 @@
         word-break: break-word;
         color: #cfcfcf;
       }
+
+      /* Compact bar: default view — connection dot, channel, version, toggle.
+         The full UI below is hidden until the operator expands the plugin
+         (which also resizes the window via the main thread). */
+      #compact-bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        min-width: 0;
+      }
+      #compact-bar .c-dot {
+        flex: 0 0 auto;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #ff6b6b;
+      }
+      #compact-bar .c-dot.on { background: #4ade80; box-shadow: 0 0 5px #4ade80; }
+      #compact-bar .c-chan {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: ui-monospace, Menlo, monospace;
+        color: #e0e0e0;
+      }
+      #compact-bar .c-ver {
+        flex: 0 0 auto;
+        color: #888;
+        font-size: 10px;
+        font-family: ui-monospace, Menlo, monospace;
+      }
+      #compact-bar button {
+        flex: 0 0 auto;
+        margin: 0;
+        padding: 2px 8px;
+        font-size: 11px;
+      }
+      #compact-status {
+        margin-top: 6px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #999;
+        max-height: 66px;
+        overflow: hidden;
+      }
+      body.collapsed { padding: 10px 12px; overflow: hidden; }
+      body.collapsed .container { display: none; }
+      body:not(.collapsed) #compact-bar { margin-bottom: 12px; }
+      body:not(.collapsed) #compact-status { display: none; }
     </style>
   </head>
 
-  <body>
+  <body class="collapsed">
+    <!-- Compact bar (default): status dot · channel · version · expand toggle -->
+    <div id="compact-bar">
+      <span class="c-dot" id="compact-dot"></span>
+      <span class="c-chan" id="compact-channel">not connected</span>
+      <span class="c-ver" id="compact-ver">v?</span>
+      <button class="secondary" id="btn-compact-connect" title="Connect / disconnect">⟳</button>
+      <button class="secondary" id="btn-expand" title="Expand / collapse the full UI">▸</button>
+    </div>
+    <div id="compact-status"></div>
+
     <div class="container">
       <div class="header">
         <div class="header-text">
@@ -515,7 +576,7 @@
       // the relay's hello/join handshake rejects a MAJOR mismatch with a
       // protocol_mismatch message, and the header badge below shows both
       // versions with a warning. Bump this together with src/shared/version.ts.
-      const PROTOCOL_VERSION = "2.5.3";
+      const PROTOCOL_VERSION = "2.5.4";
       const BINARY_MAGIC = [0x54, 0x54, 0x46, 0x42]; // "TTFB"
 
       function encodeBinaryFrame(envelope, payload) {
@@ -821,6 +882,24 @@
         connectionStatus.className = `status ${
           isConnected ? "connected" : "disconnected"
         }`;
+
+        // Mirror onto the compact bar (the default, minimized view).
+        const compactDot = document.getElementById("compact-dot");
+        const compactChannel = document.getElementById("compact-channel");
+        const compactStatus = document.getElementById("compact-status");
+        const compactConnect = document.getElementById("btn-compact-connect");
+        if (compactDot) compactDot.className = "c-dot" + (isConnected ? " on" : "");
+        if (compactChannel) {
+          compactChannel.textContent = isConnected
+            ? "#" + (state.channel || "?")
+            : "not connected";
+          compactChannel.title = compactChannel.textContent + " · " + state.serverUrl;
+        }
+        if (compactStatus) compactStatus.textContent = connectionStatus.textContent;
+        if (compactConnect) {
+          compactConnect.textContent = isConnected ? "✕" : "⟳";
+          compactConnect.title = isConnected ? "Disconnect" : "Connect";
+        }
 
         // Update connect button text and style based on connection state
         connectButton.textContent = isConnected ? "Disconnect" : "Connect";
@@ -1335,6 +1414,36 @@
           connectToServer(serverAddress);
         }
       });
+
+      // --- Compact bar <-> full UI toggle -------------------------------------
+      // Default is the collapsed compact bar (window opened at the compact
+      // size by code.js). Expanding shows the full UI and asks the plugin
+      // main thread to resize the window; collapsing shrinks it back.
+      const UI_COMPACT_SIZE = { width: 240, height: 120 };
+      const UI_EXPANDED_SIZE = { width: 350, height: 600 };
+      let uiExpanded = false;
+      function applyUiMode() {
+        document.body.classList.toggle("collapsed", !uiExpanded);
+        const btn = document.getElementById("btn-expand");
+        if (btn) {
+          btn.textContent = uiExpanded ? "▾" : "▸";
+          btn.title = uiExpanded ? "Collapse to the compact bar" : "Expand the full UI";
+        }
+        parent.postMessage({ pluginMessage: {
+          type: "resize",
+          ...(uiExpanded ? UI_EXPANDED_SIZE : UI_COMPACT_SIZE),
+        } }, "*");
+      }
+      document.getElementById("btn-expand").addEventListener("click", () => {
+        uiExpanded = !uiExpanded;
+        applyUiMode();
+      });
+      // Compact connect/disconnect reuses the main button's toggle logic.
+      document.getElementById("btn-compact-connect").addEventListener("click", () => {
+        connectButton.click();
+      });
+      document.getElementById("compact-ver").textContent = "v" + PROTOCOL_VERSION;
+      applyUiMode();
 
       // Function to update progress UI
       function updateProgressUI(progressData) {

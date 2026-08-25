@@ -10,7 +10,7 @@
 // is caught at connect time rather than causing silent breakage. When bumping
 // the version here, bump ui.html's PROTOCOL_VERSION too.
 // ---------------------------------------------------------------------------
-export const PROTOCOL_VERSION = "2.5.3";
+export const PROTOCOL_VERSION = "2.5.4";
 
 export function protocolMajor(version: unknown): number | null {
   if (typeof version !== "string") return null;

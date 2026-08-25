@@ -156,6 +156,45 @@
       .nav-main .preview-stage { flex: 1; max-height: none; }
       .nav-main .preview-stage img { max-height: none; }
       .nav-placeholder { flex: 1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
+      /* Navigator rows: the WHOLE row is the click target (except the caret),
+         so the cursor and the clickable area always match. */
+      .nav-card { cursor: default; padding: 6px 8px; }
+      .nav-card:hover { border-color: var(--border); }
+      .nav-card.current-page { border-color: var(--green); }
+      .nav-row {
+        display: flex; gap: 6px; align-items: center; min-width: 0;
+        padding: 4px 6px; border-radius: 5px; cursor: pointer;
+        border-left: 2px solid transparent;
+      }
+      .nav-row:hover { background: #2a303c; }
+      .nav-row:active { background: #313a49; }
+      .nav-row.pending { opacity: .55; }
+      .nav-row.selected { background: #22304a; border-left-color: var(--blue); }
+      .nav-row .nav-name {
+        flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        font-weight: 600; color: var(--blue);
+      }
+      .nav-row .nav-name.current { color: var(--green); }
+      .nav-row.section-row { margin-left: 14px; }
+      .nav-row.section-row .nav-name { font-weight: 400; color: var(--text); }
+      .nav-caret {
+        width: auto; background: transparent; border: 1px solid var(--border);
+        color: var(--muted); border-radius: 10px; padding: 1px 8px;
+        font-size: 10px; font-weight: 500; cursor: pointer;
+      }
+      .nav-caret:hover { color: var(--text); border-color: var(--blue); background: transparent; }
+      .sel-badge { color: var(--blue); border-color: var(--blue); }
+      .nav-row-error {
+        margin: 2px 6px 4px 22px; font-size: 11px; color: var(--red);
+        font-family: ui-monospace, Menlo, monospace; word-break: break-word;
+      }
+      .nav-selected-banner {
+        display: flex; gap: 6px; align-items: center;
+        background: #22304a; border: 1px solid var(--blue); border-radius: 6px;
+        padding: 4px 8px; margin-bottom: 6px; font-size: 11px;
+      }
+      .nav-selected-banner code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .nav-selected-banner button { padding: 0 6px; font-size: 11px; }
       @media (max-width: 900px) {
         .nav-split { flex-direction: column; }
         .nav-side {
@@ -246,7 +285,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.5.3";
+      const PROTOCOL_VERSION = "2.5.4";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -1013,6 +1052,9 @@
         const [searchResults, setSearchResults] = useState(null);
         const [busy, setBusy] = useState(false);
         const [error, setError] = useState(null);
+        const [pendingId, setPendingId] = useState(null); // row with an in-flight goto/focus
+        const [selected, setSelected] = useState(null);   // {id, name, pageName, kind:"page"|"node"} — persists until cleared
+        const [rowErrors, setRowErrors] = useState({});   // row id -> inline error
 
         // Selectable projects: live ones first, then disk-index-only ones
         // (pages/search still work offline; goto/focus answer 503).
@@ -1054,11 +1096,15 @@
 
         useEffect(() => {
           setPages(null); setSearchResults(null); setExpanded({});
+          setSelected(null); setRowErrors({}); setPendingId(null);
           if (effectiveKey) loadPages(effectiveKey);
         }, [effectiveKey, loadPages]);
 
-        const post = async (endpoint, body) => {
-          setBusy(true); setError(null);
+        // Row-scoped POST: pressed/loading state on the clicked row, inline
+        // error on that row on failure, true on success.
+        const post = async (endpoint, body, rowId) => {
+          setPendingId(rowId);
+          setRowErrors((s) => ({ ...s, [rowId]: null }));
           try {
             const r = await fetch(relayApiUrl(endpoint), {
               method: "POST",
@@ -1066,13 +1112,26 @@
               body: JSON.stringify({ project: effectiveKey, ...body }),
             });
             const data = await r.json();
-            if (!r.ok) setError(data.error || `HTTP ${r.status}`);
-          } catch (e) { setError(String(e)); }
-          finally { setBusy(false); }
+            if (!r.ok) { setRowErrors((s) => ({ ...s, [rowId]: data.error || `HTTP ${r.status}` })); return false; }
+            return true;
+          } catch (e) {
+            setRowErrors((s) => ({ ...s, [rowId]: String(e) }));
+            return false;
+          } finally { setPendingId(null); }
         };
 
-        const goto = (pageId) => post("navigator/goto", { pageId });
-        const focus = (nodeId) => post("navigator/focus", { nodeId });
+        const goto = async (pageId, pageName) => {
+          if (pendingId) return;
+          if (await post("navigator/goto", { pageId }, pageId)) {
+            setSelected({ id: pageId, name: pageName, pageName, kind: "page" });
+          }
+        };
+        const focus = async (nodeId, name, pageName) => {
+          if (pendingId) return;
+          if (await post("navigator/focus", { nodeId }, nodeId)) {
+            setSelected({ id: nodeId, name, pageName: pageName || null, kind: "node" });
+          }
+        };
 
         const search = async () => {
           const q = query.trim();
@@ -1107,16 +1166,35 @@
               <button className="ghost" style={rowBtn} disabled={busy || !query.trim() || !effectiveKey} onClick={search}>Search</button>
               {searchResults && <button className="ghost" style={rowBtn} onClick={() => { setSearchResults(null); setQuery(""); }}>✕</button>}
             </div>
+            {selected && (
+              <div className="nav-selected-banner">
+                <code title={selected.id}>
+                  Selected: {selected.name || selected.id}
+                  {selected.kind === "node" && selected.pageName ? ` (${selected.pageName})` : ""}
+                </code>
+                <button className="ghost" title="Clear selection" onClick={() => setSelected(null)}>✕</button>
+              </div>
+            )}
             {error && <div className="member"><code>⚠ {error}</code></div>}
             {searchResults && (
-              <div className="chan-card">
+              <div className="chan-card nav-card">
                 <div className="chan-head"><span className="doc-name">Results</span><span className="badge">{searchResults.length}</span></div>
                 {!searchResults.length && <div className="member muted">No matches in the disk index.</div>}
                 {searchResults.map((n) => (
-                  <div className="member" key={n.id} style={{ cursor: "pointer" }} onClick={() => focus(n.id)} title={`Focus ${n.id} (select + scroll)`}>
-                    <span className="badge">{n.annotation ? "★" : (n.type || "?")}</span>
-                    <code>{n.name || "(unnamed)"}{n.pageName ? ` · ${n.pageName}` : ""}</code>
-                  </div>
+                  <React.Fragment key={n.id}>
+                    <div
+                      className={"nav-row section-row" + (selected && selected.id === n.id ? " selected" : "") + (pendingId === n.id ? " pending" : "")}
+                      style={{ marginLeft: 0 }}
+                      onClick={() => focus(n.id, n.name || n.id, n.pageName)}
+                      title={`Focus ${n.id} (select + scroll)`}
+                    >
+                      <span className="badge">{n.annotation ? "★" : (n.type || "?")}</span>
+                      <span className="nav-name">{n.name || "(unnamed)"}{n.pageName ? ` · ${n.pageName}` : ""}</span>
+                      {pendingId === n.id && <span className="badge">…</span>}
+                      {pendingId !== n.id && selected && selected.id === n.id && <span className="badge sel-badge">selected</span>}
+                    </div>
+                    {rowErrors[n.id] && <div className="nav-row-error">⚠ {rowErrors[n.id]}</div>}
+                  </React.Fragment>
                 ))}
               </div>
             )}
@@ -1126,30 +1204,42 @@
               const isCurrent = currentPageName && p.pageName === currentPageName;
               const open = !!expanded[p.pageId];
               return (
-                <div className="chan-card" key={p.pageId} style={isCurrent ? { borderColor: "var(--green)" } : undefined}>
-                  <div className="chan-head">
-                    <span
-                      style={{ cursor: "pointer", flex: 1, color: isCurrent ? "var(--green)" : "var(--blue)", fontWeight: 600 }}
-                      onClick={() => goto(p.pageId)}
-                      title="Go to this page in Figma"
-                    >
+                <div className={"chan-card nav-card" + (isCurrent ? " current-page" : "")} key={p.pageId}>
+                  {/* The WHOLE row triggers goto; only the caret button toggles sections. */}
+                  <div
+                    className={"nav-row page-row" + (selected && selected.id === p.pageId ? " selected" : "") + (pendingId === p.pageId ? " pending" : "")}
+                    onClick={() => goto(p.pageId, p.pageName || p.pageId)}
+                    title="Go to this page in Figma"
+                  >
+                    <span className={"nav-name" + (isCurrent ? " current" : "")}>
                       {isCurrent ? "● " : ""}{p.pageName || p.pageId}
                     </span>
-                    <span
-                      className="badge"
-                      style={{ cursor: "pointer" }}
-                      onClick={() => setExpanded((s) => ({ ...s, [p.pageId]: !open }))}
+                    {pendingId === p.pageId && <span className="badge">…</span>}
+                    {pendingId !== p.pageId && selected && selected.id === p.pageId && <span className="badge sel-badge">selected</span>}
+                    <button
+                      className="nav-caret"
+                      onClick={(e) => { e.stopPropagation(); setExpanded((s) => ({ ...s, [p.pageId]: !open })); }}
                       title="Show sections"
                     >
                       {open ? "▾" : "▸"} {p.sections.length}
-                    </span>
+                    </button>
                   </div>
-                  {open && !p.sections.length && <div className="member muted">No sections on this page.</div>}
+                  {rowErrors[p.pageId] && <div className="nav-row-error">⚠ {rowErrors[p.pageId]}</div>}
+                  {open && !p.sections.length && <div className="member muted" style={{ marginLeft: 14 }}>No sections on this page.</div>}
                   {open && p.sections.map((s) => (
-                    <div className="member" key={s.id} style={{ cursor: "pointer" }} onClick={() => focus(s.id)} title={`Focus ${s.id} (select + scroll)`}>
-                      <span className="badge">{s.type}</span>
-                      <code>{s.name || "(unnamed)"}</code>
-                    </div>
+                    <React.Fragment key={s.id}>
+                      <div
+                        className={"nav-row section-row" + (selected && selected.id === s.id ? " selected" : "") + (pendingId === s.id ? " pending" : "")}
+                        onClick={() => focus(s.id, s.name || s.id, p.pageName)}
+                        title={`Focus ${s.id} (select + scroll)`}
+                      >
+                        <span className="badge">{s.type}</span>
+                        <span className="nav-name">{s.name || "(unnamed)"}</span>
+                        {pendingId === s.id && <span className="badge">…</span>}
+                        {pendingId !== s.id && selected && selected.id === s.id && <span className="badge sel-badge">selected</span>}
+                      </div>
+                      {rowErrors[s.id] && <div className="nav-row-error">⚠ {rowErrors[s.id]}</div>}
+                    </React.Fragment>
                   ))}
                 </div>
               );
@@ -1811,7 +1901,7 @@
         const [paused, setPaused] = useState(false);
         const [version, setVersion] = useState(0); // bumped on flush to trigger renders
         const [filter, setFilter] = useState("");  // shared: channel click sets this
-        const [view, setView] = useState("overview"); // top GNB: one feature group per screen
+        const [view, setView] = useState("navigator"); // top GNB: one feature group per screen; Navigator is the working screen, Overview is logging/status
         const [selectedProject, setSelectedProject] = useState(null);
         const [navProjectKey, setNavProjectKey] = useState(null); // Navigator tab's project
         const [preview, setPreview] = useState(null);
@@ -1933,8 +2023,8 @@
         // One feature group per screen. Overview keeps the live status +
         // event log; every other tab renders its panel full-width.
         const TABS = [
-          ["overview", "Overview"],
           ["navigator", "Navigator"],
+          ["overview", "Overview"],
           ["index", "Index"],
           ["annotations", "Annotations"],
           ["context", "Context"],
