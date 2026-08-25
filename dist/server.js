@@ -2881,7 +2881,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "search_nodes",
-    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. Each match includes {id, name, type, pageId, pageName, path, matchedBy} (text matches also carry a matchedText snippet); name matches sort before text matches. Optionally filter by node types or restrict to one page.",
+    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. Pages are searched sequentially (current page first, then file order) and the search stops as soon as `limit` matches are found. NOTE: the FIRST search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy} (text matches also carry a matchedText snippet); name matches sort before text matches. Optionally filter by node types or restrict to one page.",
     {
       query: z.string().describe("Substring to match (case-insensitive) against node names and/or TEXT content."),
       match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
@@ -2891,7 +2891,67 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     },
     async ({ query, match, types, pageId, limit }) => {
       try {
-        const result = await sendCommandToFigma("search_nodes", { query, match, types, pageId, limit }, 12e4);
+        const PER_PAGE_TIMEOUT_MS = 3e4;
+        const mode = match === "name" || match === "text" ? match : "both";
+        const max = Math.max(1, Math.min(Number(limit) || 50, 200));
+        let pageOrder;
+        if (pageId) {
+          pageOrder = [{ id: pageId, name: "" }];
+        } else {
+          const pageList = await sendCommandToFigma(
+            "list_pages",
+            { withChildCounts: false },
+            PER_PAGE_TIMEOUT_MS
+          );
+          const pages = pageList?.pages || [];
+          const currentId = pageList?.currentPageId;
+          pageOrder = [
+            ...pages.filter((p) => p.id === currentId),
+            ...pages.filter((p) => p.id !== currentId)
+          ];
+        }
+        const matches = [];
+        const unreadablePages = [];
+        let totalMatches = 0;
+        let totalScannedPages = 0;
+        let truncated = false;
+        for (const page of pageOrder) {
+          const remaining = max - matches.length;
+          if (remaining <= 0) {
+            truncated = true;
+            break;
+          }
+          totalScannedPages++;
+          try {
+            const pageResult = await sendCommandToFigma(
+              "search_nodes",
+              { query, match: mode, types, pageId: page.id, limit: remaining },
+              PER_PAGE_TIMEOUT_MS
+            );
+            totalMatches += pageResult?.totalMatches || 0;
+            if (Array.isArray(pageResult?.matches)) matches.push(...pageResult.matches);
+            if (pageResult?.truncated) truncated = true;
+          } catch (error) {
+            unreadablePages.push({
+              id: page.id,
+              name: page.name,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+        }
+        const result = {
+          query,
+          match: mode,
+          totalMatches,
+          truncated,
+          totalScannedPages,
+          totalPages: pageOrder.length,
+          matches
+        };
+        if (truncated) {
+          result.note = `Stopped after ${totalScannedPages}/${pageOrder.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
+        }
+        if (unreadablePages.length) result.unreadablePages = unreadablePages;
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
@@ -2900,7 +2960,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "get_file_outline",
-    "Get an outline of the ENTIRE file in one call: every page with its top-level children (id, name, type). Replaces calling get_document_info once per page. Children are capped at 200 per page (marked truncated). If you are looking for something by name, prefer search_nodes.",
+    "Get an outline of the ENTIRE file in one call: every page with its top-level children (id, name, type). Replaces calling get_document_info once per page. Children are capped at 200 per page (marked truncated). NOTE: this loads every page in the file, which can take tens of seconds on large files the first time. If you are looking for something by name, prefer search_nodes.",
     {},
     async () => {
       try {

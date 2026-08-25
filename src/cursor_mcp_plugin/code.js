@@ -175,7 +175,7 @@ async function handleCommand(command, params) {
     case "get_selection":
       return await getSelection();
     case "list_pages":
-      return await listPages();
+      return await listPages(params);
     case "set_current_page":
       return await setCurrentPage(params);
     case "get_node_by_key":
@@ -775,7 +775,17 @@ async function getDocumentInfo(params) {
 }
 
 // List all pages in the file (enables discovery of non-open pages).
-async function listPages() {
+// Pass { withChildCounts: false } to skip loadAllPagesAsync (which loads every
+// page and is the expensive part on large files) when only ids/names are needed
+// — e.g. the server-side search_nodes page loop.
+async function listPages(params) {
+  const withChildCounts = !params || params.withChildCounts !== false;
+  if (!withChildCounts) {
+    return {
+      currentPageId: figma.currentPage.id,
+      pages: figma.root.children.map((p) => ({ id: p.id, name: p.name })),
+    };
+  }
   await figma.loadAllPagesAsync();
   return {
     currentPageId: figma.currentPage.id,
@@ -822,137 +832,168 @@ function textMatchSnippet(characters, q) {
   );
 }
 
-// Search the whole file (or a single page) for nodes matching the query
-// (case-insensitive) by NAME and/or by TEXT content (a TEXT node's characters,
-// i.e. the UI copy on screen), in ONE call — instead of walking pages one by
-// one with get_document_info / scan_text_nodes.
+// ---------------------------------------------------------------------------
+// Per-page search index cache.
+//
+// Loading + walking a page is the dominant search cost (0.7–2s warm, 4–11s
+// cold per page, measured on a large production file). We therefore index a
+// page once — {id, name, type, characters (TEXT only), path} for every node —
+// and answer subsequent searches from the index in milliseconds.
+//
+// Invalidation: after indexing a page we subscribe to that page's "nodechange"
+// event (available per-page in dynamic-page mode, no loadAllPagesAsync needed)
+// and drop only that page's index on any change. If subscribing fails we do
+// NOT cache the page, so a stale index can never be served.
+// Memory is bounded: a few hundred KB per page at worst.
+// ---------------------------------------------------------------------------
+const pageSearchIndexCache = new Map(); // pageId -> { entries: [...] }
+const pageSearchIndexWatched = new Set(); // pageIds with an active nodechange handler
+
+function watchPageForIndexInvalidation(page) {
+  if (pageSearchIndexWatched.has(page.id)) return true;
+  try {
+    const pageId = page.id;
+    page.on("nodechange", () => {
+      pageSearchIndexCache.delete(pageId);
+    });
+    pageSearchIndexWatched.add(pageId);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Walk every node of a (loaded) page once and record what search needs.
+// Can throw on pages containing a node type this plugin API can't classify
+// (see diagnose_pages) — the caller lets that propagate.
+function buildPageSearchIndex(page) {
+  const entries = [];
+  page.findAll((n) => {
+    entries.push({
+      id: n.id,
+      name: n.name,
+      type: n.type,
+      characters:
+        n.type === "TEXT" && typeof n.characters === "string"
+          ? n.characters
+          : null,
+      path: nodePathString(n, page),
+    });
+    return false; // collect nothing; we only use the traversal
+  });
+  return { entries };
+}
+
+// Search ONE page for nodes matching the query (case-insensitive) by NAME
+// and/or by TEXT content (a TEXT node's characters, i.e. the UI copy on
+// screen). The whole-file loop lives in the MCP server, which calls this once
+// per page — so a single command never has to load every page (120s-timeout
+// risk on 25-page files) and the relay can interleave other clients' commands
+// between pages instead of being blocked for the entire file walk.
 async function searchNodes(params) {
   const { query, types, pageId, limit, match } = params || {};
   if (!query || typeof query !== "string") {
     throw new Error("Missing query parameter");
   }
+  if (!pageId) {
+    throw new Error(
+      "Missing pageId parameter (search_nodes searches one page per command; the MCP server iterates pages)"
+    );
+  }
   const mode = match === "name" || match === "text" ? match : "both";
   const max = Math.max(1, Math.min(Number(limit) || 50, 200));
   const q = query.toLowerCase();
 
-  let pages;
-  if (pageId) {
-    const page = await figma.getNodeByIdAsync(pageId);
-    if (!page || page.type !== "PAGE") {
-      throw new Error(`Page not found with ID: ${pageId}`);
-    }
-    await page.loadAsync();
-    pages = [page];
-  } else {
-    // dynamic-page documentAccess: pages must be loaded before findAll.
-    await figma.loadAllPagesAsync();
-    pages = figma.root.children;
+  const page = await figma.getNodeByIdAsync(pageId);
+  if (!page || page.type !== "PAGE") {
+    throw new Error(`Page not found with ID: ${pageId}`);
   }
 
-  const prevSkip = figma.skipInvisibleInstanceChildren;
-  figma.skipInvisibleInstanceChildren = true; // big speedup on instance-heavy files
+  let index = pageSearchIndexCache.get(pageId);
+  let fromCache = true;
+  if (!index) {
+    fromCache = false;
+    await page.loadAsync(); // dynamic-page documentAccess: load before findAll
+    const prevSkip = figma.skipInvisibleInstanceChildren;
+    figma.skipInvisibleInstanceChildren = true; // big speedup on instance-heavy files
+    try {
+      index = buildPageSearchIndex(page);
+    } finally {
+      figma.skipInvisibleInstanceChildren = prevSkip;
+    }
+    // Only cache when invalidation is guaranteed to work.
+    if (watchPageForIndexInvalidation(page)) {
+      pageSearchIndexCache.set(pageId, index);
+    }
+  }
+
+  const typeSet =
+    Array.isArray(types) && types.length > 0 ? new Set(types) : null;
+  // Collected separately so name matches sort before text matches.
+  const nameFound = [];
+  const textFound = [];
+  for (const entry of index.entries) {
+    if (
+      mode !== "text" &&
+      (!typeSet || typeSet.has(entry.type)) &&
+      entry.name.toLowerCase().indexOf(q) !== -1
+    ) {
+      nameFound.push(entry);
+      continue;
+    }
+    if (
+      mode !== "name" &&
+      entry.characters !== null &&
+      entry.characters.toLowerCase().indexOf(q) !== -1
+    ) {
+      textFound.push(entry);
+    }
+  }
+
   const matches = [];
-  const unreadablePages = [];
-  let totalMatches = 0;
-  let totalScannedPages = 0;
   let truncated = false;
-  try {
-    const typeSet =
-      Array.isArray(types) && types.length > 0 ? new Set(types) : null;
-    for (const page of pages) {
-      totalScannedPages++;
-      // Collected separately so name matches sort before text matches per page.
-      const nameFound = [];
-      const textFound = [];
-      try {
-        if (mode === "name" && typeSet) {
-          // Fast path: indexed type search, then name filter.
-          const candidates = page.findAllWithCriteria({ types });
-          for (const n of candidates) {
-            if (n.name.toLowerCase().indexOf(q) !== -1) nameFound.push(n);
-          }
-        } else {
-          page.findAll((n) => {
-            if (
-              mode !== "text" &&
-              (!typeSet || typeSet.has(n.type)) &&
-              n.name.toLowerCase().indexOf(q) !== -1
-            ) {
-              nameFound.push(n);
-              return false;
-            }
-            if (
-              mode !== "name" &&
-              n.type === "TEXT" &&
-              typeof n.characters === "string" &&
-              n.characters.toLowerCase().indexOf(q) !== -1
-            ) {
-              textFound.push(n);
-            }
-            return false;
-          });
-        }
-      } catch (e) {
-        // A page containing an unclassifiable node type can throw; skip it
-        // (see diagnose_pages) instead of failing the whole search.
-        unreadablePages.push({ id: page.id, name: page.name });
-        continue;
-      }
-      totalMatches += nameFound.length + textFound.length;
-      for (const node of nameFound) {
-        if (matches.length >= max) {
-          truncated = true;
-          break;
-        }
-        matches.push({
-          id: node.id,
-          name: node.name,
-          type: node.type,
-          pageId: page.id,
-          pageName: page.name,
-          path: nodePathString(node, page),
-          matchedBy: "name",
-        });
-      }
-      if (!truncated) {
-        for (const node of textFound) {
-          if (matches.length >= max) {
-            truncated = true;
-            break;
-          }
-          matches.push({
-            id: node.id,
-            name: node.name,
-            type: node.type,
-            pageId: page.id,
-            pageName: page.name,
-            path: nodePathString(node, page),
-            matchedBy: "text",
-            matchedText: textMatchSnippet(node.characters, q),
-          });
-        }
-      }
-      if (truncated) break; // early stop on large files once the limit is hit
+  for (const entry of nameFound) {
+    if (matches.length >= max) {
+      truncated = true;
+      break;
     }
-  } finally {
-    figma.skipInvisibleInstanceChildren = prevSkip;
+    matches.push({
+      id: entry.id,
+      name: entry.name,
+      type: entry.type,
+      pageId: page.id,
+      pageName: page.name,
+      path: entry.path,
+      matchedBy: "name",
+    });
+  }
+  if (!truncated) {
+    for (const entry of textFound) {
+      if (matches.length >= max) {
+        truncated = true;
+        break;
+      }
+      matches.push({
+        id: entry.id,
+        name: entry.name,
+        type: entry.type,
+        pageId: page.id,
+        pageName: page.name,
+        path: entry.path,
+        matchedBy: "text",
+        matchedText: textMatchSnippet(entry.characters, q),
+      });
+    }
   }
 
-  const result = {
-    query: query,
-    match: mode,
-    totalMatches: totalMatches,
+  return {
+    pageId: page.id,
+    pageName: page.name,
+    totalMatches: nameFound.length + textFound.length,
     truncated: truncated,
-    totalScannedPages: totalScannedPages,
-    totalPages: pages.length,
+    fromCache: fromCache,
     matches: matches,
   };
-  if (truncated) {
-    // totalMatches only covers scanned pages when we stopped early.
-    result.note = `Stopped after ${totalScannedPages}/${pages.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
-  }
-  if (unreadablePages.length) result.unreadablePages = unreadablePages;
-  return result;
 }
 
 // One-call outline of the whole file: every page plus its top-level children
