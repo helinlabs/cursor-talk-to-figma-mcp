@@ -4,6 +4,8 @@ import { Server, ServerWebSocket } from "bun";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "fs";
 import { createHash, randomUUID } from "crypto";
 import * as path from "path";
+import { captureLocalFigmaWindow } from "./local-figma-capture";
+import { applyManagedExportRetention, deleteManagedExports, listManagedExports, readManagedExport, saveManagedExport } from "./managed-exports";
 import {
   loadSearchAnnotations,
   upsertSearchAnnotation,
@@ -18,6 +20,29 @@ import {
 } from "./shared/search-index";
 
 import { PROTOCOL_VERSION } from "./shared/version";
+const BINARY_MAGIC = new Uint8Array([0x54, 0x54, 0x46, 0x42]); // "TTFB"
+
+function encodeBinaryFrame(envelope: any, payload: Uint8Array): Uint8Array {
+  const header = new TextEncoder().encode(JSON.stringify(envelope));
+  const frame = new Uint8Array(8 + header.byteLength + payload.byteLength);
+  frame.set(BINARY_MAGIC, 0);
+  new DataView(frame.buffer).setUint32(4, header.byteLength, false);
+  frame.set(header, 8);
+  frame.set(payload, 8 + header.byteLength);
+  return frame;
+}
+
+function decodeBinaryFrame(raw: Uint8Array): { envelope: any; payload: Uint8Array } {
+  if (raw.byteLength < 8 || BINARY_MAGIC.some((byte, index) => raw[index] !== byte)) {
+    throw new Error("Invalid Talk-to-Figma binary frame");
+  }
+  const headerLength = new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint32(4, false);
+  if (headerLength <= 0 || 8 + headerLength > raw.byteLength) {
+    throw new Error("Invalid Talk-to-Figma binary header length");
+  }
+  const envelope = JSON.parse(new TextDecoder().decode(raw.subarray(8, 8 + headerLength)));
+  return { envelope, payload: raw.subarray(8 + headerLength) };
+}
 
 function isProtocolCompatible(version: unknown): boolean {
   if (typeof version !== "string") return false;
@@ -68,6 +93,18 @@ interface ClientMeta {
   applicationHeartbeat: boolean;
   protocolVersion?: string;
   protocolVerified: boolean;
+  deviceName?: string;
+  platform?: string;
+  address?: string;
+  observedAddress?: string;
+  connectionScope: "localhost" | "lan" | "external" | "unknown";
+  capabilities: Set<string>;
+}
+
+interface ConnectionData {
+  address?: string;
+  observedAddress?: string;
+  connectionScope: ClientMeta["connectionScope"];
 }
 
 interface RequestMeta {
@@ -92,6 +129,11 @@ const clientMeta = new Map<ServerWebSocket<any>, ClientMeta>();
 const monitors = new Set<ServerWebSocket<any>>();
 const requests = new Map<string, RequestMeta>();
 const bulkJobs = new Map<string, any>();
+type PreviewMode = "app-window" | "node-export";
+interface PreviewSubscription { channel: string; mode: PreviewMode }
+const previewSubscriptions = new Map<ServerWebSocket<any>, PreviewSubscription>();
+let localPreviewTimer: ReturnType<typeof setInterval> | null = null;
+let localPreviewBusy = false;
 
 // Ring buffer of recent events so a freshly-opened console sees history.
 // The browser console keeps a much larger buffer; this is just the backlog
@@ -115,6 +157,22 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
 const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
+
+try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
+setInterval(() => {
+  try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
+}, 60 * 60 * 1000);
+
+function connectionScope(address?: string): ClientMeta["connectionScope"] {
+  if (!address) return "unknown";
+  const value = address.trim().replace(/^::ffff:/, "").toLowerCase();
+  if (value === "localhost" || value === "127.0.0.1" || value === "::1") return "localhost";
+  if (/^10\./.test(value) || /^192\.168\./.test(value)) return "lan";
+  const match = value.match(/^172\.(\d+)\./);
+  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return "lan";
+  if (/^(fc|fd)[0-9a-f]{2}:/.test(value) || /^fe80:/.test(value)) return "lan";
+  return "external";
+}
 
 function touch(ws: ServerWebSocket<any>): void {
   const meta = clientMeta.get(ws);
@@ -158,6 +216,84 @@ function chooseFigma(channelName: string): ServerWebSocket<any> | undefined {
     })[0];
 }
 
+function previewSubscriberCount(channelName: string): number {
+  return [...previewSubscriptions.values()].filter((subscription) => subscription.channel === channelName).length;
+}
+
+function nodePreviewSubscriberCount(channelName: string): number {
+  return [...previewSubscriptions.values()].filter((subscription) =>
+    subscription.channel === channelName && subscription.mode === "node-export"
+  ).length;
+}
+
+function sendPreviewControl(channelName: string, enabled: boolean): void {
+  const figma = chooseFigma(channelName);
+  if (figma?.readyState === WebSocket.OPEN) {
+    figma.send(JSON.stringify({ type: "preview_control", channel: channelName, enabled }));
+  }
+}
+
+function sendPreviewError(channelName: string, mode: PreviewMode, error: unknown): void {
+  for (const [subscriber, subscription] of previewSubscriptions) {
+    if (subscription.channel === channelName && subscription.mode === mode && subscriber.readyState === WebSocket.OPEN) {
+      subscriber.send(JSON.stringify({ kind: "preview_error", channel: channelName, mode, error: error instanceof Error ? error.message : String(error) }));
+    }
+  }
+}
+
+async function captureLocalAppPreviews(): Promise<void> {
+  if (localPreviewBusy) return;
+  localPreviewBusy = true;
+  try {
+    const channelsToCapture = [...new Set(
+      [...previewSubscriptions.values()]
+        .filter((subscription) => subscription.mode === "app-window")
+        .map((subscription) => subscription.channel)
+    )];
+    for (const channelName of channelsToCapture) {
+      try {
+        const document = channelDocs.get(channelName);
+        const capture = await captureLocalFigmaWindow(document?.documentName, 1400);
+        const preview = {
+          source: "app-window",
+          mimeType: capture.mimeType,
+          windowName: capture.windowName,
+          pageName: document?.page,
+          width: capture.width,
+          height: capture.height,
+          byteLength: capture.bytes.byteLength,
+          capturedAt: capture.capturedAt,
+        };
+        const envelope = { kind: "preview_frame", channel: channelName, preview };
+        const frame = encodeBinaryFrame(envelope, capture.bytes);
+        for (const [subscriber, subscription] of previewSubscriptions) {
+          if (subscription.channel !== channelName || subscription.mode !== "app-window" || subscriber.readyState !== WebSocket.OPEN) continue;
+          if (clientMeta.get(subscriber)?.capabilities.has("binaryFrames")) {
+            subscriber.send(frame);
+          } else {
+            subscriber.send(JSON.stringify({ ...envelope, preview: { ...preview, imageData: capture.bytes.toString("base64") } }));
+          }
+        }
+      } catch (error) {
+        sendPreviewError(channelName, "app-window", error);
+      }
+    }
+  } finally {
+    localPreviewBusy = false;
+  }
+}
+
+function refreshLocalPreviewLoop(): void {
+  const needed = [...previewSubscriptions.values()].some((subscription) => subscription.mode === "app-window");
+  if (needed && !localPreviewTimer) {
+    void captureLocalAppPreviews();
+    localPreviewTimer = setInterval(() => void captureLocalAppPreviews(), 2000);
+  } else if (!needed && localPreviewTimer) {
+    clearInterval(localPreviewTimer);
+    localPreviewTimer = null;
+  }
+}
+
 function pruneEmptyChannels(): void {
   if (emptyChannels.size <= MAX_EMPTY) return;
   const oldestFirst = [...emptyChannels.entries()].sort((a, b) => a[1] - b[1]);
@@ -191,6 +327,28 @@ function truncate(value: unknown, max = 4000): unknown {
   return { __truncated: true, length: str.length, preview: str.slice(0, max) };
 }
 
+function sanitizeForLog(value: any, depth = 0): any {
+  if (depth > 6) return "[depth omitted]";
+  if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitizeForLog(item, depth + 1));
+  if (!value || typeof value !== "object") return value;
+  const out: Record<string, any> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (/^(imageData|imageBase64|imageBytes|data)$/i.test(key)) {
+      const bytes = ArrayBuffer.isView(child)
+        ? child.byteLength
+        : child instanceof ArrayBuffer
+          ? child.byteLength
+          : undefined;
+      out[key] = typeof child === "string"
+        ? { omitted: true, encodedCharacters: child.length }
+        : { omitted: true, ...(bytes === undefined ? {} : { bytes }) };
+    } else {
+      out[key] = sanitizeForLog(child, depth + 1);
+    }
+  }
+  return out;
+}
+
 function pushEvent(evt: any): void {
   evt.ts = evt.ts ?? Date.now();
   eventLog.push(evt);
@@ -207,7 +365,9 @@ function snapshotChannels(): any[] {
     const members: any[] = [];
     clients.forEach((c) => {
       const m = clientMeta.get(c);
-      if (m) members.push({
+      if (m) {
+        const assigned = [...requests.values()].filter((request) => request.figma === c);
+        members.push({
         id: m.id,
         role: m.role,
         connectedAt: m.connectedAt,
@@ -216,8 +376,20 @@ function snapshotChannels(): any[] {
         activeRequests: m.activeRequests,
         unstable: m.unstable,
         protocolVersion: m.protocolVersion ?? null,
+        capabilities: [...m.capabilities],
+        deviceName: m.deviceName ?? null,
+        platform: m.platform ?? null,
+        address: m.address ?? null,
+        observedAddress: m.observedAddress ?? null,
+        connectionScope: m.connectionScope,
+        runningRequests: assigned.filter((request) => request.startedAt !== undefined).length,
+        pendingRequests: assigned.filter((request) => request.startedAt === undefined).length,
       });
+      }
     });
+    const channelRequests = [...requests.values()].filter((request) => request.channel === name);
+    const runningRequests = channelRequests.filter((request) => request.startedAt !== undefined).length;
+    const pendingRequests = channelRequests.length - runningRequests;
     out.push({
       channel: name,
       count: members.length,
@@ -226,7 +398,12 @@ function snapshotChannels(): any[] {
       emptiedAt: emptyChannels.get(name) ?? null,
       document: channelDocs.get(name) ?? null,
       announcedAt: channelAnnouncedAt.get(name) ?? null,
-      queueDepth: members.reduce((sum, member) => sum + (member.activeRequests || 0), 0),
+      busy: runningRequests > 0,
+      runningRequests,
+      pendingRequests,
+      inFlightRequests: channelRequests.length,
+      queueDepth: pendingRequests,
+      previewSubscribers: previewSubscriberCount(name),
     });
   });
   return out;
@@ -249,7 +426,7 @@ function snapshotProjects(): any[] {
     const leastLoaded = [...live].sort((a, b) => {
       const ac = a.clients.filter((client: any) => client.role === "controller").length;
       const bc = b.clients.filter((client: any) => client.role === "controller").length;
-      return ac - bc || a.queueDepth - b.queueDepth || (b.announcedAt || 0) - (a.announcedAt || 0);
+      return ac - bc || a.inFlightRequests - b.inFlightRequests || (b.announcedAt || 0) - (a.announcedAt || 0);
     })[0] ?? null;
     const document = (newest || connections[0]).document;
     return {
@@ -260,7 +437,10 @@ function snapshotProjects(): any[] {
       totalConnectionCount: connections.length,
       representativeChannel: newest?.channel ?? null,
       recommendedChannel: leastLoaded?.channel ?? null,
-      busy: live.reduce((sum, connection) => sum + connection.queueDepth, 0),
+      busy: live.some((connection) => connection.busy),
+      runningRequests: live.reduce((sum, connection) => sum + connection.runningRequests, 0),
+      pendingRequests: live.reduce((sum, connection) => sum + connection.pendingRequests, 0),
+      inFlightRequests: live.reduce((sum, connection) => sum + connection.inFlightRequests, 0),
       connections,
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
@@ -654,6 +834,7 @@ scheduleDailyIndex();
 // ---------------------------------------------------------------------------
 
 function handleConnection(ws: ServerWebSocket<any>) {
+  const connection = (ws.data || {}) as ConnectionData;
   const meta: ClientMeta = {
     id: `c${++clientSeq}`,
     role: "unknown",
@@ -666,6 +847,10 @@ function handleConnection(ws: ServerWebSocket<any>) {
     unstable: false,
     applicationHeartbeat: false,
     protocolVerified: false,
+    address: connection.address,
+    observedAddress: connection.observedAddress,
+    connectionScope: connection.connectionScope || "unknown",
+    capabilities: new Set(),
   };
   clientMeta.set(ws, meta);
 
@@ -677,7 +862,7 @@ function handleConnection(ws: ServerWebSocket<any>) {
     message: "Please join a channel to start chatting",
   }));
 
-  pushEvent({ kind: "connect", clientId: meta.id });
+  pushEvent({ kind: "connect", clientId: meta.id, address: meta.address, connectionScope: meta.connectionScope });
 }
 
 const server = Bun.serve({
@@ -696,7 +881,7 @@ const server = Bun.serve({
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Figma-Export-Name, X-Figma-Export-Extension",
         },
       });
     }
@@ -704,7 +889,13 @@ const server = Bun.serve({
     // Handle WebSocket upgrade first (clients connect to the root path).
     // For plain HTTP GETs this returns false and we fall through to serving
     // the web console below.
+    const observedAddress = server.requestIP(req)?.address;
+    const forwarded = req.headers.get("cf-connecting-ip")
+      || req.headers.get("x-real-ip")
+      || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+    const address = forwarded || observedAddress;
     const success = server.upgrade(req, {
+      data: { address, observedAddress, connectionScope: connectionScope(address) } satisfies ConnectionData,
       headers: {
         "Access-Control-Allow-Origin": "*",
       },
@@ -839,6 +1030,53 @@ const server = Bun.serve({
       });
     }
 
+    if (url.pathname === "/exports" && req.method === "GET") {
+      return new Response(JSON.stringify(listManagedExports(), null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    if (url.pathname === "/exports" && req.method === "POST") {
+      try {
+        const bytes = new Uint8Array(await req.arrayBuffer());
+        if (!bytes.byteLength || bytes.byteLength > 64 * 1024 * 1024) throw new Error("Export must be between 1 byte and 64 MB");
+        const target = saveManagedExport(
+          bytes,
+          decodeURIComponent(req.headers.get("x-figma-export-name") || "figma-export"),
+          req.headers.get("x-figma-export-extension") || "png",
+        );
+        const gallery = listManagedExports();
+        const file = gallery.files.find((item) => target.endsWith(item.name));
+        return new Response(JSON.stringify({ saved: true, path: target, file }, null, 2), {
+          status: 201,
+          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), {
+          status: 400,
+          headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+    }
+
+    if (url.pathname === "/exports" && req.method === "DELETE") {
+      const daysParam = url.searchParams.get("olderThanDays");
+      const result = deleteManagedExports(daysParam === null ? undefined : Math.max(0, Number(daysParam) || 0));
+      return new Response(JSON.stringify({ ...result, gallery: listManagedExports() }, null, 2), {
+        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    if (url.pathname.startsWith("/exports/file/") && req.method === "GET") {
+      try {
+        const name = decodeURIComponent(url.pathname.slice("/exports/file/".length));
+        const file = readManagedExport(name);
+        return new Response(file.bytes, { headers: { "Content-Type": file.mimeType, "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" } });
+      } catch {
+        return new Response("Export not found", { status: 404 });
+      }
+    }
+
     // Build id of the on-disk plugin files (for the plugin UI's version badge).
     if (url.pathname === "/plugin-version") {
       return new Response(JSON.stringify({ build: pluginVersion(), protocolVersion: PROTOCOL_VERSION }), {
@@ -857,6 +1095,7 @@ const server = Bun.serve({
     });
   },
   websocket: {
+    maxPayloadLength: 64 * 1024 * 1024,
     open: handleConnection,
     pong(ws: ServerWebSocket<any>) {
       // For Figma, require the application-level heartbeat from the plugin UI.
@@ -865,7 +1104,15 @@ const server = Bun.serve({
     },
     message(ws: ServerWebSocket<any>, message: string | Buffer) {
       try {
-        const data = JSON.parse(message as string);
+        let data: any;
+        let binaryPayload: Uint8Array | undefined;
+        if (typeof message === "string") {
+          data = JSON.parse(message);
+        } else {
+          const decoded = decodeBinaryFrame(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
+          data = decoded.envelope;
+          binaryPayload = decoded.payload;
+        }
         const meta = clientMeta.get(ws);
         touch(ws);
 
@@ -883,6 +1130,9 @@ const server = Bun.serve({
             meta.requesterId = data.requesterId ? String(data.requesterId) : meta.requesterId;
             if (data.role === "controller" || data.role === "figma") meta.role = data.role;
             if (data.role === "figma") meta.applicationHeartbeat = true;
+            if (data.deviceName) meta.deviceName = String(data.deviceName).slice(0, 120);
+            if (data.platform) meta.platform = String(data.platform).slice(0, 160);
+            meta.capabilities = new Set(Array.isArray(data.capabilities) ? data.capabilities.map(String) : []);
             meta.protocolVersion = typeof data.protocolVersion === "string" ? data.protocolVersion : undefined;
             meta.protocolVerified = isProtocolCompatible(data.protocolVersion);
             if (!meta.protocolVerified) {
@@ -898,6 +1148,12 @@ const server = Bun.serve({
               ws.close(4003, "Protocol version mismatch");
               return;
             }
+            ws.send(JSON.stringify({
+              type: "system",
+              event: "hello_ack",
+              protocolVersion: PROTOCOL_VERSION,
+              capabilities: ["binaryFrames", "livePreview"],
+            }));
           }
           pushChannels();
           return;
@@ -908,6 +1164,57 @@ const server = Bun.serve({
           if (job.id) bulkJobs.set(job.id, job);
           pushEvent({ kind: "bulk", ...job });
           pushChannels();
+          return;
+        }
+
+        if (data.type === "preview_subscribe") {
+          if (!meta?.isMonitor) return;
+          const nextChannel = typeof data.channel === "string" && data.channel ? data.channel : null;
+          if (nextChannel && !channels.has(nextChannel)) return;
+          const nextMode: PreviewMode = data.mode === "node-export" ? "node-export" : "app-window";
+          const previous = previewSubscriptions.get(ws);
+          if (previous?.channel === nextChannel && previous.mode === nextMode) return;
+          if (previous) previewSubscriptions.delete(ws);
+          if (previous?.mode === "node-export" && nodePreviewSubscriberCount(previous.channel) === 0) {
+            sendPreviewControl(previous.channel, false);
+          }
+          if (nextChannel) {
+            previewSubscriptions.set(ws, { channel: nextChannel, mode: nextMode });
+            if (nextMode === "node-export") sendPreviewControl(nextChannel, true);
+          }
+          refreshLocalPreviewLoop();
+          pushChannels();
+          return;
+        }
+
+        if (data.type === "preview_frame") {
+          if (!meta || meta.role !== "figma" || meta.channel !== data.channel) return;
+          const preview = { ...(data.preview || {}) };
+          delete preview.imageData;
+          for (const [subscriber, subscription] of previewSubscriptions) {
+            if (subscription.channel !== data.channel || subscription.mode !== "node-export" || subscriber.readyState !== WebSocket.OPEN) continue;
+            const subscriberMeta = clientMeta.get(subscriber);
+            const envelope = { kind: "preview_frame", channel: subscription.channel, preview };
+            if (binaryPayload && subscriberMeta?.capabilities.has("binaryFrames")) {
+              subscriber.send(encodeBinaryFrame(envelope, binaryPayload));
+            } else if (binaryPayload) {
+              subscriber.send(JSON.stringify({
+                ...envelope,
+                preview: { ...preview, imageData: Buffer.from(binaryPayload).toString("base64") },
+              }));
+            } else if (typeof data.preview?.imageData === "string") {
+              subscriber.send(JSON.stringify({ ...envelope, preview: data.preview }));
+            }
+          }
+          return;
+        }
+
+        if (data.type === "preview_error") {
+          for (const [subscriber, subscription] of previewSubscriptions) {
+            if (subscription.channel === data.channel && subscription.mode === "node-export" && subscriber.readyState === WebSocket.OPEN) {
+              subscriber.send(JSON.stringify({ kind: "preview_error", channel: subscription.channel, mode: subscription.mode, error: data.error }));
+            }
+          }
           return;
         }
 
@@ -925,6 +1232,7 @@ const server = Bun.serve({
               waitMs: request.startedAt - request.queuedAt,
               batchId: request.batchId,
             });
+            pushChannels();
           }
           return;
         }
@@ -985,6 +1293,7 @@ const server = Bun.serve({
           channelDocs.set(channelName, data.document);
           channelAnnouncedAt.set(channelName, Date.now());
           if (meta) meta.role = "figma"; // only the plugin announces a document
+          if (nodePreviewSubscriberCount(channelName) > 0) sendPreviewControl(channelName, true);
           console.log(`\n📄 Channel "${channelName}" → document:`, JSON.stringify(data.document));
           pushEvent({ kind: "document", clientId: meta?.id, channel: channelName, document: data.document });
           pushChannels();
@@ -999,7 +1308,10 @@ const server = Bun.serve({
         } else if (data.message?.result) {
           console.log(`Response: ID: ${data.id}, Has Result: ${!!data.message.result}`);
         }
-        console.log(`Full message:`, JSON.stringify(data, null, 2));
+        console.log(`Message metadata:`, JSON.stringify({
+          ...sanitizeForLog(data),
+          ...(binaryPayload ? { binaryTransfer: { bytes: binaryPayload.byteLength } } : {}),
+        }, null, 2));
 
         if (data.type === "join") {
           if (!meta?.protocolVerified) {
@@ -1185,16 +1497,32 @@ const server = Bun.serve({
               error: data.message.error,
               timing,
               batchId: request.batchId,
+              transfer: binaryPayload ? { encoding: "binary", bytes: binaryPayload.byteLength } : undefined,
             });
             if (request.onInternalResult) {
               request.onInternalResult(data.message);
             } else if (request.requester && request.requester.readyState === WebSocket.OPEN) {
-              request.requester.send(JSON.stringify({
+              const responseEnvelope = {
                 type: "broadcast",
                 message: { ...data.message, timing },
                 sender: meta?.id ?? "figma",
                 channel: channelName,
-              }));
+              };
+              if (binaryPayload) {
+                const requesterMeta = clientMeta.get(request.requester);
+                if (requesterMeta?.capabilities.has("binaryFrames")) {
+                  request.requester.send(encodeBinaryFrame(responseEnvelope, binaryPayload));
+                } else {
+                  responseEnvelope.message.result = {
+                    ...responseEnvelope.message.result,
+                    binary: false,
+                    imageData: Buffer.from(binaryPayload).toString("base64"),
+                  };
+                  request.requester.send(JSON.stringify(responseEnvelope));
+                }
+              } else {
+                request.requester.send(JSON.stringify(responseEnvelope));
+              }
             }
             requests.delete(requestId);
             pushChannels();
@@ -1234,6 +1562,12 @@ const server = Bun.serve({
       const meta = clientMeta.get(ws);
 
       monitors.delete(ws);
+      const previewSubscription = previewSubscriptions.get(ws);
+      previewSubscriptions.delete(ws);
+      if (previewSubscription?.mode === "node-export" && nodePreviewSubscriberCount(previewSubscription.channel) === 0) {
+        sendPreviewControl(previewSubscription.channel, false);
+      }
+      refreshLocalPreviewLoop();
 
       for (const [id, request] of requests) {
         if (request.requester === ws) {
@@ -1303,6 +1637,8 @@ const server = Bun.serve({
           if (clients.size === 0) {
             emptyChannels.set(channelName, Date.now());
             pruneEmptyChannels();
+          } else if (meta?.role === "figma" && nodePreviewSubscriberCount(channelName) > 0) {
+            sendPreviewControl(channelName, true);
           }
         }
       });

@@ -130,6 +130,17 @@
         overflow: auto; padding: 10px 14px;
       }
       .detail pre { margin: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+      .preview-panel { border-bottom: 1px solid var(--border); background: #11131a; padding: 10px 14px; }
+      .preview-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+      .preview-head strong { color: var(--green); }
+      .preview-head button { margin-left: auto; }
+      .preview-stage { min-height: 120px; max-height: 420px; display: flex; align-items: center; justify-content: center; overflow: auto; background: #090a0d; border: 1px solid var(--border); border-radius: 7px; }
+      .preview-stage img { display: block; max-width: 100%; max-height: 400px; object-fit: contain; }
+      .preview-meta { color: var(--muted); font-size: 11px; margin-top: 7px; }
+      .gallery-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
+      .gallery-item { background: #11131a; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; }
+      .gallery-item img { width: 100%; height: 72px; object-fit: cover; display: block; background: #090a0d; }
+      .gallery-caption { padding: 5px; font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       /* View tabs in the top bar */
       .view-tabs { display: inline-flex; gap: 4px; margin-left: 16px; }
       .vtab {
@@ -197,21 +208,23 @@
       import { createRoot } from "react-dom/client";
       import { FixedSizeList } from "react-window";
 
-      // Reuse the page path so a reverse proxy mounted below a prefix (for example
-      // /tunnel/svc/<endpoint>/figma-relay/console) keeps the WebSocket inside the
-      // same service route. HTTPS pages must use wss: or browsers block the socket
-      // as mixed content. The relay accepts upgrades on every path, so this also
-      // preserves the local http://localhost:3055/console workflow.
-      const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname}`;
-      // Fallback only: the live value arrives with every snapshot/channels
-      // message from the relay and is kept in RELAY_PROTOCOL_VERSION below.
+      const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const wsPath = location.pathname.endsWith("/console")
+        ? location.pathname.slice(0, -"console".length)
+        : location.pathname;
+      const WS_URL = `${wsProtocol}//${location.host}${wsPath || "/"}`;
+      function relayApiUrl(endpoint) {
+        const url = new URL(WS_URL);
+        url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+        url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
+        return url.toString();
+      }
       const PROTOCOL_VERSION = "2.2.0";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
         return Number.isInteger(m) ? m : null;
       };
-      // true when a client's protocol MAJOR differs from the relay's
       const versionMismatch = (v) =>
         v != null && protoMajor(v) !== null && protoMajor(v) !== protoMajor(RELAY_PROTOCOL_VERSION);
       const RING = 5000;          // browser-side ring buffer size
@@ -220,6 +233,16 @@
 
       function genId() {
         return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      }
+
+      function decodeBinaryFrame(raw) {
+        const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+        if (bytes.length < 8 || bytes[0] !== 0x54 || bytes[1] !== 0x54 || bytes[2] !== 0x46 || bytes[3] !== 0x42) {
+          throw new Error("Invalid Talk-to-Figma binary frame");
+        }
+        const headerLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(4, false);
+        const envelope = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + headerLength)));
+        return { envelope, payload: bytes.subarray(8 + headerLength) };
       }
       function fmtTime(ts) {
         const d = new Date(ts);
@@ -579,7 +602,9 @@
             <div className="chan-head">
               <span className="chan-name">#{c.channel}</span>
               <span className="badge">
-                {active ? `${c.count} client${c.count === 1 ? "" : "s"}` : "empty"}
+                {active
+                  ? `${c.busy ? "working" : "idle"} · ${c.runningRequests || 0} running · ${c.pendingRequests || 0} pending`
+                  : "empty"}
               </span>
             </div>
             {c.document && (
@@ -601,7 +626,15 @@
             {c.clients.map((cl) => (
               <div className="member" key={cl.id}>
                 <span className={"badge " + cl.role}>{cl.role}</span>
-                <code>{cl.id}</code>
+                <code>
+                  {cl.deviceName || cl.requesterId || cl.id}
+                  {` · ${cl.connectionScope || "unknown"}`}
+                  {cl.address ? ` · ${cl.address}` : ""}
+                  {` · ${cl.id}`}
+                  {(cl.runningRequests || cl.pendingRequests)
+                    ? ` · ${cl.runningRequests || 0} running / ${cl.pendingRequests || 0} pending`
+                    : ""}
+                </code>
                 {cl.protocolVersion && (
                   <code
                     style={versionMismatch(cl.protocolVersion) ? { color: "#ff6b6b", fontWeight: 700 } : { opacity: 0.7 }}
@@ -659,20 +692,47 @@
         );
       }
 
-      function Projects({ projects, bulkJobs, onPick }) {
+      function PreviewPanel({ project, preview, captureMode, onModeChange, onClose }) {
+        if (!project) return null;
+        return (
+          <div className="preview-panel">
+            <div className="preview-head">
+              <strong>Live Figma preview · {project.name || "(untitled)"}</strong>
+              <span className="badge">only while this detail is open</span>
+              <select value={captureMode} onChange={(event) => onModeChange(event.target.value)} style={{ width: 190 }}>
+                <option value="app-window">Figma app window (default)</option>
+                <option value="node-export">Design node export</option>
+              </select>
+              <button className="ghost" onClick={onClose}>Close preview</button>
+            </div>
+            <div className="preview-stage">
+              {preview?.url
+                ? <img src={preview.url} alt={`Live preview of ${project.name || "Figma project"}`} />
+                : <span className={preview?.error ? "bad" : "muted"}>{preview?.error || "Waiting for the Figma plugin…"}</span>}
+            </div>
+            {preview?.meta && (
+              <div className="preview-meta">
+                {preview.meta.pageName || "Current page"} · {preview.meta.nodeName || "frame"} · {preview.meta.source || "preview"} · {preview.meta.width || "?"}×{preview.meta.height || "?"} · {Math.round((preview.meta.byteLength || 0) / 1024)} KB
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      function Projects({ projects, bulkJobs, onProjectPick, onFilterPick }) {
         return (
           <>
             <div className="section">
               <h2>Figma Projects</h2>
               {!projects.length && <div className="muted">No connected Figma projects.</div>}
               {projects.map((project) => (
-                <div className="chan-card" key={project.projectKey} onClick={() => onPick(project.name)}>
+                <div className="chan-card" key={project.projectKey} onClick={() => onProjectPick(project)}>
                   <div className="chan-head">
                     <span className="doc-name">{project.name || "(untitled)"}</span>
                     <span className="badge">{project.connectionCount} connected</span>
                   </div>
                   <div className="member">
-                    <code>busy {project.busy || 0} · recommended #{project.recommendedChannel || "—"}</code>
+                    <code>{project.busy ? "working" : "idle"} · {project.runningRequests || 0} running · {project.pendingRequests || 0} pending · recommended #{project.recommendedChannel || "—"}</code>
                   </div>
                   {project.connections.map((connection) => {
                     const plugin = connection.clients.find((c) => c.role === "figma");
@@ -680,7 +740,7 @@
                     return (
                       <div className="member" key={connection.channel}>
                         <span className="badge figma">#{connection.channel}</span>
-                        <code>{connection.queueDepth || 0} active · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
+                        <code>{connection.runningRequests || 0} running · {connection.pendingRequests || 0} pending · {connection.clients.filter((c) => c.role === "controller").length} MCP clients</code>
                         {pv && (
                           <code style={versionMismatch(pv) ? { color: "#ff6b6b", fontWeight: 700 } : { opacity: 0.7 }}>
                             v{pv}{versionMismatch(pv) ? " ⚠" : ""}
@@ -696,7 +756,7 @@
               <h2>Bulk Operations</h2>
               {!bulkJobs.length && <div className="muted">No bulk operations.</div>}
               {[...bulkJobs].sort((a, b) => b.updatedAt - a.updatedAt).map((job) => (
-                <div className="chan-card" key={job.id} onClick={() => onPick(job.id)}>
+                <div className="chan-card" key={job.id} onClick={() => onFilterPick(job.id)}>
                   <div className="chan-head">
                     <code>{job.id.slice(0, 8)}</code>
                     <span className="badge">{job.status}</span>
@@ -886,6 +946,58 @@
         );
       }
 
+      function ExportGallery() {
+        const [gallery, setGallery] = useState(null);
+        const [days, setDays] = useState(30);
+        const [busy, setBusy] = useState(false);
+        const load = useCallback(async () => {
+          try {
+            const response = await fetch(relayApiUrl("exports"));
+            const data = await response.json();
+            setGallery(data);
+            if (data.retentionDays) setDays(data.retentionDays);
+          } catch {}
+        }, []);
+        useEffect(() => { load(); const timer = setInterval(load, 10000); return () => clearInterval(timer); }, [load]);
+        const clean = async (all) => {
+          if (all && !window.confirm("Delete every image in the managed export gallery? This cannot be undone.")) return;
+          setBusy(true);
+          try {
+            const suffix = all ? "" : `?olderThanDays=${Math.max(0, Number(days) || 0)}`;
+            const response = await fetch(relayApiUrl(`exports${suffix}`), { method: "DELETE" });
+            const data = await response.json();
+            setGallery(data.gallery || gallery);
+          } finally { setBusy(false); }
+        };
+        const formatBytes = (bytes) => bytes >= 1024 * 1024
+          ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
+          : `${Math.round((bytes || 0) / 1024)} KB`;
+        return (
+          <div className="section">
+            <h2>Generated Images</h2>
+            <div className="member"><code>{gallery?.files?.length || 0} files · {formatBytes(gallery?.totalBytes || 0)} · auto-delete after {gallery?.retentionDays || 30} days</code></div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <input type="number" min="0" value={days} onChange={(e) => setDays(e.target.value)} title="Delete files older than this many days" />
+              <button className="ghost" disabled={busy} onClick={() => clean(false)}>Delete older</button>
+              <button className="ghost" disabled={busy || !gallery?.files?.length} onClick={() => clean(true)}>Delete all</button>
+            </div>
+            <div className="gallery-grid">
+              {(gallery?.files || []).slice(0, 20).map((file) => {
+                const fileUrl = relayApiUrl(`exports/file/${encodeURIComponent(file.name)}`);
+                return (
+                  <div className="gallery-item" key={file.name} title={`${file.name}\n${formatBytes(file.bytes)}\n${new Date(file.createdAt).toLocaleString()}`} onClick={() => window.open(fileUrl, "_blank")}>
+                    {file.mimeType.startsWith("image/") && file.mimeType !== "image/svg+xml"
+                      ? <img src={fileUrl} loading="lazy" alt={file.name} />
+                      : <div style={{ height: 72, display: "grid", placeItems: "center" }}>{file.mimeType.includes("pdf") ? "PDF" : "SVG"}</div>}
+                    <div className="gallery-caption">{file.name} · {formatBytes(file.bytes)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      }
+
       // ----- Test call panel (uses its own peer WebSocket) -------------------
       // ----- Swagger-style request explorer ---------------------------------
       function Field({ p, value, onChange }) {
@@ -989,17 +1101,28 @@
           if (wsRef.current) { try { wsRef.current.close(); } catch {} }
           return new Promise((resolve, reject) => {
             const ws = new WebSocket(WS_URL);
+            ws.binaryType = "arraybuffer";
             wsRef.current = ws;
             st.channel = target; st.joined = false; st.pending = new Map();
             const to = setTimeout(() => reject(new Error("connect/join timeout")), 8000);
             // join as a controller (so the server labels us controller, not figma)
             ws.onopen = () => {
-              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: RELAY_PROTOCOL_VERSION }));
+              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard", protocolVersion: RELAY_PROTOCOL_VERSION, deviceName: "Web console", platform: navigator.platform || navigator.userAgent, capabilities: ["binaryFrames", "livePreview"] }));
               ws.send(JSON.stringify({ type: "join", channel: target, requesterId: "dashboard", id: genId(), message: { command: "join" } }));
             };
             ws.onerror = () => { clearTimeout(to); reject(new Error("socket error")); };
             ws.onmessage = (ev) => {
-              let d; try { d = JSON.parse(ev.data); } catch { return; }
+              let d;
+              try {
+                if (typeof ev.data === "string") d = JSON.parse(ev.data);
+                else {
+                  const decoded = decodeBinaryFrame(ev.data);
+                  d = decoded.envelope;
+                  if (d.message?.result) {
+                    d.message.result = { ...d.message.result, binary: true, byteLength: decoded.payload.byteLength };
+                  }
+                }
+              } catch { return; }
               if (d.type === "system" && d.event === "protocol_mismatch") {
                 clearTimeout(to); reject(new Error(d.message)); return;
               }
@@ -1210,8 +1333,15 @@
         const [version, setVersion] = useState(0); // bumped on flush to trigger renders
         const [filter, setFilter] = useState("");  // shared: channel click sets this
         const [view, setView] = useState("logs");   // main area: logs | explorer
+        const [selectedProject, setSelectedProject] = useState(null);
+        const [preview, setPreview] = useState(null);
+        const [captureMode, setCaptureMode] = useState(() =>
+          localStorage.getItem("talk-to-figma-preview-mode") === "node-export" ? "node-export" : "app-window"
+        );
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
+        const desiredPreviewChannelRef = useRef(null);
+        const captureModeRef = useRef("app-window");
 
         pausedRef.current = paused;
 
@@ -1221,12 +1351,50 @@
           let ws, alive = true, retry;
           const connect = () => {
             ws = new WebSocket(WS_URL);
+            ws.binaryType = "arraybuffer";
             monitorRef.current = ws;
-            ws.onopen = () => { setConnected(true); ws.send(JSON.stringify({ type: "monitor" })); };
+            ws.onopen = () => {
+              setConnected(true);
+              ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard-monitor", protocolVersion: PROTOCOL_VERSION, deviceName: "Web console monitor", platform: navigator.platform || navigator.userAgent, capabilities: ["binaryFrames", "livePreview"] }));
+              ws.send(JSON.stringify({ type: "monitor" }));
+              if (desiredPreviewChannelRef.current) {
+                ws.send(JSON.stringify({ type: "preview_subscribe", channel: desiredPreviewChannelRef.current, mode: captureModeRef.current }));
+              }
+            };
             ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 1500); };
             ws.onerror = () => { try { ws.close(); } catch {} };
             ws.onmessage = (ev) => {
-              let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+              let msg;
+              let previewPayload;
+              try {
+                if (typeof ev.data === "string") {
+                  msg = JSON.parse(ev.data);
+                } else {
+                  const decoded = decodeBinaryFrame(ev.data);
+                  msg = decoded.envelope;
+                  previewPayload = decoded.payload;
+                }
+              } catch { return; }
+              if (msg.kind === "preview_frame") {
+                const bytes = previewPayload || (msg.preview?.imageData
+                  ? Uint8Array.from(atob(msg.preview.imageData), (c) => c.charCodeAt(0))
+                  : null);
+                if (bytes) {
+                  const url = URL.createObjectURL(new Blob([bytes], { type: msg.preview?.mimeType || "image/png" }));
+                  setPreview((previous) => {
+                    if (previous?.url) URL.revokeObjectURL(previous.url);
+                    return { url, meta: msg.preview };
+                  });
+                }
+                return;
+              }
+              if (msg.kind === "preview_error") {
+                setPreview((previous) => {
+                  if (previous?.url) URL.revokeObjectURL(previous.url);
+                  return { error: msg.error || "Preview failed" };
+                });
+                return;
+              }
               if (msg.protocolVersion) {
                 RELAY_PROTOCOL_VERSION = msg.protocolVersion;
                 setRelayVersion(msg.protocolVersion);
@@ -1261,6 +1429,27 @@
           return () => { alive = false; clearTimeout(retry); clearInterval(flush); try { ws.close(); } catch {} };
         }, []);
 
+        desiredPreviewChannelRef.current = selectedProject && view === "logs"
+          ? selectedProject.recommendedChannel
+          : null;
+        captureModeRef.current = captureMode;
+
+        useEffect(() => {
+          localStorage.setItem("talk-to-figma-preview-mode", captureMode);
+        }, [captureMode]);
+
+        useEffect(() => {
+          const channel = desiredPreviewChannelRef.current;
+          const ws = monitorRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "preview_subscribe", channel, mode: captureMode }));
+          }
+          setPreview((previous) => {
+            if (previous?.url) URL.revokeObjectURL(previous.url);
+            return null;
+          });
+        }, [selectedProject?.recommendedChannel, view, captureMode]);
+
         const clear = () => { bufRef.current = []; queueRef.current = []; setVersion((v) => v + 1); };
         const clearEmpty = useCallback(() => {
           const ws = monitorRef.current;
@@ -1285,12 +1474,19 @@
             </div>
             <div className="main">
               <div className="sidebar">
-                <Projects projects={projects} bulkJobs={bulkJobs} onPick={(value) => { setFilter(value); setView("logs"); }} />
+                <Projects
+                  projects={projects}
+                  bulkJobs={bulkJobs}
+                  onProjectPick={(project) => { setSelectedProject(project); setFilter(project.name || project.projectKey); setView("logs"); }}
+                  onFilterPick={(value) => { setSelectedProject(null); setFilter(value); setView("logs"); }}
+                />
+                <ExportGallery />
                 <IndexPanel projects={projects} />
                 <AnnotationsPanel projects={projects} />
-                <Channels channels={channels} onPick={(ch) => { setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
+                <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">
+                {view === "logs" && <PreviewPanel project={selectedProject} preview={preview} captureMode={captureMode} onModeChange={setCaptureMode} onClose={() => setSelectedProject(null)} />}
                 {view === "logs"
                   ? <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
                   : <RequestExplorer projects={projects} />}

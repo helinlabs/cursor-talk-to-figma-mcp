@@ -4,6 +4,8 @@
 // Plugin state
 const state = {
   serverPort: 3055, // Default port
+  serverUrl: "ws://localhost:3055",
+  deviceName: "",
 };
 
 
@@ -118,6 +120,9 @@ figma.ui.onmessage = async (msg) => {
         figma.ui.postMessage({ type: "doc-meta", meta: getDocMeta() });
       } catch (e) {}
       break;
+    case "preview-control":
+      setLivePreviewEnabled(!!msg.enabled);
+      break;
   }
 };
 
@@ -149,7 +154,11 @@ figma.on("currentpagechange", () => {
   try {
     figma.ui.postMessage({ type: "doc-meta", meta: getDocMeta() });
   } catch (e) {}
+  scheduleLivePreview(150);
 });
+
+figma.on("selectionchange", () => scheduleLivePreview(150));
+figma.on("documentchange", () => scheduleLivePreview(500));
 
 // Listen for plugin commands from menu
 figma.on("run", ({ command }) => {
@@ -161,9 +170,13 @@ function updateSettings(settings) {
   if (settings.serverPort) {
     state.serverPort = settings.serverPort;
   }
+  if (settings.serverUrl) state.serverUrl = settings.serverUrl;
+  if (settings.deviceName !== undefined) state.deviceName = settings.deviceName;
 
   figma.clientStorage.setAsync("settings", {
     serverPort: state.serverPort,
+    serverUrl: state.serverUrl,
+    deviceName: state.deviceName,
   });
 }
 
@@ -238,6 +251,8 @@ async function handleCommand(command, params) {
       return await createComponentInstance(params);
     case "export_node_as_image":
       return await exportNodeAsImage(params);
+    case "get_current_figma_screenshot":
+      return await getCurrentFigmaScreenshot(params);
     case "set_corner_radius":
       return await setCornerRadius(params);
     case "set_text_content":
@@ -3075,7 +3090,6 @@ async function exportNodeAsImage(params) {
       const out = Object.assign(base, {
         mimeType: "image/svg+xml",
         svg: svg,
-        imageData: customBase64Encode(utf8ToUint8(svg)),
       });
       if (includeColorTokens) {
         const resolver = makeDsResolver(true);
@@ -3104,7 +3118,8 @@ async function exportNodeAsImage(params) {
 
     const out = Object.assign(base, {
       mimeType,
-      imageData: customBase64Encode(bytes),
+      imageBytes: bytes,
+      byteLength: bytes.byteLength,
     });
     if (
       format !== "PDF" &&
@@ -3118,6 +3133,85 @@ async function exportNodeAsImage(params) {
   } catch (error) {
     throw new Error(`Error exporting node as image: ${error.message}`);
   }
+}
+
+async function getCurrentFigmaScreenshot(params) {
+  const maxDimension = Math.max(320, Math.min(2400, Number(params && params.maxDimension) || 1200));
+  const selection = Array.from(figma.currentPage.selection || []);
+  const exportableSelection = selection.find((node) => node.visible !== false && "exportAsync" in node);
+  const pageCandidates = Array.from(figma.currentPage.children || [])
+    .filter((node) => node.visible !== false && "exportAsync" in node)
+    .sort((a, b) => {
+      const area = (node) =>
+        (typeof node.width === "number" ? node.width : 0) *
+        (typeof node.height === "number" ? node.height : 0);
+      return area(b) - area(a);
+    });
+  const node = exportableSelection || pageCandidates[0];
+  if (!node) throw new Error("No exportable selection or top-level node exists on the current page");
+
+  const width = typeof node.width === "number" ? node.width : maxDimension;
+  const height = typeof node.height === "number" ? node.height : maxDimension;
+  const scale = Math.max(0.05, Math.min(1, maxDimension / Math.max(width, height, 1)));
+  const bytes = await node.exportAsync({
+    format: "PNG",
+    constraint: { type: "SCALE", value: scale },
+  });
+  return {
+    nodeId: node.id,
+    nodeName: node.name,
+    pageId: figma.currentPage.id,
+    pageName: figma.currentPage.name,
+    source: exportableSelection ? "selection" : "representative-frame",
+    mimeType: "image/png",
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+    byteLength: bytes.byteLength,
+    imageBytes: bytes,
+    capturedAt: Date.now(),
+  };
+}
+
+let livePreviewEnabled = false;
+let livePreviewTimer = null;
+let livePreviewBusy = false;
+let livePreviewDirty = false;
+
+function setLivePreviewEnabled(enabled) {
+  livePreviewEnabled = enabled;
+  if (!enabled) {
+    if (livePreviewTimer) clearTimeout(livePreviewTimer);
+    livePreviewTimer = null;
+    livePreviewDirty = false;
+    return;
+  }
+  scheduleLivePreview(0);
+}
+
+function scheduleLivePreview(delay) {
+  if (!livePreviewEnabled) return;
+  if (livePreviewBusy) {
+    livePreviewDirty = true;
+    return;
+  }
+  if (livePreviewTimer) clearTimeout(livePreviewTimer);
+  livePreviewTimer = setTimeout(async () => {
+    livePreviewTimer = null;
+    if (!livePreviewEnabled || livePreviewBusy) return;
+    livePreviewBusy = true;
+    try {
+      const result = await getCurrentFigmaScreenshot({ maxDimension: 1200 });
+      figma.ui.postMessage({ type: "preview-frame", result });
+    } catch (error) {
+      figma.ui.postMessage({ type: "preview-error", error: error.message || String(error) });
+    } finally {
+      livePreviewBusy = false;
+      if (livePreviewDirty) {
+        livePreviewDirty = false;
+        scheduleLivePreview(300);
+      }
+    }
+  }, Math.max(0, delay || 0));
 }
 function customBase64Encode(bytes) {
   const chars =
@@ -3266,6 +3360,8 @@ async function setTextContent(params) {
       if (savedSettings.serverPort) {
         state.serverPort = savedSettings.serverPort;
       }
+      if (savedSettings.serverUrl) state.serverUrl = savedSettings.serverUrl;
+      if (savedSettings.deviceName) state.deviceName = savedSettings.deviceName;
     }
 
     // Send initial settings to UI
@@ -3273,6 +3369,8 @@ async function setTextContent(params) {
       type: "init-settings",
       settings: {
         serverPort: state.serverPort,
+        serverUrl: state.serverUrl,
+        deviceName: state.deviceName,
       },
     });
   } catch (error) {

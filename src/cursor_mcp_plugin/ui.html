@@ -387,15 +387,16 @@
           </div>
 
           <div id="port-container">
-            <label for="port">WebSocket Server Port</label>
+            <label for="server-url">Relay WebSocket address</label>
             <input
-              type="number"
-              id="port"
-              placeholder="3055"
-              value="3055"
-              min="1024"
-              max="65535"
+              type="text"
+              id="server-url"
+              placeholder="ws://localhost:3055"
+              value="ws://localhost:3055"
             />
+            <p style="font-size: 11px; color: #888; margin: 6px 0 12px">Use <code>wss://</code> when connecting through the internet.</p>
+            <label for="device-name">Device name</label>
+            <input type="text" id="device-name" placeholder="e.g. Design MacBook" />
           </div>
         </div>
 
@@ -498,7 +499,7 @@
           <h2>How to Use</h2>
           <ol>
             <li>Make sure the MCP server is running in Cursor</li>
-            <li>Connect to the server using the port number (default: 3055)</li>
+            <li>Connect to the local relay or enter a remote <code>ws://</code>/<code>wss://</code> address</li>
             <li>Once connected, you can interact with Figma through Cursor</li>
           </ol>
           <p style="font-size: 11px; color: #888; margin-top: 16px;">
@@ -515,11 +516,26 @@
       // protocol_mismatch message, and the header badge below shows both
       // versions with a warning. Bump this together with src/shared/version.ts.
       const PROTOCOL_VERSION = "2.2.0";
+      const BINARY_MAGIC = [0x54, 0x54, 0x46, 0x42]; // "TTFB"
+
+      function encodeBinaryFrame(envelope, payload) {
+        const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+        const header = new TextEncoder().encode(JSON.stringify(envelope));
+        const frame = new Uint8Array(8 + header.byteLength + bytes.byteLength);
+        frame.set(BINARY_MAGIC, 0);
+        new DataView(frame.buffer).setUint32(4, header.byteLength, false);
+        frame.set(header, 8);
+        frame.set(bytes, 8 + header.byteLength);
+        return frame.buffer;
+      }
       // WebSocket connection state
       const state = {
         connected: false,
         socket: null,
         serverPort: 3055,
+        serverUrl: "ws://localhost:3055",
+        deviceName: "",
+        relayCapabilities: new Set(),
         pendingRequests: new Map(),
         channel: null,
         commandTracking: new Map(),
@@ -546,11 +562,13 @@
         // Fetch the build id from the relay (default port 3055; dev manifest
         // allows http://localhost:3055).
         try {
-          const portEl = document.getElementById("port");
-          const port = (portEl && parseInt(portEl.value, 10)) || 3055;
           const protoEl = document.getElementById("proto-versions");
           if (protoEl) protoEl.textContent = "plugin v" + PROTOCOL_VERSION;
-          fetch("http://localhost:" + port + "/plugin-version")
+          const serverEl = document.getElementById("server-url");
+          const socketUrl = new URL((serverEl && serverEl.value) || "ws://localhost:3055");
+          socketUrl.protocol = socketUrl.protocol === "wss:" ? "https:" : "http:";
+          socketUrl.pathname = socketUrl.pathname.replace(/\/$/, "") + "/plugin-version";
+          fetch(socketUrl.toString())
             .then((r) => r.json())
             .then((j) => {
               const el = document.getElementById("build-id");
@@ -767,7 +785,9 @@
       })();
 
       // UI Elements
-      const portInput = document.getElementById("port");
+      const serverUrlInput = document.getElementById("server-url");
+      const deviceNameInput = document.getElementById("device-name");
+      deviceNameInput.value = navigator.platform || "Figma plugin";
       const connectButton = document.getElementById("btn-connect");
       const connectionStatus = document.getElementById("connection-status");
 
@@ -792,8 +812,8 @@
             ? "Connected to Cursor MCP server"
             : "Not connected to Cursor MCP server");
 
-        // Add instructions for localhost when disconnected
-        if (!isConnected) {
+        // Add local startup instructions only for the default local relay.
+        if (!isConnected && /^ws:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(state.serverUrl)) {
           statusMessage += `<br><br>Run this in your terminal, then connect<br><code>bunx cursor-talk-to-figma-socket</code>`;
         }
 
@@ -805,7 +825,8 @@
         // Update connect button text and style based on connection state
         connectButton.textContent = isConnected ? "Disconnect" : "Connect";
         connectButton.className = isConnected ? "secondary" : "primary";
-        portInput.disabled = isConnected;
+        serverUrlInput.disabled = isConnected;
+        deviceNameInput.disabled = isConnected;
 
         // Show/hide MCP config section
         const mcpConfig = document.getElementById("mcp-config");
@@ -820,7 +841,7 @@
       // Connect to WebSocket server.
       // options.channel — rejoin a specific channel (used by auto-reconnect so
       //   the MCP↔plugin pairing is preserved instead of getting a fresh channel).
-      async function connectToServer(port, options) {
+      async function connectToServer(serverAddress, options) {
         options = options || {};
         try {
           if (
@@ -835,8 +856,16 @@
             return;
           }
 
-          state.serverPort = port;
-          const wsUrl = `ws://localhost:${port}`;
+          const wsUrl = String(serverAddress || "ws://localhost:3055").trim();
+          if (!/^wss?:\/\//i.test(wsUrl)) throw new Error("Relay address must start with ws:// or wss://");
+          state.serverUrl = wsUrl;
+          state.deviceName = deviceNameInput.value.trim() || navigator.platform || "Figma plugin";
+          state.relayCapabilities = new Set();
+          parent.postMessage({ pluginMessage: {
+            type: "update-settings",
+            serverUrl: state.serverUrl,
+            deviceName: state.deviceName,
+          } }, "*");
 
           state.socket = new WebSocket(wsUrl);
 
@@ -846,6 +875,9 @@
               role: "figma",
               requesterId: state.clientId,
               protocolVersion: PROTOCOL_VERSION,
+              deviceName: state.deviceName,
+              platform: navigator.platform || navigator.userAgent,
+              capabilities: ["binaryFrames", "livePreview"],
             }));
             // Reuse the previous channel on reconnect; otherwise pick a new one.
             const channelName =
@@ -882,6 +914,15 @@
                 return;
               }
 
+              if (data.type === "system" && data.event === "hello_ack") {
+                state.relayCapabilities = new Set(data.capabilities || []);
+              }
+
+              if (data.type === "preview_control") {
+                parent.postMessage({ pluginMessage: { type: "preview-control", enabled: !!data.enabled } }, "*");
+                return;
+              }
+
               if (data.type === "system") {
                 // Successfully joined channel
                 if (data.message && data.message.result) {
@@ -894,7 +935,7 @@
                     `Connected to server in channel: <strong>${channelName}</strong>`
                   );
                   analytics.track("channel_join", {
-                    port: state.serverPort,
+                    relay: state.serverUrl,
                     channel: channelName,
                   });
 
@@ -906,7 +947,7 @@
                     {
                       pluginMessage: {
                         type: "notify",
-                        message: `Connected to Cursor MCP server on port ${port} in channel: ${channelName}`,
+                        message: `Connected to Cursor MCP relay ${state.serverUrl} in channel: ${channelName}`,
                       },
                     },
                     "*"
@@ -984,7 +1025,7 @@
           console.log("[reconnect] attempting —", reason);
           updateConnectionStatus(false, `Reconnecting… (${reason})`);
           connectionStatus.className = "status info";
-          connectToServer(state.serverPort, {
+          connectToServer(state.serverUrl, {
             channel: state.channel,
             isReconnect: true,
           });
@@ -1144,6 +1185,42 @@
           return;
         }
 
+        if (result && result.imageBytes && state.relayCapabilities.has("binaryFrames")) {
+          const bytes = result.imageBytes instanceof Uint8Array
+            ? result.imageBytes
+            : new Uint8Array(result.imageBytes);
+          const metadata = Object.assign({}, result, {
+            imageBytes: undefined,
+            binary: true,
+            byteLength: bytes.byteLength,
+          });
+          delete metadata.imageBytes;
+          state.socket.send(encodeBinaryFrame({
+            id,
+            type: "message",
+            channel: state.channel,
+            message: { id, result: metadata },
+          }, bytes));
+          return;
+        }
+
+        if (result && result.imageBytes) {
+          const bytes = result.imageBytes instanceof Uint8Array
+            ? result.imageBytes
+            : new Uint8Array(result.imageBytes);
+          let binary = "";
+          const chunkSize = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+          }
+          result = Object.assign({}, result, {
+            imageData: btoa(binary),
+            binary: false,
+            byteLength: bytes.byteLength,
+          });
+          delete result.imageBytes;
+        }
+
         state.socket.send(
           JSON.stringify({
             id,
@@ -1155,6 +1232,37 @@
             },
           })
         );
+      }
+
+      function bytesToBase64(bytes) {
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+      }
+
+      function sendPreviewFrame(result) {
+        if (!state.connected || !state.socket || !result?.imageBytes) return;
+        const bytes = result.imageBytes instanceof Uint8Array
+          ? result.imageBytes
+          : new Uint8Array(result.imageBytes);
+        const preview = Object.assign({}, result, { imageBytes: undefined, byteLength: bytes.byteLength });
+        delete preview.imageBytes;
+        if (state.relayCapabilities.has("binaryFrames")) {
+          state.socket.send(encodeBinaryFrame({
+            type: "preview_frame",
+            channel: state.channel,
+            preview,
+          }, bytes));
+        } else {
+          state.socket.send(JSON.stringify({
+            type: "preview_frame",
+            channel: state.channel,
+            preview: Object.assign(preview, { imageData: bytesToBase64(bytes) }),
+          }));
+        }
       }
 
       // Send error response back to WebSocket
@@ -1221,10 +1329,10 @@
         } else {
           state.userDisconnected = false;
           state.fatalProtocolError = null;
-          const port = parseInt(portInput.value, 10) || 3055;
+          const serverAddress = serverUrlInput.value.trim() || "ws://localhost:3055";
           updateConnectionStatus(false, "Connecting...");
           connectionStatus.className = "status info";
-          connectToServer(port);
+          connectToServer(serverAddress);
         }
       });
 
@@ -1302,11 +1410,30 @@
         const message = event.data.pluginMessage;
         if (!message) return;
 
-        console.log("Received message from plugin:", message);
+        if (message.type === "command-result" && message.result?.imageBytes) {
+          console.log("Received binary image from plugin:", {
+            id: message.id,
+            format: message.result.format,
+            mimeType: message.result.mimeType,
+            byteLength: message.result.imageBytes.byteLength,
+          });
+        } else {
+          console.log("Received message from plugin:", message);
+        }
 
         switch (message.type) {
           case "connection-status":
             updateConnectionStatus(message.connected, message.message);
+            break;
+          case "init-settings":
+            if (message.settings?.serverUrl) {
+              state.serverUrl = message.settings.serverUrl;
+              serverUrlInput.value = state.serverUrl;
+            }
+            if (message.settings?.deviceName) {
+              state.deviceName = message.settings.deviceName;
+              deviceNameInput.value = state.deviceName;
+            }
             break;
           case "auto-connect":
             connectButton.click();
@@ -1318,7 +1445,16 @@
             // Forward the result from plugin code back to WebSocket
             sendSuccessResponse(message.id, message.result);
             trackCommandResult(message.id, true);
-            reqLog.finish(message.id, "success", message.result);
+            reqLog.finish(message.id, "success", message.result?.imageBytes
+              ? {
+                  binary: true,
+                  format: message.result.format,
+                  mimeType: message.result.mimeType,
+                  byteLength: message.result.imageBytes.byteLength,
+                  width: message.result.width,
+                  height: message.result.height,
+                }
+              : message.result);
             break;
           case "command-started":
             if (state.connected && state.socket) {
@@ -1348,6 +1484,14 @@
           case "doc-meta":
             state.docMeta = message.meta;
             announceDocMeta();
+            break;
+          case "preview-frame":
+            sendPreviewFrame(message.result);
+            break;
+          case "preview-error":
+            if (state.connected && state.socket) {
+              state.socket.send(JSON.stringify({ type: "preview_error", channel: state.channel, error: message.error }));
+            }
             break;
         }
       };
@@ -1395,11 +1539,13 @@
 
       // Add this function to the script section
       function updateMcpConfig() {
+        const args = ["cursor-talk-to-figma-mcp@latest"];
+        if (state.serverUrl !== "ws://localhost:3055") args.push(`--server=${state.serverUrl}`);
         const mcpConfig = {
           mcpServers: {
             TalkToFigma: {
               command: "bunx",
-              args: ["cursor-talk-to-figma-mcp@latest"],
+              args,
             },
           },
         };

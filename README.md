@@ -11,6 +11,9 @@ For agent-driven provisioning on another Mac, copy the single Korean prompt in
 Agents with repository skills can use
 [`$setup-cursor-talk-to-figma`](skills/setup-cursor-talk-to-figma/SKILL.md).
 
+The default setup runs locally, but the relay, MCP server, and Figma plugin are
+independent processes and may run on different machines.
+
 ## Architecture
 
 Four pieces talk in a pipeline:
@@ -71,7 +74,10 @@ Control it any time with `./scripts/relayctl.sh <cmd>`:
 1. Figma → **Plugins → Development → Import plugin from manifest…**
 2. Select `src/cursor_mcp_plugin/manifest.json`.
 3. Run it: **Plugins → Development → Talk To Figma MCP Plugin**.
-4. In the plugin window click **Connect** (port 3055). The relay groups the
+4. In the plugin window click **Connect**. It defaults to
+   `ws://localhost:3055`; enter a reachable `ws://` LAN address or a `wss://`
+   remote address when the relay runs on another computer. Give the plugin a
+   recognizable device name. The relay groups the
    connection by Figma file/project automatically; random channel ids are now
    internal compatibility details.
 
@@ -79,6 +85,17 @@ The plugin header shows a **build badge**: `build <hash> · loaded HH:MM:SS`. Th
 hash is a content hash of the on-disk plugin files (fetched from the relay), and
 `loaded` is the time it last started — so you can always confirm Figma reloaded
 the latest code after an edit.
+
+For a remote relay, expose port 3055 through a firewall/VPN or TLS reverse
+proxy, then pass the same endpoint to the MCP server, for example
+`--server=wss://relay.example.com/talk-to-figma/`. The web console identifies
+connections by device name, local/LAN/external scope, and address. Browsers do
+not expose the operating-system hostname, so the plugin device name is an
+editable value; the MCP server uses its host name automatically.
+
+The relay itself does not authenticate clients. Do not expose it directly to
+the public internet; put it behind an authenticated `wss://` reverse proxy or a
+private VPN/network.
 
 ### 4. Point your AI client at the local MCP server
 
@@ -147,11 +164,12 @@ In the AI client:
 
 | What | Where |
 |---|---|
-| **Web console** (channels, documents, live request explorer) | http://localhost:3055/console (or `/`) |
+| **Web console** (channels, device/address identity, running and pending work) | http://localhost:3055/console (or `/`) |
 | Channels + documents as JSON | http://localhost:3055/channels |
 | Project connections and recommended targets | http://localhost:3055/projects |
 | Workload, in-flight requests, and bulk jobs | http://localhost:3055/status |
 | Current plugin build hash (matches the plugin badge) | http://localhost:3055/plugin-version |
+| Managed export gallery JSON / files | http://localhost:3055/exports |
 | Relay health (running? crashes?) | `./scripts/relayctl.sh status` |
 | Relay logs / crash history | `./scripts/relayctl.sh logs` · `crashes` · files under `.relay/` |
 | Which plugin code Figma loaded | the **build badge** in the plugin window |
@@ -159,10 +177,37 @@ In the AI client:
 ## Protocol compatibility
 
 The relay, MCP server, Figma plugin, and dashboard send protocol version
-`2.0.0` during their WebSocket handshake. Versions with the same major number
+`2.2.0` during their WebSocket handshake. Versions with the same major number
 are compatible. A missing or different major version is rejected before join
 or command routing with an actionable `protocol_mismatch` message; rebuild or
 reconnect the MCP server and re-run the Figma development plugin to update it.
+
+Protocol v2 negotiates optional capabilities during the handshake. New v2
+peers use binary WebSocket frames for images while older v2 peers keep the
+base64 compatibility path. The relay records only transfer metadata, and the
+Bun MCP server either writes bytes directly to `outputPath` or converts them to
+base64 only for a final inline MCP image response.
+
+During development, backward-compatible features increment the v2 minor/patch
+version. Formal release versions and tags are managed separately.
+
+The dashboard starts a live preview only while a viewer has opened a specific
+project detail. The default `Figma app window` mode captures a matching on-screen
+local macOS Figma window by CoreGraphics window id every two seconds and requires
+Screen Recording permission for the relay/Bun process. It still works when the
+window is partly covered, but minimized windows are unavailable. `Design node export` uses the connected Figma
+plugin instead, works even when the app window is covered, and updates after
+selection/document changes. With no viewers, neither capture path runs.
+
+Inline MCP images and live previews are not stored. Pass `saveToGallery: true`
+to `export_node_as_image` or `get_current_figma_screenshot` to upload a managed
+copy to the relay gallery. The dashboard lists files, thumbnails, count, and
+total size and can delete files older than a chosen number of days or delete the
+entire gallery. Managed files live under `.relay/exports`, are automatically
+deleted after 30 days by default, and can be configured with
+`TALK_TO_FIGMA_EXPORT_DIR` and `TALK_TO_FIGMA_EXPORT_RETENTION_DAYS`. Explicit
+arbitrary `outputPath` files remain user-managed and are never deleted by the
+dashboard.
 
 ## Editing — what makes a change take effect
 
@@ -222,6 +267,7 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 ### Connection management
 - `list_figma_projects` / `use_figma_project` — project-first discovery and connection
 - `get_figma_workload` — plugin/MCP connection counts and queued work
+- `get_current_figma_screenshot` — capture the local Figma app window by default, or use `captureMode: "node-export"`
 - `list_figma_channels` — list relay channels and which document each is on
 - `join_channel` — legacy low-level compatibility tool
 - `start_bulk_operations` / `get_bulk_operation` / `cancel_bulk_operation`

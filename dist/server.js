@@ -13,6 +13,119 @@ import * as path3 from "path";
 import * as os3 from "os";
 import { createServer as createHttpServer } from "http";
 
+// src/local-figma-capture.ts
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+var execFileAsync = promisify(execFile);
+var WINDOW_HELPER_SOURCE = String.raw`
+import Cocoa
+import CoreGraphics
+
+func normalize(_ value: String) -> String {
+  let scalars = value.unicodeScalars.drop { !CharacterSet.alphanumerics.contains($0) }
+  let stripped = String(String.UnicodeScalarView(scalars))
+  return stripped.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+}
+
+let wanted = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+let target = normalize(wanted)
+let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+guard let rows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+  fputs("Could not enumerate macOS windows\n", stderr); exit(2)
+}
+let figmaWindows = rows.compactMap { row -> [String: Any]? in
+  guard (row[kCGWindowOwnerName as String] as? String) == "Figma",
+        (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+        let number = row[kCGWindowNumber as String] as? NSNumber else { return nil }
+  let name = row[kCGWindowName as String] as? String ?? ""
+  return ["id": number.intValue, "name": name]
+}
+let namedMatch = target.isEmpty ? figmaWindows.first : figmaWindows.first { row in
+  let name = normalize(row["name"] as? String ?? "")
+  return name == target || name.contains(target) || target.contains(name)
+}
+// macOS hides window titles from background processes until Screen Recording
+// permission is granted. A single Figma window is still unambiguous.
+let match = namedMatch ?? (figmaWindows.count == 1 ? figmaWindows.first : nil)
+guard let window = match else {
+  fputs("No local Figma window matches project: \(wanted)\n", stderr); exit(3)
+}
+let data = try JSONSerialization.data(withJSONObject: window)
+print(String(data: data, encoding: .utf8)!)
+`;
+var helperPromise = null;
+async function localWindowHelper() {
+  if (helperPromise) return helperPromise;
+  helperPromise = (async () => {
+    const hash = createHash("sha256").update(WINDOW_HELPER_SOURCE).digest("hex").slice(0, 12);
+    const helperPath = join(tmpdir(), `talk-to-figma-window-${hash}`);
+    try {
+      await access(helperPath, fsConstants.X_OK);
+      return helperPath;
+    } catch {
+    }
+    const buildDir = await mkdtemp(join(tmpdir(), "talk-to-figma-window-build-"));
+    const sourcePath = join(buildDir, "main.swift");
+    const outputPath = join(buildDir, "window-helper");
+    try {
+      await writeFile(sourcePath, WINDOW_HELPER_SOURCE, "utf8");
+      await execFileAsync("/usr/bin/swiftc", [sourcePath, "-O", "-o", outputPath]);
+      await chmod(outputPath, 493);
+      await rename(outputPath, helperPath);
+      return helperPath;
+    } finally {
+      await rm(buildDir, { recursive: true, force: true });
+    }
+  })();
+  return helperPromise;
+}
+async function captureLocalFigmaWindow(projectName, maxDimension = 1400) {
+  if (process.platform !== "darwin") {
+    throw new Error("Local Figma window capture is currently supported on macOS only");
+  }
+  let windowInfo;
+  try {
+    const { stdout } = await execFileAsync(await localWindowHelper(), [projectName || ""], { maxBuffer: 1024 * 1024 });
+    windowInfo = JSON.parse(stdout.trim());
+  } catch (error) {
+    const detail = String(error?.stderr || error?.message || error).trim();
+    throw new Error(detail || `No local Figma window matches project: ${projectName || "current"}`);
+  }
+  const captureDir = await mkdtemp(join(tmpdir(), "talk-to-figma-preview-"));
+  const capturePath = join(captureDir, "figma-window.jpg");
+  try {
+    try {
+      await execFileAsync("/usr/sbin/screencapture", ["-x", "-o", `-l${windowInfo.id}`, "-tjpg", capturePath]);
+    } catch {
+      throw new Error("Could not capture the local Figma window. Grant Screen Recording permission to the Bun/relay process and keep the Figma window visible.");
+    }
+    const { stdout: originalDimensions } = await execFileAsync("/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", capturePath]);
+    const originalWidth = Number(originalDimensions.match(/pixelWidth:\s*(\d+)/)?.[1]) || maxDimension;
+    const originalHeight = Number(originalDimensions.match(/pixelHeight:\s*(\d+)/)?.[1]) || maxDimension;
+    if (Math.max(originalWidth, originalHeight) > Math.max(320, maxDimension)) {
+      await execFileAsync("/usr/bin/sips", ["-Z", String(Math.max(320, maxDimension)), capturePath]);
+    }
+    const { stdout: dimensions } = await execFileAsync("/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", capturePath]);
+    const pixelWidth = Number(dimensions.match(/pixelWidth:\s*(\d+)/)?.[1]) || originalWidth;
+    const pixelHeight = Number(dimensions.match(/pixelHeight:\s*(\d+)/)?.[1]) || originalHeight;
+    return {
+      bytes: await readFile(capturePath),
+      mimeType: "image/jpeg",
+      windowName: windowInfo.name || projectName || "Figma",
+      width: pixelWidth,
+      height: pixelHeight,
+      capturedAt: Date.now()
+    };
+  } finally {
+    await rm(captureDir, { recursive: true, force: true });
+  }
+}
+
 // src/shared/annotations-store.ts
 import * as fs from "fs";
 import * as path from "path";
@@ -150,6 +263,26 @@ function protocolMajor(version) {
 }
 
 // src/talk_to_figma_mcp/server.ts
+var BINARY_MAGIC = Buffer.from([84, 84, 70, 66]);
+function rawDataToBuffer(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (Array.isArray(data)) return Buffer.concat(data.map(rawDataToBuffer));
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return Buffer.from(data);
+}
+function decodeBinaryFrame(data) {
+  const raw = rawDataToBuffer(data);
+  if (raw.byteLength < 8 || !raw.subarray(0, 4).equals(BINARY_MAGIC)) {
+    throw new Error("Invalid Talk-to-Figma binary frame");
+  }
+  const headerLength = raw.readUInt32BE(4);
+  if (headerLength <= 0 || 8 + headerLength > raw.byteLength) {
+    throw new Error("Invalid Talk-to-Figma binary header length");
+  }
+  const envelope = JSON.parse(raw.subarray(8, 8 + headerLength).toString("utf8"));
+  return { envelope, payload: raw.subarray(8 + headerLength) };
+}
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -205,8 +338,36 @@ function createMcpServer(options = {}) {
   });
   const args = process.argv.slice(2);
   const serverArg = args.find((arg) => arg.startsWith("--server="));
-  const serverUrl = serverArg ? serverArg.split("=")[1] : "localhost";
-  const WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
+  const serverUrl = serverArg ? serverArg.slice("--server=".length) : "localhost";
+  function normalizeRelayWebSocketUrl(value) {
+    const target = value.trim() || "localhost";
+    if (target === "localhost") return "ws://localhost:3055";
+    if (/^wss?:\/\//i.test(target)) return target;
+    if (/^https?:\/\//i.test(target)) return target.replace(/^http/i, "ws");
+    return `wss://${target}`;
+  }
+  const RELAY_WS_URL = normalizeRelayWebSocketUrl(serverUrl);
+  function relayHttpUrl(endpoint) {
+    const url = new URL(RELAY_WS_URL);
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
+    return url.toString();
+  }
+  async function saveToRelayGallery(bytes, suggestedName, extension) {
+    const body = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Buffer.from(bytes);
+    const response = await fetch(relayHttpUrl("exports"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Figma-Export-Name": encodeURIComponent(suggestedName),
+        "X-Figma-Export-Extension": extension
+      },
+      body
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `Gallery upload failed with HTTP ${response.status}`);
+    return result;
+  }
   server.tool(
     "get_document_info",
     "Get information about a Figma page: its top-level nodes plus a list of all pages in the file (so non-open pages are discoverable). Pass `pageId` to inspect a specific page without switching to it. If you know (part of) the name of what you're looking for, use search_nodes first instead of inspecting pages one by one; for a one-call overview of all pages use get_file_outline.",
@@ -1142,9 +1303,10 @@ Failed: ${JSON.stringify(failures)}` : "")
       format: z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format (default PNG)"),
       scale: z.number().positive().optional().describe("Export scale (raster only, default 1)"),
       outputPath: z.string().optional().describe("If set, save the export to this file path (absolute, or relative to the server's working dir) instead of returning it inline. Parent directories are created automatically."),
+      saveToGallery: z.boolean().optional().describe("Save into the relay/MCP managed export gallery so it can be browsed and cleaned from the web dashboard"),
       includeColorTokens: z.boolean().optional().describe("SVG only: also return `colorTokens` ([{token, hex, property}], document order) listing every paint bound to a color variable, so the caller can map resolved colors back to design tokens. The SVG itself keeps real colors.")
     },
-    async ({ nodeId, format, scale, outputPath, includeColorTokens }) => {
+    async ({ nodeId, format, scale, outputPath, saveToGallery, includeColorTokens }) => {
       try {
         if (options.remoteExportBase && outputPath) {
           throw new Error("outputPath is disabled in HTTP mode; omit it to receive a tunnel download URL");
@@ -1164,7 +1326,8 @@ Failed: ${JSON.stringify(failures)}` : "")
           if (fmt === "SVG" && typeof result.svg === "string") {
             fs3.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
           } else {
-            fs3.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
+            if (!result.imageBytes) throw new Error("Figma export returned no image bytes");
+            fs3.writeFileSync(resolved, Buffer.from(result.imageBytes), { mode: 384 });
           }
           const stat = fs3.statSync(resolved);
           const summary = {
@@ -1181,13 +1344,21 @@ Failed: ${JSON.stringify(failures)}` : "")
           if (result.usedTokens) summary.usedTokens = result.usedTokens;
           return { content: [{ type: "text", text: JSON.stringify(summary) }] };
         }
+        if (saveToGallery && !outputPath) {
+          const extension = fmt === "JPG" ? "jpg" : fmt.toLowerCase();
+          const payload = fmt === "SVG" && typeof result.svg === "string" ? result.svg : result.imageBytes;
+          if (!payload) throw new Error("Image payload was not received");
+          const gallery = await saveToRelayGallery(payload, result.nodeName || "figma-export", extension);
+          return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, nodeName: result.nodeName, format: fmt }) }] };
+        }
         if (outputPath) {
           const resolved = path3.resolve(outputPath);
           fs3.mkdirSync(path3.dirname(resolved), { recursive: true });
           if (fmt === "SVG" && typeof result.svg === "string") {
             fs3.writeFileSync(resolved, result.svg, "utf8");
           } else {
-            fs3.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+            if (!result.imageBytes) throw new Error("Image payload was not received");
+            fs3.writeFileSync(resolved, Buffer.from(result.imageBytes));
           }
           const stat = fs3.statSync(resolved);
           const summary = {
@@ -1219,11 +1390,14 @@ Failed: ${JSON.stringify(failures)}` : "")
           }
           return { content: [{ type: "text", text: result.svg }] };
         }
+        if (!result.imageBytes) throw new Error("Image payload was not received");
         return {
           content: [
             {
               type: "image",
-              data: result.imageData,
+              // MCP image content still requires base64. Conversion happens only
+              // here, after the binary has crossed plugin → relay → Bun.
+              data: Buffer.from(result.imageBytes).toString("base64"),
               mimeType: result.mimeType || "image/png"
             }
           ]
@@ -1237,6 +1411,63 @@ Failed: ${JSON.stringify(failures)}` : "")
             }
           ]
         };
+      }
+    }
+  );
+  server.tool(
+    "get_current_figma_screenshot",
+    "Capture the current Figma view. By default Bun captures the matching local Figma application window on macOS (fast, requires Screen Recording permission and a visible local window). Set captureMode=node-export to export the selected design node, or the largest visible top-level node when nothing is selected. If outputPath is provided, save the image on the MCP server machine instead of returning it inline.",
+    {
+      maxDimension: z.number().int().min(320).max(2400).optional().describe("Maximum output width or height in pixels (default 1200)"),
+      captureMode: z.enum(["app-window", "node-export"]).optional().describe("Capture source; defaults to app-window"),
+      outputPath: z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved"),
+      saveToGallery: z.boolean().optional().describe("Save into the managed export gallery shown in the web dashboard")
+    },
+    async ({ maxDimension, captureMode, outputPath, saveToGallery }) => {
+      try {
+        const mode = captureMode || "app-window";
+        const localCapture = mode === "app-window" ? await captureLocalFigmaWindow(selectedProject?.name, maxDimension || 1200) : null;
+        const result = localCapture ? {
+          imageBytes: localCapture.bytes,
+          mimeType: localCapture.mimeType,
+          nodeName: localCapture.windowName,
+          source: "app-window",
+          width: localCapture.width,
+          height: localCapture.height,
+          capturedAt: localCapture.capturedAt
+        } : await sendCommandToFigma("get_current_figma_screenshot", {
+          maxDimension: maxDimension || 1200
+        });
+        if (!result.imageBytes) throw new Error("Image payload was not received");
+        const metadata = {
+          nodeId: result.nodeId,
+          nodeName: result.nodeName,
+          pageId: result.pageId,
+          pageName: result.pageName,
+          source: result.source,
+          width: result.width,
+          height: result.height,
+          capturedAt: result.capturedAt
+        };
+        if (saveToGallery && !outputPath) {
+          const extension = result.mimeType === "image/jpeg" ? "jpg" : "png";
+          const gallery = await saveToRelayGallery(result.imageBytes, result.nodeName || "figma-screenshot", extension);
+          return { content: [{ type: "text", text: JSON.stringify({ ...gallery, managed: true, ...metadata }) }] };
+        }
+        if (outputPath) {
+          const resolved = path3.resolve(outputPath);
+          fs3.mkdirSync(path3.dirname(resolved), { recursive: true });
+          fs3.writeFileSync(resolved, Buffer.from(result.imageBytes));
+          return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs3.statSync(resolved).size, ...metadata }) }] };
+        }
+        return {
+          content: [
+            { type: "image", data: Buffer.from(result.imageBytes).toString("base64"), mimeType: result.mimeType || "image/png" },
+            { type: "text", text: JSON.stringify(metadata) }
+          ]
+        };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error capturing current Figma screenshot: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
@@ -2772,23 +3003,39 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       logger.info("Already connected to Figma");
       return;
     }
-    const wsUrl = serverUrl === "localhost" ? `${WS_URL}:${port}` : WS_URL;
+    const wsUrl = serverUrl === "localhost" ? `ws://localhost:${port}` : RELAY_WS_URL;
     logger.info(`Connecting to Figma socket server at ${wsUrl}...`);
     ws = new WebSocket(wsUrl);
     ws.on("open", () => {
       logger.info("Connected to Figma socket server");
       currentChannel = null;
       fatalProtocolError = null;
-      ws?.send(JSON.stringify({ type: "hello", role: "controller", requesterId, protocolVersion: PROTOCOL_VERSION }));
+      ws?.send(JSON.stringify({
+        type: "hello",
+        role: "controller",
+        requesterId,
+        protocolVersion: PROTOCOL_VERSION,
+        deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os3.hostname(),
+        platform: `${os3.platform()} ${os3.arch()}`,
+        capabilities: ["binaryFrames", "livePreview"]
+      }));
       if (desiredChannel) {
         joinChannel(desiredChannel).catch(
           (error) => logger.warn(`Could not resume project connection: ${error instanceof Error ? error.message : String(error)}`)
         );
       }
     });
-    ws.on("message", (data) => {
+    ws.on("message", (data, isBinary) => {
       try {
-        const json = JSON.parse(data);
+        let binaryPayload;
+        let json;
+        if (isBinary) {
+          const decoded = decodeBinaryFrame(data);
+          json = decoded.envelope;
+          binaryPayload = decoded.payload;
+        } else {
+          json = JSON.parse(rawDataToBuffer(data).toString("utf8"));
+        }
         if (json.type === "system" && json.event === "protocol_mismatch") {
           fatalProtocolError = String(json.message || `Protocol mismatch. MCP=${PROTOCOL_VERSION}`);
           currentChannel = null;
@@ -2849,6 +3096,11 @@ This detailed process ensures you correctly interpret the reaction data, prepare
             request.reject(new Error(myResponse.error));
           } else {
             let result = myResponse.result;
+            if (binaryPayload) {
+              result = { ...result, imageBytes: binaryPayload, byteLength: binaryPayload.byteLength };
+            } else if (result?.imageData && !result.imageBytes) {
+              result = { ...result, imageBytes: Buffer.from(result.imageData, "base64") };
+            }
             if (myResponse.timing && result && typeof result === "object") {
               result = { ...result, _timing: myResponse.timing };
             }
@@ -2898,7 +3150,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     }
   }
   async function relayProjectsPayload() {
-    const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/projects" : `https://${serverUrl}/projects`;
+    const httpUrl = relayHttpUrl("projects");
     const response = await fetch(httpUrl);
     if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
     return await response.json();
@@ -3550,7 +3802,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     {},
     async () => {
       try {
-        const httpUrl = serverUrl === "localhost" ? "http://localhost:3055/channels" : `https://${serverUrl}/channels`;
+        const httpUrl = relayHttpUrl("channels");
         const res = await fetch(httpUrl);
         if (!res.ok) throw new Error(`relay returned HTTP ${res.status}`);
         const data = await res.json();
@@ -3559,6 +3811,18 @@ This detailed process ensures you correctly interpret the reaction data, prepare
           active: !c.empty,
           hasFigma: (c.clients || []).some((cl) => cl.role === "figma"),
           clientRoles: (c.clients || []).map((cl) => cl.role),
+          busy: c.busy,
+          runningRequests: c.runningRequests || 0,
+          pendingRequests: c.pendingRequests || 0,
+          clients: (c.clients || []).map((cl) => ({
+            id: cl.id,
+            role: cl.role,
+            deviceName: cl.deviceName,
+            connectionScope: cl.connectionScope,
+            address: cl.address,
+            runningRequests: cl.runningRequests || 0,
+            pendingRequests: cl.pendingRequests || 0
+          })),
           document: c.document ? {
             name: c.document.documentName,
             page: c.document.page,
