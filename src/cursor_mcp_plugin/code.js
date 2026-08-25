@@ -809,14 +809,29 @@ function nodePathString(node, page) {
   return parts.join(" > ");
 }
 
-// Search the whole file (or a single page) for nodes whose name contains the
-// query (case-insensitive), in ONE call — instead of walking pages one by one
-// with get_document_info / scan_text_nodes.
+// Snippet of the matched TEXT characters: up to 40 chars of context on each side.
+function textMatchSnippet(characters, q) {
+  const idx = characters.toLowerCase().indexOf(q);
+  if (idx === -1) return null;
+  const start = Math.max(0, idx - 40);
+  const end = Math.min(characters.length, idx + q.length + 40);
+  return (
+    (start > 0 ? "…" : "") +
+    characters.slice(start, end) +
+    (end < characters.length ? "…" : "")
+  );
+}
+
+// Search the whole file (or a single page) for nodes matching the query
+// (case-insensitive) by NAME and/or by TEXT content (a TEXT node's characters,
+// i.e. the UI copy on screen), in ONE call — instead of walking pages one by
+// one with get_document_info / scan_text_nodes.
 async function searchNodes(params) {
-  const { query, types, pageId, limit } = params || {};
+  const { query, types, pageId, limit, match } = params || {};
   if (!query || typeof query !== "string") {
     throw new Error("Missing query parameter");
   }
+  const mode = match === "name" || match === "text" ? match : "both";
   const max = Math.max(1, Math.min(Number(limit) || 50, 200));
   const q = query.toLowerCase();
 
@@ -842,16 +857,40 @@ async function searchNodes(params) {
   let totalScannedPages = 0;
   let truncated = false;
   try {
+    const typeSet =
+      Array.isArray(types) && types.length > 0 ? new Set(types) : null;
     for (const page of pages) {
       totalScannedPages++;
-      let found;
+      // Collected separately so name matches sort before text matches per page.
+      const nameFound = [];
+      const textFound = [];
       try {
-        if (Array.isArray(types) && types.length > 0) {
-          found = page
-            .findAllWithCriteria({ types })
-            .filter((n) => n.name.toLowerCase().indexOf(q) !== -1);
+        if (mode === "name" && typeSet) {
+          // Fast path: indexed type search, then name filter.
+          const candidates = page.findAllWithCriteria({ types });
+          for (const n of candidates) {
+            if (n.name.toLowerCase().indexOf(q) !== -1) nameFound.push(n);
+          }
         } else {
-          found = page.findAll((n) => n.name.toLowerCase().indexOf(q) !== -1);
+          page.findAll((n) => {
+            if (
+              mode !== "text" &&
+              (!typeSet || typeSet.has(n.type)) &&
+              n.name.toLowerCase().indexOf(q) !== -1
+            ) {
+              nameFound.push(n);
+              return false;
+            }
+            if (
+              mode !== "name" &&
+              n.type === "TEXT" &&
+              typeof n.characters === "string" &&
+              n.characters.toLowerCase().indexOf(q) !== -1
+            ) {
+              textFound.push(n);
+            }
+            return false;
+          });
         }
       } catch (e) {
         // A page containing an unclassifiable node type can throw; skip it
@@ -859,8 +898,8 @@ async function searchNodes(params) {
         unreadablePages.push({ id: page.id, name: page.name });
         continue;
       }
-      totalMatches += found.length;
-      for (const node of found) {
+      totalMatches += nameFound.length + textFound.length;
+      for (const node of nameFound) {
         if (matches.length >= max) {
           truncated = true;
           break;
@@ -872,7 +911,26 @@ async function searchNodes(params) {
           pageId: page.id,
           pageName: page.name,
           path: nodePathString(node, page),
+          matchedBy: "name",
         });
+      }
+      if (!truncated) {
+        for (const node of textFound) {
+          if (matches.length >= max) {
+            truncated = true;
+            break;
+          }
+          matches.push({
+            id: node.id,
+            name: node.name,
+            type: node.type,
+            pageId: page.id,
+            pageName: page.name,
+            path: nodePathString(node, page),
+            matchedBy: "text",
+            matchedText: textMatchSnippet(node.characters, q),
+          });
+        }
       }
       if (truncated) break; // early stop on large files once the limit is hit
     }
@@ -882,6 +940,7 @@ async function searchNodes(params) {
 
   const result = {
     query: query,
+    match: mode,
     totalMatches: totalMatches,
     truncated: truncated,
     totalScannedPages: totalScannedPages,

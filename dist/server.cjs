@@ -2903,16 +2903,17 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "search_nodes",
-    "Search the WHOLE FILE (every page) for nodes whose name contains the query (case-insensitive) in a single call. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something by name \u2014 use this tool first, then drill into the returned node/page ids. Each match includes {id, name, type, pageId, pageName, path}. Optionally filter by node types or restrict to one page.",
+    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. Each match includes {id, name, type, pageId, pageName, path, matchedBy} (text matches also carry a matchedText snippet); name matches sort before text matches. Optionally filter by node types or restrict to one page.",
     {
-      query: import_zod.z.string().describe("Substring to match against node names (case-insensitive)."),
-      types: import_zod.z.array(import_zod.z.string()).optional().describe("Optional node types to restrict the search to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Faster on large files."),
+      query: import_zod.z.string().describe("Substring to match (case-insensitive) against node names and/or TEXT content."),
+      match: import_zod.z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
+      types: import_zod.z.array(import_zod.z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
       pageId: import_zod.z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
       limit: import_zod.z.number().int().positive().optional().describe("Max matches to return (default 50, max 200).")
     },
-    async ({ query, types, pageId, limit }) => {
+    async ({ query, match, types, pageId, limit }) => {
       try {
-        const result = await sendCommandToFigma("search_nodes", { query, types, pageId, limit }, 12e4);
+        const result = await sendCommandToFigma("search_nodes", { query, match, types, pageId, limit }, 12e4);
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error searching nodes: ${error instanceof Error ? error.message : String(error)}` }] };
