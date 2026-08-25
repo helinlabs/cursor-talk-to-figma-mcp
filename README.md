@@ -144,15 +144,26 @@ In the AI client:
 ## Protocol compatibility
 
 The relay, MCP server, Figma plugin, and dashboard send protocol version
-`3.0.0` during their WebSocket handshake. Versions with the same major number
+`2.1.0` during their WebSocket handshake. Versions with the same major number
 are compatible. A missing or different major version is rejected before join
 or command routing with an actionable `protocol_mismatch` message; rebuild or
 reconnect the MCP server and re-run the Figma development plugin to update it.
 
-Protocol v3 transports raster/PDF exports as binary WebSocket frames. The
-Figma plugin sends `Uint8Array` bytes, the relay records only transfer metadata,
-and the Bun MCP server either writes those bytes directly to `outputPath` or
-converts them to base64 only for a final inline MCP image response.
+Protocol v2.1 negotiates optional capabilities during the handshake. New v2
+peers use binary WebSocket frames for images while older v2 peers keep the
+base64 compatibility path. The relay records only transfer metadata, and the
+Bun MCP server either writes bytes directly to `outputPath` or converts them to
+base64 only for a final inline MCP image response.
+
+During development, backward-compatible features increment the v2 minor/patch
+version. Formal release versions and tags are managed separately.
+
+The dashboard starts a live preview only while a viewer has opened a specific
+project detail. The default `Figma app window` mode captures a matching visible
+local macOS Figma window every two seconds and requires Screen Recording
+permission for the relay process. `Design node export` uses the connected Figma
+plugin instead, works even when the app window is covered, and updates after
+selection/document changes. With no viewers, neither capture path runs.
 
 ## Editing — what makes a change take effect
 
@@ -211,6 +222,7 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 ### Connection management
 - `list_figma_projects` / `use_figma_project` — project-first discovery and connection
 - `get_figma_workload` — plugin/MCP connection counts and queued work
+- `get_current_figma_screenshot` — capture the local Figma app window by default, or use `captureMode: "node-export"`
 - `list_figma_channels` — list relay channels and which document each is on
 - `join_channel` — legacy low-level compatibility tool
 - `start_bulk_operations` / `get_bulk_operation` / `cancel_bulk_operation`

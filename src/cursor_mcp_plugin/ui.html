@@ -509,7 +509,7 @@
     </div>
 
     <script>
-      const PROTOCOL_VERSION = "3.0.0";
+      const PROTOCOL_VERSION = "2.1.0";
       const BINARY_MAGIC = [0x54, 0x54, 0x46, 0x42]; // "TTFB"
 
       function encodeBinaryFrame(envelope, payload) {
@@ -529,6 +529,7 @@
         serverPort: 3055,
         serverUrl: "ws://localhost:3055",
         deviceName: "",
+        relayCapabilities: new Set(),
         pendingRequests: new Map(),
         channel: null,
         commandTracking: new Map(),
@@ -837,6 +838,7 @@
           if (!/^wss?:\/\//i.test(wsUrl)) throw new Error("Relay address must start with ws:// or wss://");
           state.serverUrl = wsUrl;
           state.deviceName = deviceNameInput.value.trim() || navigator.platform || "Figma plugin";
+          state.relayCapabilities = new Set();
           parent.postMessage({ pluginMessage: {
             type: "update-settings",
             serverUrl: state.serverUrl,
@@ -853,6 +855,7 @@
               protocolVersion: PROTOCOL_VERSION,
               deviceName: state.deviceName,
               platform: navigator.platform || navigator.userAgent,
+              capabilities: ["binaryFrames", "livePreview"],
             }));
             // Reuse the previous channel on reconnect; otherwise pick a new one.
             const channelName =
@@ -886,6 +889,15 @@
                 reconnect.stop();
                 updateConnectionStatus(false, state.fatalProtocolError);
                 connectionStatus.className = "status disconnected";
+                return;
+              }
+
+              if (data.type === "system" && data.event === "hello_ack") {
+                state.relayCapabilities = new Set(data.capabilities || []);
+              }
+
+              if (data.type === "preview_control") {
+                parent.postMessage({ pluginMessage: { type: "preview-control", enabled: !!data.enabled } }, "*");
                 return;
               }
 
@@ -1151,7 +1163,7 @@
           return;
         }
 
-        if (result && result.imageBytes) {
+        if (result && result.imageBytes && state.relayCapabilities.has("binaryFrames")) {
           const bytes = result.imageBytes instanceof Uint8Array
             ? result.imageBytes
             : new Uint8Array(result.imageBytes);
@@ -1170,6 +1182,23 @@
           return;
         }
 
+        if (result && result.imageBytes) {
+          const bytes = result.imageBytes instanceof Uint8Array
+            ? result.imageBytes
+            : new Uint8Array(result.imageBytes);
+          let binary = "";
+          const chunkSize = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+          }
+          result = Object.assign({}, result, {
+            imageData: btoa(binary),
+            binary: false,
+            byteLength: bytes.byteLength,
+          });
+          delete result.imageBytes;
+        }
+
         state.socket.send(
           JSON.stringify({
             id,
@@ -1181,6 +1210,37 @@
             },
           })
         );
+      }
+
+      function bytesToBase64(bytes) {
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+      }
+
+      function sendPreviewFrame(result) {
+        if (!state.connected || !state.socket || !result?.imageBytes) return;
+        const bytes = result.imageBytes instanceof Uint8Array
+          ? result.imageBytes
+          : new Uint8Array(result.imageBytes);
+        const preview = Object.assign({}, result, { imageBytes: undefined, byteLength: bytes.byteLength });
+        delete preview.imageBytes;
+        if (state.relayCapabilities.has("binaryFrames")) {
+          state.socket.send(encodeBinaryFrame({
+            type: "preview_frame",
+            channel: state.channel,
+            preview,
+          }, bytes));
+        } else {
+          state.socket.send(JSON.stringify({
+            type: "preview_frame",
+            channel: state.channel,
+            preview: Object.assign(preview, { imageData: bytesToBase64(bytes) }),
+          }));
+        }
       }
 
       // Send error response back to WebSocket
@@ -1402,6 +1462,14 @@
           case "doc-meta":
             state.docMeta = message.meta;
             announceDocMeta();
+            break;
+          case "preview-frame":
+            sendPreviewFrame(message.result);
+            break;
+          case "preview-error":
+            if (state.connected && state.socket) {
+              state.socket.send(JSON.stringify({ type: "preview_error", channel: state.channel, error: message.error }));
+            }
             break;
         }
       };

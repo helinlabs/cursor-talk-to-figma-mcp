@@ -8,8 +8,9 @@ import { v4 as uuidv4 } from "uuid";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { captureLocalFigmaWindow } from "../local-figma-capture";
 
-const PROTOCOL_VERSION = "3.0.0";
+const PROTOCOL_VERSION = "2.1.0";
 const BINARY_MAGIC = Buffer.from([0x54, 0x54, 0x46, 0x42]); // "TTFB"
 
 function rawDataToBuffer(data: any): Buffer {
@@ -1291,7 +1292,7 @@ server.tool(
         if (fmt === "SVG" && typeof result.svg === "string") {
           fs.writeFileSync(resolved, result.svg, "utf8");
         } else {
-          if (!result.imageBytes) throw new Error("Binary image payload was not received");
+          if (!result.imageBytes) throw new Error("Image payload was not received");
           fs.writeFileSync(resolved, Buffer.from(result.imageBytes));
         }
         const stat = fs.statSync(resolved);
@@ -1330,7 +1331,7 @@ server.tool(
       }
 
       // --- Raster / PDF inline image ---------------------------------------
-      if (!result.imageBytes) throw new Error("Binary image payload was not received");
+      if (!result.imageBytes) throw new Error("Image payload was not received");
       return {
         content: [
           {
@@ -1352,6 +1353,71 @@ server.tool(
           },
         ],
       };
+    }
+  }
+);
+
+server.tool(
+  "get_current_figma_screenshot",
+  "Capture the current Figma view. By default Bun captures the matching local Figma application window on macOS (fast, requires Screen Recording permission and a visible local window). Set captureMode=node-export to export the selected design node, or the largest visible top-level node when nothing is selected. If outputPath is provided, save the image on the MCP server machine instead of returning it inline.",
+  {
+    maxDimension: z.number().int().min(320).max(2400).optional().describe("Maximum output width or height in pixels (default 1200)"),
+    captureMode: z.enum(["app-window", "node-export"]).optional().describe("Capture source; defaults to app-window"),
+    outputPath: z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved"),
+  },
+  async ({ maxDimension, captureMode, outputPath }: any) => {
+    try {
+      const mode = captureMode || "app-window";
+      const localCapture = mode === "app-window"
+        ? await captureLocalFigmaWindow(selectedProject?.name, maxDimension || 1200)
+        : null;
+      const result = localCapture ? {
+        imageBytes: localCapture.bytes,
+        mimeType: localCapture.mimeType,
+        nodeName: localCapture.windowName,
+        source: "app-window",
+        width: localCapture.width,
+        height: localCapture.height,
+        capturedAt: localCapture.capturedAt,
+      } : (await sendCommandToFigma("get_current_figma_screenshot", {
+          maxDimension: maxDimension || 1200,
+        })) as {
+        imageBytes?: Buffer | Uint8Array;
+        mimeType?: string;
+        nodeId?: string;
+        nodeName?: string;
+        pageId?: string;
+        pageName?: string;
+        source?: string;
+        width?: number;
+        height?: number;
+        capturedAt?: number;
+      };
+      if (!result.imageBytes) throw new Error("Image payload was not received");
+      const metadata = {
+        nodeId: result.nodeId,
+        nodeName: result.nodeName,
+        pageId: result.pageId,
+        pageName: result.pageName,
+        source: result.source,
+        width: result.width,
+        height: result.height,
+        capturedAt: result.capturedAt,
+      };
+      if (outputPath) {
+        const resolved = path.resolve(outputPath);
+        fs.mkdirSync(path.dirname(resolved), { recursive: true });
+        fs.writeFileSync(resolved, Buffer.from(result.imageBytes));
+        return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs.statSync(resolved).size, ...metadata }) }] };
+      }
+      return {
+        content: [
+          { type: "image", data: Buffer.from(result.imageBytes).toString("base64"), mimeType: result.mimeType || "image/png" },
+          { type: "text", text: JSON.stringify(metadata) },
+        ],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error capturing current Figma screenshot: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
@@ -3091,6 +3157,7 @@ type FigmaCommand =
   | "get_instance_overrides"
   | "set_instance_overrides"
   | "export_node_as_image"
+  | "get_current_figma_screenshot"
   | "join"
   | "set_corner_radius"
   | "clone_node"
@@ -3224,6 +3291,9 @@ type CommandParams = {
     format?: "PNG" | "JPG" | "SVG" | "PDF";
     scale?: number;
   };
+  get_current_figma_screenshot: {
+    maxDimension?: number;
+  };
   execute_code: {
     code: string;
   };
@@ -3341,6 +3411,7 @@ function connectToFigma(port: number = 3055) {
       protocolVersion: PROTOCOL_VERSION,
       deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os.hostname(),
       platform: `${os.platform()} ${os.arch()}`,
+      capabilities: ["binaryFrames", "livePreview"],
     }));
     if (desiredChannel) {
       joinChannel(desiredChannel).catch((error) =>
@@ -3462,6 +3533,8 @@ function connectToFigma(port: number = 3055) {
           let result = myResponse.result;
           if (binaryPayload) {
             result = { ...result, imageBytes: binaryPayload, byteLength: binaryPayload.byteLength };
+          } else if (result?.imageData && !result.imageBytes) {
+            result = { ...result, imageBytes: Buffer.from(result.imageData, "base64") };
           }
           if (myResponse.timing && result && typeof result === "object") {
             result = { ...result, _timing: myResponse.timing };

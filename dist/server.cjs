@@ -31,7 +31,77 @@ var import_uuid = require("uuid");
 var fs = __toESM(require("fs"), 1);
 var path = __toESM(require("path"), 1);
 var os = __toESM(require("os"), 1);
-var PROTOCOL_VERSION = "3.0.0";
+
+// src/local-figma-capture.ts
+var import_node_child_process = require("child_process");
+var import_promises = require("fs/promises");
+var import_node_os = require("os");
+var import_node_path = require("path");
+var import_node_util = require("util");
+var execFileAsync = (0, import_node_util.promisify)(import_node_child_process.execFile);
+var WINDOW_SCRIPT = `
+function run(argv) {
+  const wanted = String(argv[0] || "");
+  const normalize = (value) => String(value || "").replace(/^[^A-Za-z0-9\uAC00-\uD7A3]+/, "").trim().toLowerCase();
+  const target = normalize(wanted);
+  const systemEvents = Application("System Events");
+  const process = systemEvents.processes.byName("Figma");
+  if (!process.exists()) throw new Error("Figma application is not running on this Mac");
+  const windows = process.windows().map((window) => ({
+    name: String(window.name() || ""),
+    position: window.position(),
+    size: window.size(),
+  }));
+  const match = target
+    ? windows.find((window) => {
+        const name = normalize(window.name);
+        return name === target || name.includes(target) || target.includes(name);
+      })
+    : windows[0];
+  if (!match) throw new Error("No local Figma window matches project: " + wanted);
+  return JSON.stringify(match);
+}`;
+async function captureLocalFigmaWindow(projectName, maxDimension = 1400) {
+  if (process.platform !== "darwin") {
+    throw new Error("Local Figma window capture is currently supported on macOS only");
+  }
+  const { stdout } = await execFileAsync("/usr/bin/osascript", [
+    "-l",
+    "JavaScript",
+    "-e",
+    WINDOW_SCRIPT,
+    projectName || ""
+  ], { maxBuffer: 1024 * 1024 });
+  const windowInfo = JSON.parse(stdout.trim());
+  const [x, y] = windowInfo.position.map((value) => Math.round(value));
+  const [width, height] = windowInfo.size.map((value) => Math.max(1, Math.round(value)));
+  const captureDir = await (0, import_promises.mkdtemp)((0, import_node_path.join)((0, import_node_os.tmpdir)(), "talk-to-figma-preview-"));
+  const capturePath = (0, import_node_path.join)(captureDir, "figma-window.jpg");
+  try {
+    try {
+      await execFileAsync("/usr/sbin/screencapture", ["-x", `-R${x},${y},${width},${height}`, "-tjpg", capturePath]);
+    } catch {
+      throw new Error("Could not capture the local Figma window. Grant Screen Recording permission to the Bun/relay process and keep the Figma window visible.");
+    }
+    const scale = Math.min(1, Math.max(320, maxDimension) / Math.max(width, height));
+    if (scale < 1) {
+      await execFileAsync("/usr/bin/sips", ["-Z", String(Math.round(Math.max(width, height) * scale)), capturePath]);
+    }
+    return {
+      bytes: await (0, import_promises.readFile)(capturePath),
+      mimeType: "image/jpeg",
+      windowName: windowInfo.name,
+      width: Math.max(1, Math.round(width * scale)),
+      height: Math.max(1, Math.round(height * scale)),
+      capturedAt: Date.now()
+    };
+  } finally {
+    await (0, import_promises.rm)(captureDir, { recursive: true, force: true });
+  }
+}
+
+// src/talk_to_figma_mcp/server.ts
+var PROTOCOL_VERSION = "2.1.0";
 var BINARY_MAGIC = Buffer.from([84, 84, 70, 66]);
 function rawDataToBuffer(data) {
   if (Buffer.isBuffer(data)) return data;
@@ -1045,7 +1115,7 @@ server.tool(
         if (fmt === "SVG" && typeof result.svg === "string") {
           fs.writeFileSync(resolved, result.svg, "utf8");
         } else {
-          if (!result.imageBytes) throw new Error("Binary image payload was not received");
+          if (!result.imageBytes) throw new Error("Image payload was not received");
           fs.writeFileSync(resolved, Buffer.from(result.imageBytes));
         }
         const stat = fs.statSync(resolved);
@@ -1078,7 +1148,7 @@ server.tool(
         }
         return { content: [{ type: "text", text: result.svg }] };
       }
-      if (!result.imageBytes) throw new Error("Binary image payload was not received");
+      if (!result.imageBytes) throw new Error("Image payload was not received");
       return {
         content: [
           {
@@ -1099,6 +1169,57 @@ server.tool(
           }
         ]
       };
+    }
+  }
+);
+server.tool(
+  "get_current_figma_screenshot",
+  "Capture the current Figma view. By default Bun captures the matching local Figma application window on macOS (fast, requires Screen Recording permission and a visible local window). Set captureMode=node-export to export the selected design node, or the largest visible top-level node when nothing is selected. If outputPath is provided, save the image on the MCP server machine instead of returning it inline.",
+  {
+    maxDimension: import_zod.z.number().int().min(320).max(2400).optional().describe("Maximum output width or height in pixels (default 1200)"),
+    captureMode: import_zod.z.enum(["app-window", "node-export"]).optional().describe("Capture source; defaults to app-window"),
+    outputPath: import_zod.z.string().optional().describe("Optional path on the MCP server machine where the captured image should be saved")
+  },
+  async ({ maxDimension, captureMode, outputPath }) => {
+    try {
+      const mode = captureMode || "app-window";
+      const localCapture = mode === "app-window" ? await captureLocalFigmaWindow(selectedProject?.name, maxDimension || 1200) : null;
+      const result = localCapture ? {
+        imageBytes: localCapture.bytes,
+        mimeType: localCapture.mimeType,
+        nodeName: localCapture.windowName,
+        source: "app-window",
+        width: localCapture.width,
+        height: localCapture.height,
+        capturedAt: localCapture.capturedAt
+      } : await sendCommandToFigma("get_current_figma_screenshot", {
+        maxDimension: maxDimension || 1200
+      });
+      if (!result.imageBytes) throw new Error("Image payload was not received");
+      const metadata = {
+        nodeId: result.nodeId,
+        nodeName: result.nodeName,
+        pageId: result.pageId,
+        pageName: result.pageName,
+        source: result.source,
+        width: result.width,
+        height: result.height,
+        capturedAt: result.capturedAt
+      };
+      if (outputPath) {
+        const resolved = path.resolve(outputPath);
+        fs.mkdirSync(path.dirname(resolved), { recursive: true });
+        fs.writeFileSync(resolved, Buffer.from(result.imageBytes));
+        return { content: [{ type: "text", text: JSON.stringify({ saved: true, path: resolved, bytes: fs.statSync(resolved).size, ...metadata }) }] };
+      }
+      return {
+        content: [
+          { type: "image", data: Buffer.from(result.imageBytes).toString("base64"), mimeType: result.mimeType || "image/png" },
+          { type: "text", text: JSON.stringify(metadata) }
+        ]
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error capturing current Figma screenshot: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
@@ -2628,7 +2749,8 @@ function connectToFigma(port = 3055) {
       requesterId,
       protocolVersion: PROTOCOL_VERSION,
       deviceName: process.env.TALK_TO_FIGMA_DEVICE_NAME || os.hostname(),
-      platform: `${os.platform()} ${os.arch()}`
+      platform: `${os.platform()} ${os.arch()}`,
+      capabilities: ["binaryFrames", "livePreview"]
     }));
     if (desiredChannel) {
       joinChannel(desiredChannel).catch(
@@ -2709,6 +2831,8 @@ function connectToFigma(port = 3055) {
           let result = myResponse.result;
           if (binaryPayload) {
             result = { ...result, imageBytes: binaryPayload, byteLength: binaryPayload.byteLength };
+          } else if (result?.imageData && !result.imageBytes) {
+            result = { ...result, imageBytes: Buffer.from(result.imageData, "base64") };
           }
           if (myResponse.timing && result && typeof result === "object") {
             result = { ...result, _timing: myResponse.timing };
