@@ -177,6 +177,7 @@
       .nav-row .nav-name.current { color: var(--green); }
       .nav-row.section-row { margin-left: 14px; }
       .nav-row.section-row .nav-name { font-weight: 400; color: var(--text); }
+      .nav-row.section-row.depth2 { margin-left: 28px; }
       .nav-caret {
         width: auto; background: transparent; border: 1px solid var(--border);
         color: var(--muted); border-radius: 10px; padding: 1px 8px;
@@ -285,7 +286,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.5.4";
+      const PROTOCOL_VERSION = "2.5.5";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -1055,6 +1056,9 @@
         const [pendingId, setPendingId] = useState(null); // row with an in-flight goto/focus
         const [selected, setSelected] = useState(null);   // {id, name, pageName, kind:"page"|"node"} — persists until cleared
         const [rowErrors, setRowErrors] = useState({});   // row id -> inline error
+        const [pageOverride, setPageOverride] = useState(null); // current-page highlight after our own goto/focus page switches
+        const [childExpanded, setChildExpanded] = useState({}); // sectionId -> bool (depth-2 expansion)
+        const [childrenMap, setChildrenMap] = useState({});     // sectionId -> {loading}|{error}|{children,total,truncated,ambiguous}
 
         // Selectable projects: live ones first, then disk-index-only ones
         // (pages/search still work offline; goto/focus answer 503).
@@ -1078,10 +1082,12 @@
         // preview pane sitting next to this rail on the Navigator tab).
         useEffect(() => { if (onProjectChange) onProjectChange(effectiveKey); }, [effectiveKey, onProjectChange]);
         const liveProject = projects.find((p) => p.projectKey === effectiveKey);
-        // Current page name as announced by the plugin (best effort highlight).
-        const currentPageName = liveProject
+        // Current page: our own goto/focus page switch wins (the plugin's
+        // announce can lag), else the page announced by the plugin.
+        const announcedPageName = liveProject
           && liveProject.connections
           && liveProject.connections.map((c) => c.document && c.document.page).find(Boolean);
+        const currentPageName = pageOverride || announcedPageName;
 
         const loadPages = useCallback(async (key) => {
           if (!key) return;
@@ -1097,11 +1103,13 @@
         useEffect(() => {
           setPages(null); setSearchResults(null); setExpanded({});
           setSelected(null); setRowErrors({}); setPendingId(null);
+          setPageOverride(null); setChildExpanded({}); setChildrenMap({});
           if (effectiveKey) loadPages(effectiveKey);
         }, [effectiveKey, loadPages]);
 
         // Row-scoped POST: pressed/loading state on the clicked row, inline
-        // error on that row on failure, true on success.
+        // error on that row on failure. Returns the response body on success,
+        // null on failure.
         const post = async (endpoint, body, rowId) => {
           setPendingId(rowId);
           setRowErrors((s) => ({ ...s, [rowId]: null }));
@@ -1112,25 +1120,50 @@
               body: JSON.stringify({ project: effectiveKey, ...body }),
             });
             const data = await r.json();
-            if (!r.ok) { setRowErrors((s) => ({ ...s, [rowId]: data.error || `HTTP ${r.status}` })); return false; }
-            return true;
+            if (!r.ok) { setRowErrors((s) => ({ ...s, [rowId]: data.error || `HTTP ${r.status}` })); return null; }
+            return data;
           } catch (e) {
             setRowErrors((s) => ({ ...s, [rowId]: String(e) }));
-            return false;
+            return null;
           } finally { setPendingId(null); }
         };
 
         const goto = async (pageId, pageName) => {
           if (pendingId) return;
-          if (await post("navigator/goto", { pageId }, pageId)) {
+          const data = await post("navigator/goto", { pageId }, pageId);
+          if (data) {
             setSelected({ id: pageId, name: pageName, pageName, kind: "page" });
+            setPageOverride(pageName);
           }
         };
         const focus = async (nodeId, name, pageName) => {
           if (pendingId) return;
-          if (await post("navigator/focus", { nodeId }, nodeId)) {
+          const data = await post("navigator/focus", { nodeId }, nodeId);
+          if (data) {
             setSelected({ id: nodeId, name, pageName: pageName || null, kind: "node" });
+            // The plugin switches pages for cross-page focus and reports it;
+            // move the current-page highlight along with it.
+            const sp = data.result && data.result.switchedPage;
+            if (sp && sp.name) setPageOverride(sp.name);
           }
+        };
+
+        // Depth-2 expansion: direct children of a section, derived from the
+        // disk index's path chains (GET /navigator/children).
+        const toggleChildren = (sectionId) => {
+          const open = !!childExpanded[sectionId];
+          setChildExpanded((s) => ({ ...s, [sectionId]: !open }));
+          if (open || childrenMap[sectionId]) return;
+          setChildrenMap((s) => ({ ...s, [sectionId]: { loading: true } }));
+          (async () => {
+            try {
+              const r = await fetch(relayApiUrl("navigator/children") + `?project=${encodeURIComponent(effectiveKey)}&nodeId=${encodeURIComponent(sectionId)}`);
+              const data = await r.json();
+              setChildrenMap((s) => ({ ...s, [sectionId]: r.ok ? data : { error: data.error || `HTTP ${r.status}` } }));
+            } catch (e) {
+              setChildrenMap((s) => ({ ...s, [sectionId]: { error: String(e) } }));
+            }
+          })();
         };
 
         const search = async () => {
@@ -1226,21 +1259,59 @@
                   </div>
                   {rowErrors[p.pageId] && <div className="nav-row-error">⚠ {rowErrors[p.pageId]}</div>}
                   {open && !p.sections.length && <div className="member muted" style={{ marginLeft: 14 }}>No sections on this page.</div>}
-                  {open && p.sections.map((s) => (
-                    <React.Fragment key={s.id}>
-                      <div
-                        className={"nav-row section-row" + (selected && selected.id === s.id ? " selected" : "") + (pendingId === s.id ? " pending" : "")}
-                        onClick={() => focus(s.id, s.name || s.id, p.pageName)}
-                        title={`Focus ${s.id} (select + scroll)`}
-                      >
-                        <span className="badge">{s.type}</span>
-                        <span className="nav-name">{s.name || "(unnamed)"}</span>
-                        {pendingId === s.id && <span className="badge">…</span>}
-                        {pendingId !== s.id && selected && selected.id === s.id && <span className="badge sel-badge">selected</span>}
-                      </div>
-                      {rowErrors[s.id] && <div className="nav-row-error">⚠ {rowErrors[s.id]}</div>}
-                    </React.Fragment>
-                  ))}
+                  {open && p.sections.map((s) => {
+                    const childOpen = !!childExpanded[s.id];
+                    const kids = childrenMap[s.id];
+                    return (
+                      <React.Fragment key={s.id}>
+                        <div
+                          className={"nav-row section-row" + (selected && selected.id === s.id ? " selected" : "") + (pendingId === s.id ? " pending" : "")}
+                          onClick={() => focus(s.id, s.name || s.id, p.pageName)}
+                          title={`Focus ${s.id} (select + scroll)`}
+                        >
+                          <span className="badge">{s.type}</span>
+                          <span className="nav-name">{s.name || "(unnamed)"}</span>
+                          {pendingId === s.id && <span className="badge">…</span>}
+                          {pendingId !== s.id && selected && selected.id === s.id && <span className="badge sel-badge">selected</span>}
+                          <button
+                            className="nav-caret"
+                            onClick={(e) => { e.stopPropagation(); toggleChildren(s.id); }}
+                            title="Show children"
+                          >
+                            {childOpen ? "▾" : "▸"}
+                          </button>
+                        </div>
+                        {rowErrors[s.id] && <div className="nav-row-error">⚠ {rowErrors[s.id]}</div>}
+                        {childOpen && kids && kids.loading && <div className="member muted" style={{ marginLeft: 28 }}>Loading children…</div>}
+                        {childOpen && kids && kids.error && <div className="nav-row-error" style={{ marginLeft: 36 }}>⚠ {kids.error}</div>}
+                        {childOpen && kids && kids.children && !kids.children.length && (
+                          <div className="member muted" style={{ marginLeft: 28 }}>No children in the index.</div>
+                        )}
+                        {childOpen && kids && kids.children && kids.children.map((c) => (
+                          <React.Fragment key={c.id}>
+                            <div
+                              className={"nav-row section-row depth2" + (selected && selected.id === c.id ? " selected" : "") + (pendingId === c.id ? " pending" : "")}
+                              onClick={() => focus(c.id, c.name || c.id, p.pageName)}
+                              title={`Focus ${c.id} (select + scroll)`}
+                            >
+                              <span className="badge">{c.type}</span>
+                              <span className="nav-name">{c.name || "(unnamed)"}</span>
+                              {pendingId === c.id && <span className="badge">…</span>}
+                              {pendingId !== c.id && selected && selected.id === c.id && <span className="badge sel-badge">selected</span>}
+                            </div>
+                            {rowErrors[c.id] && <div className="nav-row-error" style={{ marginLeft: 36 }}>⚠ {rowErrors[c.id]}</div>}
+                          </React.Fragment>
+                        ))}
+                        {childOpen && kids && kids.children && (kids.truncated || kids.ambiguous) && (
+                          <div className="member muted" style={{ marginLeft: 28, fontSize: 11 }}>
+                            {kids.truncated ? `showing ${kids.children.length} of ${kids.total}` : ""}
+                            {kids.truncated && kids.ambiguous ? " · " : ""}
+                            {kids.ambiguous ? "same-named siblings — children merged" : ""}
+                          </div>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </div>
               );
             })}

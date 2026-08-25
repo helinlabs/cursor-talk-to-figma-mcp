@@ -1577,6 +1577,47 @@ const server = Bun.serve({
       return new Response(JSON.stringify({ results: results.slice(0, limit) }, null, 2), { headers: JSON_HEADERS });
     }
 
+    // Direct children of an indexed node, derived from the disk index's path
+    // chains (child.path === parent.path + " > " + parent.name) — no live
+    // scan. Works at any depth, so this is effectively a tree API; the
+    // console currently uses it for depth 2. Same-named siblings share a
+    // path chain, so their children merge — flagged via ambiguous:true.
+    if (url.pathname === "/navigator/children" && req.method === "GET") {
+      const project = url.searchParams.get("project") || "";
+      const nodeId = url.searchParams.get("nodeId") || "";
+      if (!project || !nodeId) {
+        return new Response(JSON.stringify({ error: "project and nodeId query params are required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const idx = resolveNavigatorIndex(project);
+      if (!idx) {
+        return new Response(JSON.stringify({ error: `No disk index for project "${project}" — run an index build first (POST /index/rebuild or wait for the auto/daily build)` }), { status: 404, headers: JSON_HEADERS });
+      }
+      let page: (typeof idx.pages)[number] | undefined;
+      let entry: (typeof idx.pages)[number]["entries"][number] | undefined;
+      for (const p of idx.pages) {
+        const hit = p.entries.find((e) => e.id === nodeId);
+        if (hit) { page = p; entry = hit; break; }
+      }
+      if (!page || !entry) {
+        return new Response(JSON.stringify({ error: `Node "${nodeId}" is not in the disk index for project "${project}" — reindex the page if it was just created` }), { status: 404, headers: JSON_HEADERS });
+      }
+      const childPath = entry.path ? `${entry.path} > ${entry.name}` : entry.name;
+      // Same (name, path) siblings make the child set ambiguous (merged).
+      const ambiguous = page.entries.filter((e) => e.name === entry!.name && e.path === entry!.path).length > 1;
+      const children = page.entries.filter((e) => e.path === childPath);
+      const LIMIT = 200;
+      return new Response(JSON.stringify({
+        nodeId: entry.id,
+        name: entry.name,
+        pageId: page.pageId,
+        pageName: page.pageName,
+        ambiguous,
+        total: children.length,
+        truncated: children.length > LIMIT,
+        children: children.slice(0, LIMIT).map((e) => ({ id: e.id, name: e.name, type: e.type })),
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
     if (url.pathname === "/status") {
       return new Response(JSON.stringify({
         protocolVersion: PROTOCOL_VERSION,

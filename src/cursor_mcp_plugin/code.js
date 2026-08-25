@@ -6721,6 +6721,24 @@ async function setNodeNames(params) {
 }
 
 // Set focus on a specific node
+// Find the PAGE that owns a node by walking the parent chain, and switch to
+// it when it isn't the current page — a page's selection can only contain its
+// own nodes, so cross-page focus/selection must switch first. Dynamic-page
+// safe: setCurrentPageAsync loads the target page. Returns {id, name} when a
+// switch happened, null otherwise.
+function owningPageOf(node) {
+  let owner = node;
+  while (owner && owner.type !== "PAGE") owner = owner.parent;
+  return owner && owner.type === "PAGE" ? owner : null;
+}
+
+async function ensureNodePageCurrent(node) {
+  const page = owningPageOf(node);
+  if (!page || figma.currentPage.id === page.id) return null;
+  await figma.setCurrentPageAsync(page);
+  return { id: page.id, name: page.name };
+}
+
 async function setFocus(params) {
   if (!params || !params.nodeId) {
     throw new Error("Missing nodeId parameter");
@@ -6731,18 +6749,23 @@ async function setFocus(params) {
     throw new Error(`Node with ID ${params.nodeId} not found`);
   }
 
+  // Cross-page focus: switch to the node's page first.
+  const switchedPage = await ensureNodePageCurrent(node);
+
   // Set selection to the node
   figma.currentPage.selection = [node];
-  
+
   // Scroll and zoom to show the node in viewport
   figma.viewport.scrollAndZoomIntoView([node]);
 
-  return {
+  const result = {
     success: true,
     name: node.name,
     id: node.id,
-    message: `Focused on node "${node.name}"`
+    message: `Focused on node "${node.name}"${switchedPage ? ` (switched to page "${switchedPage.name}")` : ""}`
   };
+  if (switchedPage) result.switchedPage = switchedPage;
+  return result;
 }
 
 // Set selection to multiple nodes
@@ -6772,22 +6795,41 @@ async function setSelections(params) {
     throw new Error(`No valid nodes found for the provided IDs: ${params.nodeIds.join(', ')}`);
   }
 
-  // Set selection to the nodes
-  figma.currentPage.selection = nodes;
-  
-  // Scroll and zoom to show all nodes in viewport
-  figma.viewport.scrollAndZoomIntoView(nodes);
+  // Cross-page selection: switch to the FIRST node's page, then select only
+  // the nodes living on that page (a selection cannot span pages); the rest
+  // are reported as skipped instead of failing the whole call.
+  const switchedPage = await ensureNodePageCurrent(nodes[0]);
+  const currentPageId = figma.currentPage.id;
+  const selectable = [];
+  const otherPageIds = [];
+  for (const node of nodes) {
+    const page = owningPageOf(node);
+    if (page && page.id === currentPageId) selectable.push(node);
+    else otherPageIds.push(node.id);
+  }
 
-  const selectedNodes = nodes.map(node => ({
+  // Set selection to the nodes
+  figma.currentPage.selection = selectable;
+
+  // Scroll and zoom to show all nodes in viewport
+  figma.viewport.scrollAndZoomIntoView(selectable);
+
+  const selectedNodes = selectable.map(node => ({
     name: node.name,
     id: node.id
   }));
 
-  return {
+  const result = {
     success: true,
-    count: nodes.length,
+    count: selectable.length,
     selectedNodes: selectedNodes,
     notFoundIds: notFoundIds,
-    message: `Selected ${nodes.length} nodes${notFoundIds.length > 0 ? ` (${notFoundIds.length} not found)` : ''}`
+    message: `Selected ${selectable.length} nodes`
+      + (switchedPage ? ` (switched to page "${switchedPage.name}")` : '')
+      + (notFoundIds.length > 0 ? ` (${notFoundIds.length} not found)` : '')
+      + (otherPageIds.length > 0 ? ` (${otherPageIds.length} skipped: on a different page than the first node)` : '')
   };
+  if (switchedPage) result.switchedPage = switchedPage;
+  if (otherPageIds.length > 0) result.skippedOtherPageIds = otherPageIds;
+  return result;
 }
