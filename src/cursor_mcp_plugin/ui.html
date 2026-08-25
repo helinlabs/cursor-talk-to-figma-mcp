@@ -508,6 +508,7 @@
     </div>
 
     <script>
+      const PROTOCOL_VERSION = "2.0.0";
       // WebSocket connection state
       const state = {
         connected: false,
@@ -519,6 +520,8 @@
         // Auto-reconnect bookkeeping
         userDisconnected: false, // true only when the user clicks Disconnect
         everConnected: false, // only auto-reconnect after a real connection
+        fatalProtocolError: null,
+        clientId: "figma-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
       };
 
       // Build badge: the load time proves Figma reloaded; the build id is a
@@ -674,6 +677,8 @@
                 ? "ok"
                 : "error";
             const body = [];
+            if (e.requester)
+              body.push(`<h4>requester</h4><pre>${esc(e.requester)}</pre>`);
             body.push(`<h4>params</h4><pre>${esc(safeJson(e.params))}</pre>`);
             if (e.status === "success")
               body.push(`<h4>result</h4><pre>${esc(safeJson(e.result))}</pre>`);
@@ -697,13 +702,14 @@
         }
 
         return {
-          add(id, command, params) {
+          add(id, command, params, requester) {
             const e = {
               id,
               command,
               params,
               status: "running",
               startedAt: Date.now(),
+              requester,
               open: false,
             };
             entries.push(e);
@@ -813,6 +819,12 @@
           state.socket = new WebSocket(wsUrl);
 
           state.socket.onopen = () => {
+            state.socket.send(JSON.stringify({
+              type: "hello",
+              role: "figma",
+              requesterId: state.clientId,
+              protocolVersion: PROTOCOL_VERSION,
+            }));
             // Reuse the previous channel on reconnect; otherwise pick a new one.
             const channelName =
               options.channel || state.channel || generateChannelName();
@@ -838,6 +850,15 @@
             try {
               const data = JSON.parse(event.data);
               console.log("Received message:", data);
+
+              if (data.type === "system" && data.event === "protocol_mismatch") {
+                state.fatalProtocolError = data.message || `Protocol mismatch. Plugin=${PROTOCOL_VERSION}`;
+                state.userDisconnected = true;
+                reconnect.stop();
+                updateConnectionStatus(false, state.fatalProtocolError);
+                connectionStatus.className = "status disconnected";
+                return;
+              }
 
               if (data.type === "system") {
                 // Successfully joined channel
@@ -884,6 +905,10 @@
           state.socket.onclose = () => {
             state.connected = false;
             state.socket = null;
+            if (state.fatalProtocolError) {
+              updateConnectionStatus(false, state.fatalProtocolError);
+              return;
+            }
             handleDisconnect("connection lost");
           };
 
@@ -977,6 +1002,20 @@
         if (!document.hidden) reconnect.attempt("tab visible");
       });
 
+      // Application-level heartbeat catches a frozen/backgrounded plugin UI;
+      // the relay closes stale sockets and the reconnect loop resumes them.
+      setInterval(() => {
+        if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+          state.socket.send(JSON.stringify({
+            type: "heartbeat",
+            role: "figma",
+            requesterId: state.clientId,
+            channel: state.channel,
+            ts: Date.now(),
+          }));
+        }
+      }, 10000);
+
       // Handle messages from the WebSocket
       async function handleSocketMessage(payload) {
         const data = payload.message;
@@ -1003,7 +1042,7 @@
               command: data.command,
               startedAt: Date.now(),
             });
-            reqLog.add(data.id, data.command, data.params);
+            reqLog.add(data.id, data.command, data.params, payload.sender);
 
             // Send the command to the plugin code
             parent.postMessage(
@@ -1159,6 +1198,7 @@
           disconnectFromServer();
         } else {
           state.userDisconnected = false;
+          state.fatalProtocolError = null;
           const port = parseInt(portInput.value, 10) || 3055;
           updateConnectionStatus(false, "Connecting...");
           connectionStatus.className = "status info";
@@ -1257,6 +1297,16 @@
             sendSuccessResponse(message.id, message.result);
             trackCommandResult(message.id, true);
             reqLog.finish(message.id, "success", message.result);
+            break;
+          case "command-started":
+            if (state.connected && state.socket) {
+              state.socket.send(JSON.stringify({
+                type: "execution_started",
+                id: message.id,
+                channel: state.channel,
+                ts: message.timestamp || Date.now(),
+              }));
+            }
             break;
           case "command-error":
             // Forward the error from plugin code back to WebSocket

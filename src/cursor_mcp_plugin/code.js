@@ -90,6 +90,14 @@ figma.ui.onmessage = async (msg) => {
     case "execute-command":
       // Execute commands received from UI (which gets them from WebSocket)
       try {
+        // Emitted from the plugin main thread (not the UI iframe), so the relay
+        // can separate time spent waiting for Figma from actual execution time.
+        figma.ui.postMessage({
+          type: "command-started",
+          id: msg.id,
+          command: msg.command,
+          timestamp: Date.now(),
+        });
         const result = await handleCommand(msg.command, msg.params);
         figma.ui.postMessage({
           type: "command-result",

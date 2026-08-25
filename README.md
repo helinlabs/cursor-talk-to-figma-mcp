@@ -71,8 +71,9 @@ Control it any time with `./scripts/relayctl.sh <cmd>`:
 1. Figma → **Plugins → Development → Import plugin from manifest…**
 2. Select `src/cursor_mcp_plugin/manifest.json`.
 3. Run it: **Plugins → Development → Talk To Figma MCP Plugin**.
-4. In the plugin window click **Connect** (port 3055). It joins a random channel
-   whose name is shown in the UI — you'll need that name to join from the agent.
+4. In the plugin window click **Connect** (port 3055). The relay groups the
+   connection by Figma file/project automatically; random channel ids are now
+   internal compatibility details.
 
 The plugin header shows a **build badge**: `build <hash> · loaded HH:MM:SS`. The
 hash is a content hash of the on-disk plugin files (fetched from the relay), and
@@ -136,9 +137,11 @@ confined to this directory.
 
 In the AI client:
 
-1. `list_figma_channels` — find the channel whose document matches your Figma file.
-2. `join_channel` with that channel name.
-3. Use the tools (see [MCP Tools](#mcp-tools)).
+1. `list_figma_projects` — see connected projects, connection counts, and load.
+2. `use_figma_project` with a document name or file key. The relay selects the
+   least-loaded healthy plugin connection automatically.
+3. Use the tools (see [MCP Tools](#mcp-tools)). If exactly one project is live,
+   ordinary tools select it automatically.
 
 ## Where to look / what to check
 
@@ -146,10 +149,20 @@ In the AI client:
 |---|---|
 | **Web console** (channels, documents, live request explorer) | http://localhost:3055/console (or `/`) |
 | Channels + documents as JSON | http://localhost:3055/channels |
+| Project connections and recommended targets | http://localhost:3055/projects |
+| Workload, in-flight requests, and bulk jobs | http://localhost:3055/status |
 | Current plugin build hash (matches the plugin badge) | http://localhost:3055/plugin-version |
 | Relay health (running? crashes?) | `./scripts/relayctl.sh status` |
 | Relay logs / crash history | `./scripts/relayctl.sh logs` · `crashes` · files under `.relay/` |
 | Which plugin code Figma loaded | the **build badge** in the plugin window |
+
+## Protocol compatibility
+
+The relay, MCP server, Figma plugin, and dashboard send protocol version
+`2.0.0` during their WebSocket handshake. Versions with the same major number
+are compatible. A missing or different major version is rejected before join
+or command routing with an actionable `protocol_mismatch` message; rebuild or
+reconnect the MCP server and re-run the Figma development plugin to update it.
 
 ## Editing — what makes a change take effect
 
@@ -207,8 +220,11 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 - `get_reactions` / `set_default_connector` / `create_connections`
 
 ### Connection management
+- `list_figma_projects` / `use_figma_project` — project-first discovery and connection
+- `get_figma_workload` — plugin/MCP connection counts and queued work
 - `list_figma_channels` — list relay channels and which document each is on
-- `join_channel` — join a channel to talk to a specific Figma file
+- `join_channel` — legacy low-level compatibility tool
+- `start_bulk_operations` / `get_bulk_operation` / `cancel_bulk_operation`
 
 ### MCP prompts
 `design_strategy`, `read_design_strategy`, `text_replacement_strategy`,
@@ -217,7 +233,7 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 
 ## Best practices
 
-1. Always `join_channel` before sending commands (`list_figma_channels` finds it).
+1. Select with `use_figma_project`; channel ids are not needed for normal use.
 2. Start from `get_document_info`; for a whole screen prefer `get_frame_context`.
 3. Verify changes with `get_node_info` / `read_my_design`.
 4. For large designs, rely on the chunked/progress-reporting tools

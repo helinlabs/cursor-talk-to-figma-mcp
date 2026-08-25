@@ -29,7 +29,7 @@ There is no test suite or linter configured.
 The main server implementing the MCP protocol via `@modelcontextprotocol/sdk`. Exposes 50+ tools (create shapes, modify text, manage layouts, export images, etc.) and several AI prompts (design strategies). Communicates with the AI agent over stdio and with the WebSocket relay via `ws`. Each request gets a UUID, is tracked in a `pendingRequests` Map with timeout/promise callbacks, and resolves when the plugin responds.
 
 ### WebSocket Relay (`src/socket.ts`)
-Lightweight Bun WebSocket server on port 3055 (configurable via `PORT` env). Routes messages between MCP server and Figma plugin using channel-based isolation. Clients call `join` to enter a channel; messages broadcast only within the same channel.
+Lightweight Bun WebSocket server on port 3055 (configurable via `PORT` env). Groups live plugin connections by Figma file/project, routes each request to one healthy low-load connection, tracks heartbeats/workload/timings/bulk jobs, and keeps channels only as an internal compatibility layer.
 
 ### Figma Plugin (`src/cursor_mcp_plugin/`)
 Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via a dispatcher. `ui.html` is the plugin UI for WebSocket connection management. `manifest.json` declares permissions (dynamic-page access, localhost network). The plugin is **not built/bundled** — `code.js` is written directly as the runtime artifact.
@@ -48,7 +48,7 @@ Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via
 1. Run `bun setup` — installs dependencies and writes MCP config for both Cursor (`.cursor/mcp.json`) and Claude Code (`.mcp.json`)
 2. `bun socket` in one terminal (WebSocket relay on port 3055)
 3. In Figma: Plugins → Development → Link existing plugin → select `src/cursor_mcp_plugin/manifest.json`
-4. Run plugin in Figma, join a channel, then use tools from Cursor or Claude Code
+4. Run the plugin in Figma, then select it with `use_figma_project` from Cursor or Claude Code
 
 The MCP config written by `bun setup` uses the published package:
 
@@ -71,7 +71,7 @@ claude mcp add TalkToFigma -- bunx cursor-talk-to-figma-mcp@latest
 
 ## Agent Notes
 
-- Always call `join_channel` before issuing any Figma commands
+- Prefer `list_figma_projects` + `use_figma_project`; `join_channel` is legacy compatibility only
 - Call `get_document_info` first to understand the design structure
 - Use `read_my_design` or `get_selection` before making modifications
 - Batch operations (`set_multiple_text_contents`, `delete_multiple_nodes`, `set_multiple_annotations`) are preferred over repeated single-node calls for performance
