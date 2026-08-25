@@ -683,6 +683,182 @@
         );
       }
 
+      // ----- Search index panel ---------------------------------------------
+      function fmtAge(ts) {
+        if (!ts) return "never";
+        const s = Math.round((Date.now() - ts) / 1000);
+        if (s < 90) return `${s}s ago`;
+        if (s < 5400) return `${Math.round(s / 60)}m ago`;
+        if (s < 129600) return `${Math.round(s / 3600)}h ago`;
+        return `${Math.round(s / 86400)}d ago`;
+      }
+
+      function IndexPanel({ projects }) {
+        const [status, setStatus] = useState(null);
+        const [cacheStatus, setCacheStatus] = useState({}); // projectKey -> result|{error}
+        const [busy, setBusy] = useState(false);
+
+        const refresh = useCallback(async () => {
+          try {
+            const r = await fetch("/index/status");
+            setStatus(await r.json());
+          } catch (e) { setStatus({ error: String(e) }); }
+        }, []);
+
+        useEffect(() => {
+          refresh();
+          const t = setInterval(refresh, 5000);
+          return () => clearInterval(t);
+        }, [refresh]);
+
+        const rebuild = async (projectKey) => {
+          setBusy(true);
+          try {
+            await fetch("/index/rebuild" + (projectKey ? `?project=${encodeURIComponent(projectKey)}` : ""), { method: "POST" });
+            await refresh();
+          } finally { setBusy(false); }
+        };
+
+        const fetchCache = async (projectKey) => {
+          try {
+            const r = await fetch(`/index/cache-status?project=${encodeURIComponent(projectKey)}`);
+            setCacheStatus((s) => ({ ...s, [projectKey]: null }));
+            const data = await r.json();
+            setCacheStatus((s) => ({ ...s, [projectKey]: data }));
+          } catch (e) {
+            setCacheStatus((s) => ({ ...s, [projectKey]: { error: String(e) } }));
+          }
+        };
+
+        const running = status && status.state === "running";
+        const disk = (status && status.diskIndexes) || [];
+        const jobByKey = {};
+        ((status && status.jobProjects) || []).forEach((p) => { jobByKey[p.projectKey] = p; });
+        // Show every project we know about: live ones + ones with a disk index.
+        const keys = new Map();
+        projects.forEach((p) => keys.set(p.projectKey, { name: p.name, live: true }));
+        disk.forEach((d) => { if (!keys.has(d.projectKey)) keys.set(d.projectKey, { name: d.projectName || d.projectKey, live: false }); });
+        const diskByKey = {};
+        disk.forEach((d) => { diskByKey[d.projectKey] = d; });
+
+        return (
+          <div className="section">
+            <h2>Search Index</h2>
+            {!status && <div className="muted">Loading…</div>}
+            {status && status.error && <div className="muted">{status.error}</div>}
+            {status && !status.error && (
+              <div className="chan-card">
+                <div className="chan-head">
+                  <span className="doc-name">{running ? "Indexing…" : "Idle"}</span>
+                  <span className="badge">{running ? `${status.scannedPages}/${status.totalPages} pages` : `built ${fmtAge(status.lastCompletedAt)}`}</span>
+                </div>
+                {running && status.currentStep && (
+                  <div className="member"><code>now: {status.currentStep.pageName} · avg {status.avgPageMs ? (status.avgPageMs / 1000).toFixed(1) : "?"}s/page · ETA {status.etaMs ? Math.round(status.etaMs / 1000) + "s" : "?"}</code></div>
+                )}
+                {status.lastError && <div className="member"><code>⚠ {status.lastError}</code></div>}
+                <div className="member">
+                  <button className="ghost" disabled={busy || running} onClick={() => rebuild()} style={{ padding: "2px 8px", fontSize: 11 }}>
+                    Reindex all now
+                  </button>
+                </div>
+              </div>
+            )}
+            {[...keys.entries()].map(([projectKey, info]) => {
+              const d = diskByKey[projectKey];
+              const j = jobByKey[projectKey];
+              const cache = cacheStatus[projectKey];
+              return (
+                <div className="chan-card" key={projectKey}>
+                  <div className="chan-head">
+                    <span className="doc-name">{info.name || "(untitled)"}</span>
+                    <span className="badge">{d ? `${d.pageCount} pages · ${d.nodeCount} nodes` : "no index"}</span>
+                  </div>
+                  <div className="member"><code>built {fmtAge(d && d.builtAt)}{j && running ? ` · scanning ${j.scannedPages}/${j.totalPages}` : ""}{j && j.failures && j.failures.length ? ` · ${j.failures.length} failed pages` : ""}</code></div>
+                  <div className="member" style={{ gap: 6 }}>
+                    <button className="ghost" disabled={busy || running || !info.live} onClick={() => rebuild(projectKey)} style={{ padding: "2px 8px", fontSize: 11 }}>Reindex</button>
+                    <button className="ghost" disabled={!info.live} onClick={() => fetchCache(projectKey)} style={{ padding: "2px 8px", fontSize: 11 }}>Plugin cache</button>
+                  </div>
+                  {cache && cache.error && <div className="member"><code>⚠ {cache.error}</code></div>}
+                  {cache && cache.pages && (
+                    <div className="member" style={{ display: "block" }}>
+                      {cache.pages.map((p) => (
+                        <div key={p.pageId}><code>{p.cached ? "●" : "○"} {p.name}{p.cached ? ` · ${p.nodeCount} nodes · ${fmtAge(p.builtAt)}` : ""}</code></div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      }
+
+      // ----- Keyword annotations panel --------------------------------------
+      function AnnotationsPanel({ projects }) {
+        const [items, setItems] = useState(null);
+        const [form, setForm] = useState({ keyword: "", projectKey: "", nodeId: "", note: "" });
+        const [error, setError] = useState(null);
+
+        const refresh = useCallback(async () => {
+          try {
+            const r = await fetch("/search/annotations");
+            const data = await r.json();
+            setItems(data.annotations || []);
+          } catch (e) { setError(String(e)); }
+        }, []);
+
+        useEffect(() => { refresh(); }, [refresh]);
+
+        const add = async () => {
+          setError(null);
+          const projectKey = form.projectKey || (projects[0] && projects[0].projectKey) || "";
+          const r = await fetch("/search/annotations", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ keyword: form.keyword, projectKey, nodeId: form.nodeId, note: form.note || undefined }),
+          });
+          const data = await r.json();
+          if (!r.ok) { setError(data.error || "failed"); return; }
+          setForm({ keyword: "", projectKey: form.projectKey, nodeId: "", note: "" });
+          refresh();
+        };
+
+        const remove = async (a) => {
+          await fetch(`/search/annotations?keyword=${encodeURIComponent(a.keyword)}&projectKey=${encodeURIComponent(a.projectKey)}&nodeId=${encodeURIComponent(a.nodeId)}`, { method: "DELETE" });
+          refresh();
+        };
+
+        const inputStyle = { width: "100%", boxSizing: "border-box", marginBottom: 4, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", fontSize: 12 };
+        return (
+          <div className="section">
+            <h2>Keyword Annotations</h2>
+            {items === null && <div className="muted">Loading…</div>}
+            {items && !items.length && <div className="muted">No annotations. Register keyword→node links that search missed.</div>}
+            {items && items.map((a, i) => (
+              <div className="chan-card" key={i}>
+                <div className="chan-head">
+                  <span className="doc-name">{a.keyword}</span>
+                  <button className="ghost" onClick={() => remove(a)} style={{ padding: "1px 7px", fontSize: 11 }}>✕</button>
+                </div>
+                <div className="member"><code>{a.nodeName || "(unnamed)"} · {a.nodeId}</code></div>
+                <div className="member"><code>{a.projectKey}{a.note ? ` · ${a.note}` : ""}</code></div>
+              </div>
+            ))}
+            <div className="chan-card">
+              <input style={inputStyle} placeholder="keyword" value={form.keyword} onChange={(e) => setForm({ ...form, keyword: e.target.value })} />
+              <select style={inputStyle} value={form.projectKey} onChange={(e) => setForm({ ...form, projectKey: e.target.value })}>
+                {!projects.length && <option value="">(no live projects)</option>}
+                {projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.name}</option>)}
+              </select>
+              <input style={inputStyle} placeholder="nodeId (e.g. 123:456)" value={form.nodeId} onChange={(e) => setForm({ ...form, nodeId: e.target.value })} />
+              <input style={inputStyle} placeholder="note (optional)" value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} />
+              <button className="ghost" style={{ padding: "2px 8px", fontSize: 11 }} disabled={!form.keyword.trim() || !form.nodeId.trim()} onClick={add}>Add annotation</button>
+              {error && <div className="member"><code>⚠ {error}</code></div>}
+            </div>
+          </div>
+        );
+      }
+
       // ----- Test call panel (uses its own peer WebSocket) -------------------
       // ----- Swagger-style request explorer ---------------------------------
       function Field({ p, value, onChange }) {
@@ -1077,6 +1253,8 @@
             <div className="main">
               <div className="sidebar">
                 <Projects projects={projects} bulkJobs={bulkJobs} onPick={(value) => { setFilter(value); setView("logs"); }} />
+                <IndexPanel projects={projects} />
+                <AnnotationsPanel projects={projects} />
                 <Channels channels={channels} onPick={(ch) => { setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>
               <div className="logwrap">

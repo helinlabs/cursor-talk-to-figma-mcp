@@ -184,6 +184,10 @@ async function handleCommand(command, params) {
       return await diagnosePages(params);
     case "search_nodes":
       return await searchNodes(params);
+    case "dump_page_index":
+      return await dumpPageIndex(params);
+    case "get_search_cache_status":
+      return await getSearchCacheStatus();
     case "get_file_outline":
       return await getFileOutline();
     case "get_node_info":
@@ -908,7 +912,28 @@ function buildPageSearchIndex(page) {
     });
     return false; // collect nothing; we only use the traversal
   });
-  return { entries };
+  return { entries: entries, builtAt: Date.now() };
+}
+
+// Return the page's search index, building (load + walk) it on a cache miss.
+// Only caches when nodechange-based invalidation could be installed, so a
+// stale index is never served.
+async function getOrBuildPageSearchIndex(page) {
+  const cached = pageSearchIndexCache.get(page.id);
+  if (cached) return { index: cached, fromCache: true };
+  await page.loadAsync(); // dynamic-page documentAccess: load before findAll
+  const prevSkip = figma.skipInvisibleInstanceChildren;
+  figma.skipInvisibleInstanceChildren = true; // big speedup on instance-heavy files
+  let index;
+  try {
+    index = buildPageSearchIndex(page);
+  } finally {
+    figma.skipInvisibleInstanceChildren = prevSkip;
+  }
+  if (watchPageForIndexInvalidation(page)) {
+    pageSearchIndexCache.set(page.id, index);
+  }
+  return { index: index, fromCache: false };
 }
 
 // Search ONE page for nodes matching the query (case-insensitive) by NAME
@@ -954,23 +979,9 @@ async function searchNodes(params) {
     throw new Error(`Page not found with ID: ${pageId}`);
   }
 
-  let index = pageSearchIndexCache.get(pageId);
-  let fromCache = true;
-  if (!index) {
-    fromCache = false;
-    await page.loadAsync(); // dynamic-page documentAccess: load before findAll
-    const prevSkip = figma.skipInvisibleInstanceChildren;
-    figma.skipInvisibleInstanceChildren = true; // big speedup on instance-heavy files
-    try {
-      index = buildPageSearchIndex(page);
-    } finally {
-      figma.skipInvisibleInstanceChildren = prevSkip;
-    }
-    // Only cache when invalidation is guaranteed to work.
-    if (watchPageForIndexInvalidation(page)) {
-      pageSearchIndexCache.set(pageId, index);
-    }
-  }
+  const built = await getOrBuildPageSearchIndex(page);
+  const index = built.index;
+  const fromCache = built.fromCache;
 
   const typeSet =
     Array.isArray(types) && types.length > 0 ? new Set(types) : null;
@@ -1049,6 +1060,45 @@ async function searchNodes(params) {
     truncated: truncated,
     fromCache: fromCache,
     matches: matches,
+  };
+}
+
+// Dump ONE page's full search index ({id,name,type,characters,path} per node)
+// so the relay's incremental indexer can persist a disk index page by page.
+// Reuses (and warms) the same per-page cache as search_nodes.
+async function dumpPageIndex(params) {
+  const { pageId } = params || {};
+  if (!pageId) throw new Error("Missing pageId parameter");
+  const page = await figma.getNodeByIdAsync(pageId);
+  if (!page || page.type !== "PAGE") {
+    throw new Error(`Page not found with ID: ${pageId}`);
+  }
+  const built = await getOrBuildPageSearchIndex(page);
+  return {
+    pageId: page.id,
+    pageName: page.name,
+    nodeCount: built.index.entries.length,
+    builtAt: built.index.builtAt,
+    fromCache: built.fromCache,
+    entries: built.index.entries,
+  };
+}
+
+// Report the in-plugin page index cache: which pages are cached, how many
+// nodes each holds, and when each was built. Cheap (no page loads).
+async function getSearchCacheStatus() {
+  return {
+    currentPageId: figma.currentPage.id,
+    pages: figma.root.children.map((p) => {
+      const index = pageSearchIndexCache.get(p.id);
+      return {
+        pageId: p.id,
+        name: p.name,
+        cached: !!index,
+        nodeCount: index ? index.entries.length : null,
+        builtAt: index ? index.builtAt : null,
+      };
+    }),
   };
 }
 

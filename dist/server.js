@@ -8,9 +8,9 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
-import * as fs2 from "fs";
-import * as path2 from "path";
-import * as os2 from "os";
+import * as fs3 from "fs";
+import * as path3 from "path";
+import * as os3 from "os";
 import { createServer as createHttpServer } from "http";
 
 // src/shared/annotations-store.ts
@@ -83,6 +83,64 @@ function findAnnotationsForKeys(projectKey, keys) {
   );
 }
 
+// src/shared/search-index.ts
+import * as fs2 from "fs";
+import * as path2 from "path";
+import * as os2 from "os";
+var INDEX_DIR = path2.join(os2.homedir(), ".talk-to-figma", "index");
+function sanitizeKey(projectKey) {
+  return projectKey.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "unknown";
+}
+function projectIndexPath(projectKey) {
+  return path2.join(INDEX_DIR, `project-${sanitizeKey(projectKey)}.json`);
+}
+function loadProjectIndex(projectKey) {
+  try {
+    const raw = JSON.parse(fs2.readFileSync(projectIndexPath(projectKey), "utf8"));
+    if (raw && typeof raw.projectKey === "string" && Array.isArray(raw.pages)) {
+      return raw;
+    }
+  } catch (error) {
+  }
+  return null;
+}
+function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
+  const lower = haystack.toLowerCase();
+  const idx = lower.indexOf(qLower);
+  if (idx !== -1) return { start: idx, end: idx + qLower.length };
+  if (!qLowerNoSpace) return null;
+  const map = [];
+  let stripped = "";
+  for (let i = 0; i < lower.length; i++) {
+    const ch = lower[i];
+    if (!/\s/.test(ch)) {
+      stripped += ch;
+      map.push(i);
+    }
+  }
+  const sIdx = stripped.indexOf(qLowerNoSpace);
+  if (sIdx === -1) return null;
+  return { start: map[sIdx], end: map[sIdx + qLowerNoSpace.length - 1] + 1 };
+}
+function textMatchSnippet(characters, range) {
+  if (!range) return null;
+  const start = Math.max(0, range.start - 40);
+  const end = Math.min(characters.length, range.end + 40);
+  return (start > 0 ? "\u2026" : "") + characters.slice(start, end) + (end < characters.length ? "\u2026" : "");
+}
+function buildNeedles(queries) {
+  const needles = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const raw of queries) {
+    const qLower = raw.toLowerCase();
+    const qLowerNoSpace = qLower.replace(/\s+/g, "");
+    if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue;
+    seen.add(qLowerNoSpace);
+    needles.push({ raw, qLower, qLowerNoSpace });
+  }
+  return needles;
+}
+
 // src/talk_to_figma_mcp/server.ts
 var PROTOCOL_VERSION = "2.2.0";
 var logger = {
@@ -97,11 +155,11 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
-var STATE_DIR = path2.join(os2.homedir(), ".talk-to-figma");
-var STATE_FILE = path2.join(STATE_DIR, "state.json");
+var STATE_DIR = path3.join(os3.homedir(), ".talk-to-figma");
+var STATE_FILE = path3.join(STATE_DIR, "state.json");
 function loadPersistedSelectedProject() {
   try {
-    const raw = JSON.parse(fs2.readFileSync(STATE_FILE, "utf8"));
+    const raw = JSON.parse(fs3.readFileSync(STATE_FILE, "utf8"));
     const project = raw?.selectedProject;
     if (project && typeof project === "object" && typeof project.name === "string") {
       return {
@@ -116,8 +174,8 @@ function loadPersistedSelectedProject() {
 }
 function persistSelectedProject(project) {
   try {
-    fs2.mkdirSync(STATE_DIR, { recursive: true });
-    fs2.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
+    fs3.mkdirSync(STATE_DIR, { recursive: true });
+    fs3.writeFileSync(STATE_FILE, JSON.stringify({ selectedProject: project }, null, 2));
   } catch (error) {
     logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1094,14 +1152,14 @@ Failed: ${JSON.stringify(failures)}` : "")
         if (!outputPath && options.remoteExportBase) {
           const extension = fmt.toLowerCase();
           const name = `${uuidv4()}.${extension}`;
-          const resolved = path2.join(exportDirectory, name);
-          fs2.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+          const resolved = path3.join(exportDirectory, name);
+          fs3.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs2.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
+            fs3.writeFileSync(resolved, result.svg, { encoding: "utf8", mode: 384 });
           } else {
-            fs2.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
+            fs3.writeFileSync(resolved, Buffer.from(result.imageData, "base64"), { mode: 384 });
           }
-          const stat = fs2.statSync(resolved);
+          const stat = fs3.statSync(resolved);
           const summary = {
             saved: true,
             url: `${options.remoteExportBase}/files/${name}`,
@@ -1117,14 +1175,14 @@ Failed: ${JSON.stringify(failures)}` : "")
           return { content: [{ type: "text", text: JSON.stringify(summary) }] };
         }
         if (outputPath) {
-          const resolved = path2.resolve(outputPath);
-          fs2.mkdirSync(path2.dirname(resolved), { recursive: true });
+          const resolved = path3.resolve(outputPath);
+          fs3.mkdirSync(path3.dirname(resolved), { recursive: true });
           if (fmt === "SVG" && typeof result.svg === "string") {
-            fs2.writeFileSync(resolved, result.svg, "utf8");
+            fs3.writeFileSync(resolved, result.svg, "utf8");
           } else {
-            fs2.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
+            fs3.writeFileSync(resolved, Buffer.from(result.imageData, "base64"));
           }
-          const stat = fs2.statSync(resolved);
+          const stat = fs3.statSync(resolved);
           const summary = {
             saved: true,
             path: resolved,
@@ -2953,16 +3011,17 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   );
   server.tool(
     "search_nodes",
-    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once \u2014 Korean/English, joined/spaced, product name vs feature name (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). Pages are searched sequentially (current page first, then file order) and the search stops as soon as `limit` matches are found. NOTE: the FIRST search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
+    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once \u2014 Korean/English, joined/spaced, product name vs feature name (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found \u2014 the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
     {
       query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
       queries: z.array(z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
       match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
       types: z.array(z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
       pageId: z.string().optional().describe("Restrict the search to this page only (from list_pages/get_file_outline)."),
-      limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200).")
+      limit: z.number().int().positive().optional().describe("Max matches to return (default 50, max 200)."),
+      fresh: z.boolean().optional().describe("Skip the relay-built disk index and search the live file page by page (slower). Use when the index may be stale for what you are looking for.")
     },
-    async ({ query, queries, match, types, pageId, limit }) => {
+    async ({ query, queries, match, types, pageId, limit, fresh }) => {
       try {
         const PER_PAGE_TIMEOUT_MS = 3e4;
         const mode = match === "name" || match === "text" ? match : "both";
@@ -2987,6 +3046,92 @@ This detailed process ensures you correctly interpret the reaction data, prepare
           ...a.note ? { note: a.note } : {},
           addedAt: a.addedAt
         }));
+        if (!fresh && !pageId) {
+          const projectIndex = loadProjectIndex(projectKey);
+          if (projectIndex && projectIndex.pages.length > 0) {
+            const needles = buildNeedles(allQueries);
+            const typeSet = Array.isArray(types) && types.length > 0 ? new Set(types) : null;
+            const matches2 = [];
+            let totalMatches2 = 0;
+            let truncated2 = false;
+            for (const page of projectIndex.pages) {
+              const nameFound = [];
+              const textFound = [];
+              for (const entry of page.entries) {
+                let matched = false;
+                if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
+                  for (const needle of needles) {
+                    if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
+                      nameFound.push({ entry, matchedQuery: needle.raw });
+                      matched = true;
+                      break;
+                    }
+                  }
+                }
+                if (!matched && mode !== "name" && entry.characters !== null) {
+                  for (const needle of needles) {
+                    const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace);
+                    if (range) {
+                      textFound.push({ entry, matchedQuery: needle.raw, range });
+                      break;
+                    }
+                  }
+                }
+              }
+              totalMatches2 += nameFound.length + textFound.length;
+              for (const found of nameFound) {
+                if (matches2.length >= max) {
+                  truncated2 = true;
+                  break;
+                }
+                matches2.push({
+                  id: found.entry.id,
+                  name: found.entry.name,
+                  type: found.entry.type,
+                  pageId: page.pageId,
+                  pageName: page.pageName,
+                  path: found.entry.path,
+                  matchedBy: "name",
+                  matchedQuery: found.matchedQuery
+                });
+              }
+              if (!truncated2) {
+                for (const found of textFound) {
+                  if (matches2.length >= max) {
+                    truncated2 = true;
+                    break;
+                  }
+                  matches2.push({
+                    id: found.entry.id,
+                    name: found.entry.name,
+                    type: found.entry.type,
+                    pageId: page.pageId,
+                    pageName: page.pageName,
+                    path: found.entry.path,
+                    matchedBy: "text",
+                    matchedQuery: found.matchedQuery,
+                    matchedText: textMatchSnippet(found.entry.characters, found.range)
+                  });
+                }
+              }
+            }
+            const result2 = {
+              queries: allQueries,
+              match: mode,
+              source: "index",
+              indexedAt: projectIndex.builtAt ?? projectIndex.updatedAt,
+              totalMatches: totalMatches2,
+              truncated: truncated2,
+              totalScannedPages: projectIndex.pages.length,
+              totalPages: projectIndex.pages.length,
+              matches: [...annotationMatches, ...matches2]
+            };
+            if (truncated2) {
+              result2.note = `Only the first ${max} matches are returned (totalMatches counts all index hits). The result came from the disk index built at ${new Date(result2.indexedAt).toISOString()}; pass fresh: true to search the live file instead.`;
+            }
+            return { content: [{ type: "text", text: JSON.stringify(result2) }] };
+          }
+        }
         let pageOrder;
         if (pageId) {
           pageOrder = [{ id: pageId, name: "" }];
@@ -3035,6 +3180,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         const result = {
           queries: allQueries,
           match: mode,
+          source: "live",
           totalMatches,
           truncated,
           totalScannedPages,
@@ -3462,19 +3608,19 @@ var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
 var httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 var httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
-var exportDirectory = process.env.FIGMA_EXPORT_DIR || path2.join(os2.homedir(), ".macfleet", "figma-exports");
+var exportDirectory = process.env.FIGMA_EXPORT_DIR || path3.join(os3.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
 var exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0 ? configuredExportTTLHours : 24;
 var exportTTL = exportTTLHours * 60 * 60 * 1e3;
 var exportNamePattern = /^[0-9a-f-]{36}\.(png|jpg|svg|pdf)$/;
 function cleanupExports() {
-  if (!fs2.existsSync(exportDirectory)) return;
+  if (!fs3.existsSync(exportDirectory)) return;
   const cutoff = Date.now() - exportTTL;
-  for (const name of fs2.readdirSync(exportDirectory)) {
+  for (const name of fs3.readdirSync(exportDirectory)) {
     if (!exportNamePattern.test(name)) continue;
-    const file = path2.join(exportDirectory, name);
+    const file = path3.join(exportDirectory, name);
     try {
-      if (fs2.statSync(file).mtimeMs < cutoff) fs2.unlinkSync(file);
+      if (fs3.statSync(file).mtimeMs < cutoff) fs3.unlinkSync(file);
     } catch (error) {
       logger.warn(`Could not clean export ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -3493,11 +3639,11 @@ function serveExport(req, res, pathname) {
     res.writeHead(404).end("not found");
     return true;
   }
-  const file = path2.join(exportDirectory, name);
+  const file = path3.join(exportDirectory, name);
   try {
-    const stat = fs2.statSync(file);
+    const stat = fs3.statSync(file);
     if (!stat.isFile() || Date.now() - stat.mtimeMs > exportTTL) {
-      if (stat.isFile()) fs2.unlinkSync(file);
+      if (stat.isFile()) fs3.unlinkSync(file);
       res.writeHead(404).end("not found");
       return true;
     }
@@ -3507,7 +3653,7 @@ function serveExport(req, res, pathname) {
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff"
     });
-    fs2.createReadStream(file).pipe(res);
+    fs3.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
   }
@@ -3528,7 +3674,7 @@ async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
   }
-  fs2.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
+  fs3.mkdirSync(exportDirectory, { recursive: true, mode: 448 });
   cleanupExports();
   const cleanupTimer = setInterval(cleanupExports, Math.min(exportTTL, 60 * 60 * 1e3));
   cleanupTimer.unref();
