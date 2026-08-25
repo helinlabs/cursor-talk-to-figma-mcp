@@ -144,6 +144,25 @@
       /* Full-width page for a single feature panel (non-overview tabs) */
       .panel-page { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg); }
       .panel-page > .section { max-width: 900px; margin: 0 auto; border-bottom: none; padding: 16px; }
+      /* Navigator tab: navigation rail + live preview on ONE screen */
+      .nav-split { flex: 1; display: flex; min-height: 0; min-width: 0; }
+      .nav-side {
+        width: 300px; min-width: 280px; overflow-y: auto;
+        border-right: 1px solid var(--border); background: var(--panel);
+      }
+      .nav-side > .section { border-bottom: none; }
+      .nav-main { flex: 1; min-width: 0; overflow-y: auto; display: flex; flex-direction: column; }
+      .nav-main .preview-panel { border-bottom: none; flex: 1; display: flex; flex-direction: column; }
+      .nav-main .preview-stage { flex: 1; max-height: none; }
+      .nav-main .preview-stage img { max-height: none; }
+      .nav-placeholder { flex: 1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
+      @media (max-width: 900px) {
+        .nav-split { flex-direction: column; }
+        .nav-side {
+          width: 100%; min-width: 0; max-height: 45%;
+          border-right: none; border-bottom: 1px solid var(--border);
+        }
+      }
       .idx-page-row {
         display: flex; gap: 8px; align-items: center; margin-top: 5px;
         font-size: 12px; font-family: ui-monospace, Menlo, monospace;
@@ -227,7 +246,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.5.2";
+      const PROTOCOL_VERSION = "2.5.3";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -706,9 +725,8 @@
           <div className="preview-panel">
             <div className="preview-head">
               <strong>Live Figma preview · {project.name || "(untitled)"}</strong>
-              <span className="badge">only while this detail is open</span>
               <span className="badge">Figma app window</span>
-              <button className="ghost" onClick={onClose}>Close preview</button>
+              {onClose && <button className="ghost" onClick={onClose}>Close preview</button>}
             </div>
             <div className="preview-stage">
               {preview?.url
@@ -987,7 +1005,7 @@
       // from the console: click a page → set_current_page, click a section or
       // a search result → set_focus (select + scroll). Reads work from the
       // disk index alone; goto/focus need a live plugin (relay answers 503).
-      function NavigatorPanel({ projects }) {
+      function NavigatorPanel({ projects, onProjectChange }) {
         const [projectKey, setProjectKey] = useState("");
         const [pages, setPages] = useState(null);       // GET /navigator/pages result
         const [expanded, setExpanded] = useState({});   // pageId -> bool
@@ -1014,6 +1032,9 @@
         }
 
         const effectiveKey = projectKey || (options[0] && options[0].key) || "";
+        // Tell the parent which project is being navigated (drives the live
+        // preview pane sitting next to this rail on the Navigator tab).
+        useEffect(() => { if (onProjectChange) onProjectChange(effectiveKey); }, [effectiveKey, onProjectChange]);
         const liveProject = projects.find((p) => p.projectKey === effectiveKey);
         // Current page name as announced by the plugin (best effort highlight).
         const currentPageName = liveProject
@@ -1792,6 +1813,7 @@
         const [filter, setFilter] = useState("");  // shared: channel click sets this
         const [view, setView] = useState("overview"); // top GNB: one feature group per screen
         const [selectedProject, setSelectedProject] = useState(null);
+        const [navProjectKey, setNavProjectKey] = useState(null); // Navigator tab's project
         const [preview, setPreview] = useState(null);
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
@@ -1883,20 +1905,24 @@
           return () => { alive = false; clearTimeout(retry); clearInterval(flush); try { ws.close(); } catch {} };
         }, []);
 
-        desiredPreviewChannelRef.current = selectedProject && view === "overview"
-          ? selectedProject.recommendedChannel
+        // Live preview follows whichever screen is showing it: the Overview's
+        // selected project card, or the Navigator tab's selected project.
+        const navProject = projects.find((p) => p.projectKey === navProjectKey) || null;
+        const desiredPreviewChannel =
+          view === "overview" && selectedProject ? selectedProject.recommendedChannel
+          : view === "navigator" && navProject ? navProject.recommendedChannel
           : null;
+        desiredPreviewChannelRef.current = desiredPreviewChannel;
         useEffect(() => {
-          const channel = desiredPreviewChannelRef.current;
           const ws = monitorRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "preview_subscribe", channel, mode: "app-window" }));
+            ws.send(JSON.stringify({ type: "preview_subscribe", channel: desiredPreviewChannel, mode: "app-window" }));
           }
           setPreview((previous) => {
             if (previous?.url) URL.revokeObjectURL(previous.url);
             return null;
           });
-        }, [selectedProject?.recommendedChannel, view]);
+        }, [desiredPreviewChannel]);
 
         const clear = () => { bufRef.current = []; queueRef.current = []; setVersion((v) => v + 1); };
         const clearEmpty = useCallback(() => {
@@ -1957,7 +1983,21 @@
                   </div>
                 </>
               )}
-              {view === "navigator" && <div className="panel-page"><NavigatorPanel projects={projects} /></div>}
+              {view === "navigator" && (
+                <div className="nav-split">
+                  <div className="nav-side">
+                    <NavigatorPanel projects={projects} onProjectChange={setNavProjectKey} />
+                  </div>
+                  <div className="nav-main">
+                    {navProject
+                      ? <PreviewPanel project={navProject} preview={preview} />
+                      : <div className="nav-placeholder">
+                          No live plugin for this project — the preview mirrors the Figma app window.<br />
+                          Open the file in Figma and run the Talk-to-Figma plugin; browsing the index still works.
+                        </div>}
+                  </div>
+                </div>
+              )}
               {view === "index" && <div className="panel-page"><IndexPanel projects={projects} /></div>}
               {view === "annotations" && <div className="panel-page"><AnnotationsPanel projects={projects} /></div>}
               {view === "context" && <div className="panel-page"><ProjectContextPanel projects={projects} /></div>}
