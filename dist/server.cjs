@@ -333,7 +333,7 @@ function hasCachedProjectContext(projectKey) {
 }
 
 // src/shared/version.ts
-var PROTOCOL_VERSION = "2.3.0";
+var PROTOCOL_VERSION = "2.4.0";
 function protocolMajor(version) {
   if (typeof version !== "string") return null;
   const major = Number(version.split(".")[0]);
@@ -3658,6 +3658,22 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         return { content: [{ type: "text", text: JSON.stringify({ removed, nodes: nodeResults }) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error removing search annotation: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "run_figma_script",
+    "Run arbitrary JavaScript inside the Figma plugin sandbox with FULL access to the figma plugin API \u2014 use this to fill gaps where no dedicated tool exists. The code body may use await and must `return` the value you want back; the return value is serialized (JSON.stringify, falling back to String(), capped at 100KB) and returned in this tool's response, with thrown errors returned as message+stack. WARNING: this can MODIFY THE DOCUMENT directly \u2014 verify your target nodes before destructive changes (nothing is auto-committed; undo relies on Figma's own undo/version history). A synchronous infinite loop FREEZES the plugin with no way to abort remotely (the operator must re-run the plugin in Figma). If a dedicated tool already does the job, use the dedicated tool instead. Timeout 120s.",
+    {
+      code: import_zod.z.string().describe('JavaScript function body. Receives (figma, params); may use await; `return` the result you want. E.g. "const n = await figma.getNodeByIdAsync(params.id); return { name: n.name, w: n.width };"'),
+      params: import_zod.z.record(import_zod.z.unknown()).optional().describe("Optional JSON object passed to the script as `params`.")
+    },
+    async ({ code, params }) => {
+      try {
+        const result = await sendCommandToFigma("run_script", { code, params }, 12e4);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error running Figma script: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );

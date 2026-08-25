@@ -206,6 +206,8 @@ async function handleCommand(command, params) {
       return await setProjectContext(params);
     case "set_node_keywords":
       return await setNodeKeywords(params);
+    case "run_script":
+      return await runScript(params);
     case "harvest_keyword_annotations":
       return await harvestKeywordAnnotations();
     case "get_file_outline":
@@ -6165,6 +6167,68 @@ async function harvestKeywordAnnotations() {
     annotated.push({ nodeId: node.id, nodeName: node.name || "", keywords });
   }
   return { fileName: figma.root.name, nodeCount: annotated.length, nodes: annotated };
+}
+
+// ── 임의 스크립트 실행 (플러그인 미지원 기능 메꾸기) ──
+//
+// 전용 커맨드가 없는 figma API 조작을 즉석에서 실행한다. 웹 콘솔이 넥서스
+// 관리자 토큰 게이트 뒤에 있어 허용됐다. 실행 전후 아무것도 자동 커밋하지
+// 않는다 — 되돌리기는 피그마 undo/버전 히스토리에 맡긴다.
+//
+// 실행 경로 2개: AsyncFunction 생성자(선호) → 안 잡히는 엔진(QuickJS 변형)
+// 이면 eval 폴백. 어느 경로로 실행됐는지 engine 필드로 알려 실기기 검증
+// 때 확인할 수 있게 한다. 예외는 던지지 않고 message+stack 을 그대로
+// 돌려준다(릴레이 에러 경로는 메시지만 남기므로).
+const RUN_SCRIPT_RESULT_CAP = 100 * 1024;
+
+async function runScript(params) {
+  const code = params && params.code;
+  const scriptParams = params && params.params;
+  if (typeof code !== "string" || !code.trim()) throw new Error("Missing code (string)");
+  let engine = null;
+  let fn = null;
+  try {
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    fn = new AsyncFunction("figma", "params", code);
+    engine = "AsyncFunction";
+  } catch (e) {
+    fn = null;
+  }
+  let value;
+  try {
+    if (fn) {
+      value = await fn(figma, scriptParams);
+    } else {
+      engine = "eval";
+      // 본문을 async 래퍼로 감싸 return/await 를 그대로 쓸 수 있게 한다.
+      const wrapped = eval("(async function (figma, params) {\n" + code + "\n})");
+      value = await wrapped(figma, scriptParams);
+    }
+  } catch (e) {
+    return {
+      ok: false,
+      engine,
+      error: {
+        message: e && e.message ? String(e.message) : String(e),
+        stack: e && e.stack ? String(e.stack) : null,
+      },
+    };
+  }
+  let result;
+  let serialization = "json";
+  try {
+    result = JSON.stringify(value);
+    if (result === undefined) {
+      result = String(value);
+      serialization = "string";
+    }
+  } catch (e) {
+    result = String(value);
+    serialization = "string";
+  }
+  const truncated = result.length > RUN_SCRIPT_RESULT_CAP;
+  if (truncated) result = result.slice(0, RUN_SCRIPT_RESULT_CAP);
+  return { ok: true, engine, serialization, truncated, result };
 }
 
 // ── 노드에 붙는 데이터 (SSOT 를 파일이 아니라 문서에 두기 위한 것) ──

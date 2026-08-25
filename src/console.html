@@ -219,7 +219,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.3.0";
+      const PROTOCOL_VERSION = "2.4.0";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -946,6 +946,66 @@
         );
       }
 
+      // ----- Script runner panel --------------------------------------------
+      // Arbitrary figma-API script execution in the plugin sandbox (gap
+      // filler for features without a dedicated command). Console is behind
+      // the nexus admin-token gate. Return value comes back serialized;
+      // errors come back as message+stack. No auto-commit — undo is Figma's.
+      function ScriptPanel({ projects }) {
+        const [projectKey, setProjectKey] = useState("");
+        const [code, setCode] = useState("");
+        const [paramsText, setParamsText] = useState("");
+        const [busy, setBusy] = useState(false);
+        const [output, setOutput] = useState(null);
+
+        const effectiveKey = projectKey || (projects[0] && projects[0].projectKey) || "";
+
+        const run = async () => {
+          setBusy(true); setOutput(null);
+          try {
+            let params = undefined;
+            if (paramsText.trim()) {
+              try { params = JSON.parse(paramsText); }
+              catch (e) { setOutput({ error: "params is not valid JSON: " + e }); setBusy(false); return; }
+            }
+            const r = await fetch(relayApiUrl("script/run") + `?project=${encodeURIComponent(effectiveKey)}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ code, params }),
+            });
+            const data = await r.json();
+            if (!r.ok) setOutput({ error: data.error || `HTTP ${r.status}` });
+            else setOutput(data);
+          } catch (e) { setOutput({ error: String(e) }); }
+          finally { setBusy(false); }
+        };
+
+        const selStyle = { width: "100%", boxSizing: "border-box", marginBottom: 4, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", fontSize: 12 };
+        const monoStyle = { width: "100%", boxSizing: "border-box", marginBottom: 4, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 };
+        return (
+          <div className="section">
+            <h2>Run Script</h2>
+            <div className="member muted">figma 플러그인 API 전체 접근. 문서를 직접 수정할 수 있고, 동기 무한루프는 플러그인을 멈춘다(피그마에서 재실행 필요).</div>
+            <select style={selStyle} value={projectKey} onChange={(e) => setProjectKey(e.target.value)}>
+              {!projects.length && <option value="">(no live projects)</option>}
+              {projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.name}</option>)}
+            </select>
+            <textarea rows={8} spellCheck={false} value={code} onChange={(e) => setCode(e.target.value)}
+              placeholder={"// (figma, params) 를 받는 async 함수 본문 — return 한 값이 결과로 온다\nreturn figma.currentPage.name;"}
+              style={monoStyle} />
+            <textarea rows={2} spellCheck={false} value={paramsText} onChange={(e) => setParamsText(e.target.value)}
+              placeholder='params JSON (optional), e.g. {"id":"1:2"}'
+              style={monoStyle} />
+            <button className="ghost" disabled={busy || !effectiveKey || !code.trim()} onClick={run}>{busy ? "Running…" : "Run"}</button>
+            {output && (
+              <pre style={{ marginTop: 6, maxHeight: 240, overflow: "auto", background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 4, padding: 6, fontSize: 11, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+                {output.error ? "⚠ " + output.error : JSON.stringify(output, null, 2)}
+              </pre>
+            )}
+          </div>
+        );
+      }
+
       // ----- Keyword annotations panel --------------------------------------
       function AnnotationsPanel({ projects }) {
         const [items, setItems] = useState(null);
@@ -1539,6 +1599,7 @@
                 <ExportGallery />
                 <IndexPanel projects={projects} />
                 <ProjectContextPanel projects={projects} />
+                <ScriptPanel projects={projects} />
                 <AnnotationsPanel projects={projects} />
                 <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); setView("logs"); }} onClearEmpty={clearEmpty} />
               </div>

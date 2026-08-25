@@ -1033,6 +1033,34 @@ const server = Bun.serve({
       }
     }
 
+    // --- Arbitrary script execution in the plugin sandbox --------------------
+    // Fills gaps where no dedicated command exists. Allowed because the web
+    // console sits behind the nexus admin-token gate. Body: JSON {code,
+    // params?}. Live plugin required; 120s timeout for bulk-manipulation
+    // scripts. The result (return value / error message+stack) is relayed
+    // verbatim from the plugin's run_script.
+    if (url.pathname === "/script/run" && req.method === "POST") {
+      const projectKey = url.searchParams.get("project") || "";
+      if (!projectKey) {
+        return new Response(JSON.stringify({ error: "project query param is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const channel = resolveProjectChannel(projectKey);
+      if (!channel) {
+        return new Response(JSON.stringify({ error: `No live Figma plugin for project "${projectKey}" — connect the plugin and retry` }), { status: 503, headers: JSON_HEADERS });
+      }
+      try {
+        const body: any = await req.json();
+        const code = String(body?.code || "");
+        if (!code.trim()) {
+          return new Response(JSON.stringify({ error: "code is required" }), { status: 400, headers: JSON_HEADERS });
+        }
+        const result = await sendInternalCommand(channel, "run_script", { code, params: body?.params }, 120_000);
+        return new Response(JSON.stringify(result, null, 2), { headers: JSON_HEADERS });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }), { status: 502, headers: JSON_HEADERS });
+      }
+    }
+
     // --- Keyword annotations (shared file with the MCP server) --------------
     if (url.pathname === "/search/annotations") {
       if (req.method === "GET") {
