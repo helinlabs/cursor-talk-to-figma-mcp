@@ -3,7 +3,7 @@
   "defaultProjectIDs": ["gw-product", "f-product", "gw-apple-watch"],
   "projects": [
     {"id":"t-product","title":"T_Product","displayTitle":"🟣 T_Product","url":"https://www.figma.com/design/HF3OE95xtnaxfYvhEv11GT/T_Product?m=draw"},
-    {"id":"c-product","title":"C_Product","displayTitle":"🔴 C_Product","url":"https://www.figma.com/design/kNR5gyONqLJWYOrab9KNyM/C_Product?m=draw"},
+    {"id":"c-product","title":"CA_Product","displayTitle":"🔴 CA_Product","url":"https://www.figma.com/design/kNR5gyONqLJWYOrab9KNyM/C_Product?m=draw"},
     {"id":"gw-product","title":"GW_Product","displayTitle":"🔵 GW_Product","url":"https://www.figma.com/design/Z4NCoiedZYU8oB0rEFJRnm/GW_Product?m=draw"},
     {"id":"gw-apple-watch","title":"GW_Apple Watch","displayTitle":"🔵 GW_Apple Watch","url":"https://www.figma.com/design/pdr7IovxQpTM629gIhBt84/GW_Apple-Watch?m=draw"},
     {"id":"co-product","title":"CO_Product","displayTitle":"💚 CO_Product","url":"https://www.figma.com/design/PEnIoWYBJWOx2SPrdGsSzg/CO_Product?m=draw"},
