@@ -325,16 +325,30 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let target else { throw AgentError.message("no target window selected") }
         await stop()
 
-        // Measured failure mode on the fleet: without a Screen Recording grant
-        // for THIS process chain, SCShareableContent never returns — no error,
-        // no timeout, the stream just silently never starts. Preflight turns
-        // that into an explicit, actionable error (and, in a GUI session,
-        // CGRequestScreenCaptureAccess raises the system prompt once).
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
+        // Measured failure modes on the fleet, in order of discovery:
+        // 1. Without a Screen Recording grant, SCShareableContent never
+        //    returns — no error, no timeout.
+        // 2. The TCC *calls themselves* (preflight/request) can also block
+        //    indefinitely when tccd is wedged behind a pending permission
+        //    dialog on the machine — which is exactly the state a headless
+        //    fleet mac drifts into. So every TCC call runs on a background
+        //    queue behind its own deadline, and each way out is a distinct,
+        //    actionable error.
+        switch preflightScreenCapture(timeout: 3) {
+        case .some(true):
+            break
+        case .some(false):
+            // Fire-and-forget: raises the system prompt when a GUI session is
+            // there to show it; never block the agent on it.
+            DispatchQueue.global().async { CGRequestScreenCaptureAccess() }
             throw AgentError.message(
                 "Screen Recording permission is missing for this process chain — "
                 + "System Settings > Privacy & Security > Screen Recording에서 릴레이 런타임(bun 또는 bash)을 허용하고 릴레이를 재시작하세요"
+            )
+        case .none:
+            throw AgentError.message(
+                "tccd did not answer the Screen Recording preflight within 3s — "
+                + "macmini 화면에 떠 있는 권한 다이얼로그를 먼저 처리하세요 (tccd가 그 응답을 기다리며 멈춰 있습니다)"
             )
         }
 
@@ -514,6 +528,19 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// A TCC check that cannot wedge the agent: nil means tccd itself did not
+// answer, which is its own diagnosis (a pending permission dialog on the
+// machine blocks every TCC verdict behind it).
+func preflightScreenCapture(timeout: TimeInterval) -> Bool? {
+    let semaphore = DispatchSemaphore(value: 0)
+    var verdict: Bool?
+    DispatchQueue.global().async {
+        verdict = CGPreflightScreenCaptureAccess()
+        semaphore.signal()
+    }
+    return semaphore.wait(timeout: .now() + timeout) == .success ? verdict : nil
+}
+
 enum AgentError: Error, CustomStringConvertible {
     case message(String)
     var description: String {
@@ -583,6 +610,13 @@ let semaphore = DispatchSemaphore(value: 0)
 
 Task.detached {
     emitEvent(["event": "ready", "pid": ProcessInfo.processInfo.processIdentifier])
+    // Report the TCC verdicts up front so a stalled stream is diagnosable from
+    // the relay's event log alone, without touching the machine.
+    DispatchQueue.global().async {
+        let screen = preflightScreenCapture(timeout: 5)
+        emitEvent(["event": "tcc", "screenCapture": screen.map { $0 ? "granted" : "denied" } ?? "tccd-unresponsive",
+                   "accessibility": AXIsProcessTrusted()])
+    }
     while let line = readLine(strippingNewline: true) {
         if line.isEmpty { continue }
         await handle(line)
