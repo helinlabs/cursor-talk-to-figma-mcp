@@ -325,7 +325,31 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let target else { throw AgentError.message("no target window selected") }
         await stop()
 
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        // Measured failure mode on the fleet: without a Screen Recording grant
+        // for THIS process chain, SCShareableContent never returns — no error,
+        // no timeout, the stream just silently never starts. Preflight turns
+        // that into an explicit, actionable error (and, in a GUI session,
+        // CGRequestScreenCaptureAccess raises the system prompt once).
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+            throw AgentError.message(
+                "Screen Recording permission is missing for this process chain — "
+                + "System Settings > Privacy & Security > Screen Recording에서 릴레이 런타임(bun 또는 bash)을 허용하고 릴레이를 재시작하세요"
+            )
+        }
+
+        // Belt and braces: even with the grant, treat a shareable-content
+        // lookup that takes >10s as failed rather than hanging the stream.
+        let content = try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
+            group.addTask { try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 10_000_000_000)
+                throw AgentError.message("SCShareableContent timed out after 10s — screen capture is blocked for this process")
+            }
+            let value = try await group.next()!
+            group.cancelAll()
+            return value
+        }
         guard let scWindow = content.windows.first(where: { $0.windowID == target.id }) else {
             throw AgentError.message("window \(target.id) is no longer shareable — was it closed?")
         }
