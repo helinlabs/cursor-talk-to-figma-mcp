@@ -384,6 +384,10 @@ async function handleCommand(command, params) {
       return await createComponentFromNode(params);
     case "set_focus":
       return await setFocus(params);
+    case "get_viewport":
+      return await getViewport();
+    case "set_viewport":
+      return await setViewport(params);
     case "set_selections":
       return await setSelections(params);
     case "get_design_system_info":
@@ -6737,6 +6741,86 @@ async function ensureNodePageCurrent(node) {
   if (!page || figma.currentPage.id === page.id) return null;
   await figma.setCurrentPageAsync(page);
   return { id: page.id, name: page.name };
+}
+
+// ---------------------------------------------------------------------------
+// Viewport control. The web console's live preview is a screenshot of the
+// Figma app window, so "pan/zoom the preview" can only mean moving the real
+// viewport from here — figma.viewport.center/zoom are writable. Figma clamps
+// the zoom to its own range and snaps the center to whole device pixels, so
+// every call reports the state that actually took effect rather than the one
+// that was asked for; callers should render the returned state, not their
+// own optimistic guess.
+// ---------------------------------------------------------------------------
+const VIEWPORT_ZOOM_MIN = 0.02;
+const VIEWPORT_ZOOM_MAX = 256;
+
+function viewportState() {
+  const bounds = figma.viewport.bounds;
+  return {
+    center: { x: figma.viewport.center.x, y: figma.viewport.center.y },
+    zoom: figma.viewport.zoom,
+    bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+    pageId: figma.currentPage.id,
+    pageName: figma.currentPage.name,
+  };
+}
+
+async function getViewport() {
+  return viewportState();
+}
+
+// Nodes a "fit" request should zoom to, or null when the request is a plain
+// pan/zoom rather than a fit.
+async function viewportFitNodes(params) {
+  if (params.nodeId) {
+    const node = await figma.getNodeByIdAsync(params.nodeId);
+    if (!node) throw new Error(`Node with ID ${params.nodeId} not found`);
+    await ensureNodePageCurrent(node);
+    return [node];
+  }
+  if (params.fit === "selection") return figma.currentPage.selection.slice();
+  if (params.fit === "page") return figma.currentPage.children.slice();
+  if (params.fit) throw new Error(`Unknown fit "${params.fit}" (expected "selection" or "page")`);
+  return null;
+}
+
+async function setViewport(params) {
+  const p = params || {};
+  const before = viewportState();
+
+  // A fit decides both center and zoom, so it wins over the other params.
+  const fitNodes = await viewportFitNodes(p);
+  if (fitNodes) {
+    if (!fitNodes.length) {
+      throw new Error(p.fit === "selection" ? "Nothing is selected in Figma" : "This page is empty");
+    }
+    figma.viewport.scrollAndZoomIntoView(fitNodes);
+    return Object.assign({ success: true, before }, viewportState());
+  }
+
+  // Zoom first so that fraction-based pans use the post-zoom extent — that is
+  // what the console's arrow buttons mean by "a quarter of a screen over".
+  let zoom = typeof p.zoom === "number" ? p.zoom : before.zoom;
+  if (typeof p.zoomBy === "number" && p.zoomBy > 0) zoom = zoom * p.zoomBy;
+  zoom = Math.min(VIEWPORT_ZOOM_MAX, Math.max(VIEWPORT_ZOOM_MIN, zoom));
+  if (zoom !== before.zoom) figma.viewport.zoom = zoom;
+
+  const extent = figma.viewport.bounds;
+  const current = figma.viewport.center;
+  let x = p.center && typeof p.center.x === "number" ? p.center.x : current.x;
+  let y = p.center && typeof p.center.y === "number" ? p.center.y : current.y;
+  if (p.panBy) {
+    x += Number(p.panBy.x) || 0;
+    y += Number(p.panBy.y) || 0;
+  }
+  if (p.panByFraction) {
+    x += (Number(p.panByFraction.x) || 0) * extent.width;
+    y += (Number(p.panByFraction.y) || 0) * extent.height;
+  }
+  if (x !== current.x || y !== current.y) figma.viewport.center = { x, y };
+
+  return Object.assign({ success: true, before }, viewportState());
 }
 
 async function setFocus(params) {

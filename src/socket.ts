@@ -1520,6 +1520,39 @@ const server = Bun.serve({
       }
     }
 
+    // Preview pan/zoom. The console's live preview is a screenshot of the
+    // Figma app window, so "move the preview" means moving the real viewport
+    // in the plugin — both the read and the write need a live plugin.
+    if (url.pathname === "/navigator/viewport" && (req.method === "GET" || req.method === "POST")) {
+      const isRead = req.method === "GET";
+      let body: any = {};
+      if (!isRead) {
+        try {
+          body = await req.json();
+        } catch {
+          return new Response(JSON.stringify({ error: "JSON body is required" }), { status: 400, headers: JSON_HEADERS });
+        }
+      }
+      const project = String((isRead ? url.searchParams.get("project") : body?.project) || "").trim();
+      if (!project) {
+        return new Response(JSON.stringify({ error: "project is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const channel = resolveNavigatorChannel(project);
+      if (!channel) {
+        return new Response(JSON.stringify({ error: `No live Figma plugin for project "${project}" — open the file in Figma and run the plugin, then retry` }), { status: 503, headers: JSON_HEADERS });
+      }
+      const command = isRead ? "get_viewport" : "set_viewport";
+      const { project: _projectKey, ...viewportParams } = body ?? {};
+      try {
+        const result = await sendInternalCommand(channel, command, isRead ? {} : viewportParams, 15_000);
+        return new Response(JSON.stringify({ ok: true, result }, null, 2), { headers: JSON_HEADERS });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        recordRelayError({ source: "relay", project: channelProjectInfo(channel).name, command, message: `navigator viewport failed: ${message}` });
+        return new Response(JSON.stringify({ error: message }), { status: 502, headers: JSON_HEADERS });
+      }
+    }
+
     if (url.pathname === "/navigator/search" && req.method === "GET") {
       const project = url.searchParams.get("project") || "";
       const q = (url.searchParams.get("q") || "").trim();

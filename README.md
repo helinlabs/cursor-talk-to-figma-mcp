@@ -27,7 +27,7 @@ AI agent ⇄(stdio or HTTP :3056)⇄ MCP server ⇄(WebSocket)⇄ Relay (:3055) 
 | **MCP server** | `src/talk_to_figma_mcp/server.ts` | Exposes ~50 tools over stdio or Streamable HTTP; talks to the relay. HTTP sessions are isolated and each owns its relay connection. |
 | **Relay** | `src/socket.ts` (port 3055) | Routes messages between MCP server and plugin by channel. Also serves a web console. Runs as a background service (launchd). |
 | **Figma plugin** | `src/cursor_mcp_plugin/` | Runs inside Figma (`code.js` + `ui.html`). Has Figma API access, no filesystem. Not bundled — the source files are the runtime. |
-| **Web console** | served by the relay at `/console` | Live view of channels, documents, and requests. |
+| **Web console** | served by the relay at `/console` | Live view of channels, documents, and requests. The Navigator tab browses the disk index three levels deep and drives the live preview: drag to pan, scroll to zoom, or use the arrow/zoom/fit buttons (they move Figma's real viewport, since the preview is a capture of the Figma app window). |
 
 > macOS-only as written: the relay is installed as a launchd LaunchAgent.
 
@@ -170,6 +170,7 @@ In the AI client:
 | Workload, in-flight requests, and bulk jobs | http://localhost:3055/status |
 | Current plugin build hash (matches the plugin badge) | http://localhost:3055/plugin-version |
 | Managed export gallery JSON / files | http://localhost:3055/exports |
+| Figma's current viewport (and where the console's pan/zoom posts) | `GET`/`POST` http://localhost:3055/navigator/viewport |
 | Relay health (running? crashes?) | `./scripts/relayctl.sh status` |
 | Relay logs / crash history | `./scripts/relayctl.sh logs` · `crashes` · files under `.relay/` |
 | Which plugin code Figma loaded | the **build badge** in the plugin window |
@@ -237,6 +238,7 @@ bun scripts/figma-test-client.mjs abc12345 get_document_info '{}'
 - `get_frame_context` — **one-shot, RN-ready digest of a screen subtree**: OS chrome + hidden nodes dropped; each node carries relative bounds, text + typography, flex layout, resolved semantic tokens, and `hasImageFill`. Replaces several round-trips.
 - `list_pages` / `set_current_page` / `get_node_by_key` / `diagnose_pages`
 - `set_focus` / `set_selections`
+- `get_viewport` / `set_viewport` — read and drive what the user is looking at (pan by canvas units or by a fraction of the screen, absolute or relative zoom, fit selection/page/node) without touching the selection. This is what the web console's preview pan/zoom controls call.
 
 ### Design-system / tokens
 - `get_design_system_info` — components, styles, variables (with keys)

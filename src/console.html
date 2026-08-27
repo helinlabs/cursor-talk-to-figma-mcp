@@ -135,8 +135,13 @@
       .preview-head strong { color: var(--green); }
       .preview-head button { margin-left: auto; }
       .preview-stage { min-height: 120px; max-height: 420px; display: flex; align-items: center; justify-content: center; overflow: auto; background: #090a0d; border: 1px solid var(--border); border-radius: 7px; }
-      .preview-stage img { display: block; max-width: 100%; max-height: 400px; object-fit: contain; }
+      .preview-stage img { display: block; max-width: 100%; max-height: 400px; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+      .preview-stage.grab { cursor: grab; }
+      .preview-stage.grab:active { cursor: grabbing; }
       .preview-meta { color: var(--muted); font-size: 11px; margin-top: 7px; }
+      .preview-controls { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+      .preview-controls button { padding: 1px 8px; font-size: 12px; }
+      .preview-controls .vp-sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
       .gallery-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
       .gallery-item { background: #11131a; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; }
       .gallery-item img { width: 100%; height: 72px; object-fit: cover; display: block; background: #090a0d; }
@@ -177,7 +182,6 @@
       .nav-row .nav-name.current { color: var(--green); }
       .nav-row.section-row { margin-left: 14px; }
       .nav-row.section-row .nav-name { font-weight: 400; color: var(--text); }
-      .nav-row.section-row.depth2 { margin-left: 28px; }
       .nav-caret {
         width: auto; background: transparent; border: 1px solid var(--border);
         color: var(--muted); border-radius: 10px; padding: 1px 8px;
@@ -286,7 +290,7 @@
         url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
         return url.toString();
       }
-      const PROTOCOL_VERSION = "2.5.5";
+      const PROTOCOL_VERSION = "2.6.0";
       let RELAY_PROTOCOL_VERSION = PROTOCOL_VERSION;
       const protoMajor = (v) => {
         const m = Number(String(v || "").split(".")[0]);
@@ -759,8 +763,127 @@
         );
       }
 
+      // Drive the Figma viewport from the preview. The preview is a screenshot
+      // of the Figma app window, so the only way to move it is to move the real
+      // viewport in the plugin: every gesture posts to /navigator/viewport and
+      // the next capture (~2s) shows the result. Gestures are coalesced into a
+      // single in-flight request, so a fast drag or a burst of clicks can never
+      // queue up dozens of round trips.
+      const VP_ZOOM_STEP = 1.25;
+      const VP_PAN_STEP = 0.25;    // a quarter of a screen per arrow press
+      const VP_POLL_MS = 5000;     // keeps the readout honest when Figma is driven by hand
+
+      function useViewportControl(projectKey) {
+        const [viewport, setViewport] = useState(null);
+        const [error, setError] = useState(null);
+        const inflight = useRef(false);
+        const pending = useRef(null);
+        const flushRef = useRef(null);
+
+        const read = useCallback(async () => {
+          if (!projectKey || inflight.current || pending.current) return;
+          try {
+            const r = await fetch(relayApiUrl("navigator/viewport") + `?project=${encodeURIComponent(projectKey)}`);
+            const data = await r.json();
+            if (!r.ok) { setError(data.error || `HTTP ${r.status}`); return; }
+            setError(null); setViewport(data.result);
+          } catch (e) { setError(String(e)); }
+        }, [projectKey]);
+
+        const flush = useCallback(async () => {
+          if (inflight.current || !pending.current || !projectKey) return;
+          const body = pending.current;
+          pending.current = null;
+          inflight.current = true;
+          try {
+            const r = await fetch(relayApiUrl("navigator/viewport"), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ project: projectKey, ...body }),
+            });
+            const data = await r.json();
+            if (!r.ok) setError(data.error || `HTTP ${r.status}`);
+            // Render what Figma actually did — it clamps the zoom and snaps
+            // the center, so an optimistic guess would drift out of sync.
+            else { setError(null); setViewport(data.result); }
+          } catch (e) { setError(String(e)); }
+          finally {
+            inflight.current = false;
+            if (pending.current && flushRef.current) flushRef.current();
+          }
+        }, [projectKey]);
+        flushRef.current = flush;
+
+        // Deltas merge with a pending delta; an absolute move replaces it.
+        const nudge = useCallback((delta) => {
+          const base = pending.current && (pending.current.panByFraction || pending.current.zoomBy)
+            ? pending.current
+            : { panByFraction: { x: 0, y: 0 }, zoomBy: 1 };
+          if (delta.panByFraction) {
+            base.panByFraction.x += delta.panByFraction.x;
+            base.panByFraction.y += delta.panByFraction.y;
+          }
+          if (delta.zoomBy) base.zoomBy *= delta.zoomBy;
+          pending.current = base;
+          flush();
+        }, [flush]);
+
+        const jump = useCallback((body) => { pending.current = body; flush(); }, [flush]);
+
+        useEffect(() => {
+          setViewport(null); setError(null); pending.current = null;
+          if (!projectKey) return;
+          read();
+          const timer = setInterval(read, VP_POLL_MS);
+          return () => clearInterval(timer);
+        }, [projectKey, read]);
+
+        return { viewport, error, nudge, jump };
+      }
+
       function PreviewPanel({ project, preview, onClose }) {
+        const { viewport, error: vpError, nudge, jump } = useViewportControl(project ? project.projectKey : null);
+        const stageRef = useRef(null);
+        const drag = useRef(null);
+
+        // Wheel must be a non-passive native listener: React's synthetic wheel
+        // handler is passive, so preventDefault there would not stop the page
+        // from scrolling under the gesture.
+        useEffect(() => {
+          const el = stageRef.current;
+          if (!el) return;
+          const onWheel = (e) => {
+            e.preventDefault();
+            nudge({ zoomBy: Math.exp(-e.deltaY * 0.0015) });
+          };
+          el.addEventListener("wheel", onWheel, { passive: false });
+          return () => el.removeEventListener("wheel", onWheel);
+        }, [nudge]);
+
         if (!project) return null;
+
+        // Drag deltas are read as a fraction of the preview, which is a
+        // fraction of the *window* — Figma's side panels are part of the shot,
+        // so a drag pans slightly more canvas than the pixels under the cursor.
+        const onPointerDown = (e) => {
+          if (e.button !== 0 || !preview?.url) return;
+          const rect = e.currentTarget.getBoundingClientRect();
+          drag.current = { x: e.clientX, y: e.clientY, w: rect.width || 1, h: rect.height || 1 };
+          try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+        };
+        const onPointerMove = (e) => {
+          const d = drag.current;
+          if (!d) return;
+          const dx = e.clientX - d.x, dy = e.clientY - d.y;
+          if (!dx && !dy) return;
+          d.x = e.clientX; d.y = e.clientY;
+          nudge({ panByFraction: { x: -dx / d.w, y: -dy / d.h } });
+        };
+        const endDrag = (e) => {
+          drag.current = null;
+          try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+        };
+
         return (
           <div className="preview-panel">
             <div className="preview-head">
@@ -768,14 +891,36 @@
               <span className="badge">Figma app window</span>
               {onClose && <button className="ghost" onClick={onClose}>Close preview</button>}
             </div>
-            <div className="preview-stage">
+            <div className="preview-controls">
+              <button className="ghost" title="Pan left (drag the preview, or scroll to zoom)" onClick={() => nudge({ panByFraction: { x: -VP_PAN_STEP, y: 0 } })}>←</button>
+              <button className="ghost" title="Pan right" onClick={() => nudge({ panByFraction: { x: VP_PAN_STEP, y: 0 } })}>→</button>
+              <button className="ghost" title="Pan up" onClick={() => nudge({ panByFraction: { x: 0, y: -VP_PAN_STEP } })}>↑</button>
+              <button className="ghost" title="Pan down" onClick={() => nudge({ panByFraction: { x: 0, y: VP_PAN_STEP } })}>↓</button>
+              <span className="vp-sep" />
+              <button className="ghost" title="Zoom out" onClick={() => nudge({ zoomBy: 1 / VP_ZOOM_STEP })}>−</button>
+              <button className="ghost" title="Zoom in" onClick={() => nudge({ zoomBy: VP_ZOOM_STEP })}>＋</button>
+              <code className="muted" title="Figma zoom level">{viewport ? `${Math.round(viewport.zoom * 100)}%` : "…"}</code>
+              <span className="vp-sep" />
+              <button className="ghost" title="Zoom to fit this page" onClick={() => jump({ fit: "page" })}>Fit page</button>
+              <button className="ghost" title="Zoom to fit the current Figma selection" onClick={() => jump({ fit: "selection" })}>Fit selection</button>
+              {vpError && <code className="bad" title={vpError}>⚠ {vpError}</code>}
+            </div>
+            <div
+              className={"preview-stage" + (preview?.url ? " grab" : "")}
+              ref={stageRef}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={endDrag}
+              onPointerCancel={endDrag}
+            >
               {preview?.url
-                ? <img src={preview.url} alt={`Live preview of ${project.name || "Figma project"}`} />
+                ? <img src={preview.url} alt={`Live preview of ${project.name || "Figma project"}`} draggable={false} />
                 : <span className={preview?.error ? "bad" : "muted"}>{preview?.error || "Waiting for the Figma plugin…"}</span>}
             </div>
             {preview?.meta && (
               <div className="preview-meta">
                 {preview.meta.pageName || "Current page"} · {preview.meta.nodeName || "frame"} · {preview.meta.source || "preview"} · {preview.meta.width || "?"}×{preview.meta.height || "?"} · {Math.round((preview.meta.byteLength || 0) / 1024)} KB
+                {viewport ? ` · viewport ${Math.round(viewport.center.x)}, ${Math.round(viewport.center.y)} @ ${Math.round(viewport.zoom * 100)}%` : ""}
               </div>
             )}
           </div>
@@ -1040,6 +1185,12 @@
         );
       }
 
+      // How deep the Navigator rail lets you open a page's tree: 1 = a page's
+      // sections, 2 = their children, 3 = grandchildren. Rows at the cap lose
+      // their caret; every row stays clickable (click = focus it in Figma).
+      const MAX_NAV_DEPTH = 3;
+      const NAV_INDENT = 14;   // px of indent per depth level
+
       // ----- Navigator panel ------------------------------------------------
       // Browse the disk index's pages/sections and drive the Figma viewport
       // from the console: click a page → set_current_page, click a section or
@@ -1057,8 +1208,8 @@
         const [selected, setSelected] = useState(null);   // {id, name, pageName, kind:"page"|"node"} — persists until cleared
         const [rowErrors, setRowErrors] = useState({});   // row id -> inline error
         const [pageOverride, setPageOverride] = useState(null); // current-page highlight after our own goto/focus page switches
-        const [childExpanded, setChildExpanded] = useState({}); // sectionId -> bool (depth-2 expansion)
-        const [childrenMap, setChildrenMap] = useState({});     // sectionId -> {loading}|{error}|{children,total,truncated,ambiguous}
+        const [childExpanded, setChildExpanded] = useState({}); // nodeId -> bool (subtree expansion)
+        const [childrenMap, setChildrenMap] = useState({});     // nodeId -> {loading}|{error}|{children,total,truncated,ambiguous}
 
         // Selectable projects: live ones first, then disk-index-only ones
         // (pages/search still work offline; goto/focus answer 503).
@@ -1148,8 +1299,9 @@
           }
         };
 
-        // Depth-2 expansion: direct children of a section, derived from the
-        // disk index's path chains (GET /navigator/children).
+        // Subtree expansion: direct children of any indexed node, derived from
+        // the disk index's path chains (GET /navigator/children). That endpoint
+        // works at any depth; MAX_NAV_DEPTH is what the rail chooses to show.
         const toggleChildren = (sectionId) => {
           const open = !!childExpanded[sectionId];
           setChildExpanded((s) => ({ ...s, [sectionId]: !open }));
@@ -1177,6 +1329,59 @@
             setSearchResults(data.results || []);
           } catch (e) { setError(String(e)); }
           finally { setBusy(false); }
+        };
+
+        // One row per indexed node, recursing into the children the index knows
+        // about. Depth 1 is a page's sections; MAX_NAV_DEPTH caps how far down
+        // the rail lets you open.
+        const renderNode = (n, depth, pageName) => {
+          const childOpen = !!childExpanded[n.id];
+          const kids = childrenMap[n.id];
+          const canExpand = depth < MAX_NAV_DEPTH;
+          const indent = NAV_INDENT * depth;
+          const isSelected = selected && selected.id === n.id;
+          return (
+            <React.Fragment key={n.id}>
+              <div
+                className={"nav-row section-row" + (isSelected ? " selected" : "") + (pendingId === n.id ? " pending" : "")}
+                style={{ marginLeft: indent }}
+                onClick={() => focus(n.id, n.name || n.id, pageName)}
+                title={`Focus ${n.id} (select + scroll)`}
+              >
+                <span className="badge">{n.type}</span>
+                <span className="nav-name">{n.name || "(unnamed)"}</span>
+                {pendingId === n.id && <span className="badge">…</span>}
+                {pendingId !== n.id && isSelected && <span className="badge sel-badge">selected</span>}
+                {canExpand && (
+                  <button
+                    className="nav-caret"
+                    onClick={(e) => { e.stopPropagation(); toggleChildren(n.id); }}
+                    title="Show children"
+                  >
+                    {childOpen ? "▾" : "▸"}
+                  </button>
+                )}
+              </div>
+              {rowErrors[n.id] && <div className="nav-row-error" style={{ marginLeft: indent }}>⚠ {rowErrors[n.id]}</div>}
+              {canExpand && childOpen && kids && kids.loading && (
+                <div className="member muted" style={{ marginLeft: indent + NAV_INDENT }}>Loading children…</div>
+              )}
+              {canExpand && childOpen && kids && kids.error && (
+                <div className="nav-row-error" style={{ marginLeft: indent + NAV_INDENT }}>⚠ {kids.error}</div>
+              )}
+              {canExpand && childOpen && kids && kids.children && !kids.children.length && (
+                <div className="member muted" style={{ marginLeft: indent + NAV_INDENT }}>No children in the index.</div>
+              )}
+              {canExpand && childOpen && kids && kids.children && kids.children.map((c) => renderNode(c, depth + 1, pageName))}
+              {canExpand && childOpen && kids && kids.children && (kids.truncated || kids.ambiguous) && (
+                <div className="member muted" style={{ marginLeft: indent + NAV_INDENT, fontSize: 11 }}>
+                  {kids.truncated ? `showing ${kids.children.length} of ${kids.total}` : ""}
+                  {kids.truncated && kids.ambiguous ? " · " : ""}
+                  {kids.ambiguous ? "same-named siblings — children merged" : ""}
+                </div>
+              )}
+            </React.Fragment>
+          );
         };
 
         const selStyle = { width: "100%", boxSizing: "border-box", marginBottom: 4, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 4, padding: "3px 6px", fontSize: 12 };
@@ -1258,60 +1463,8 @@
                     </button>
                   </div>
                   {rowErrors[p.pageId] && <div className="nav-row-error">⚠ {rowErrors[p.pageId]}</div>}
-                  {open && !p.sections.length && <div className="member muted" style={{ marginLeft: 14 }}>No sections on this page.</div>}
-                  {open && p.sections.map((s) => {
-                    const childOpen = !!childExpanded[s.id];
-                    const kids = childrenMap[s.id];
-                    return (
-                      <React.Fragment key={s.id}>
-                        <div
-                          className={"nav-row section-row" + (selected && selected.id === s.id ? " selected" : "") + (pendingId === s.id ? " pending" : "")}
-                          onClick={() => focus(s.id, s.name || s.id, p.pageName)}
-                          title={`Focus ${s.id} (select + scroll)`}
-                        >
-                          <span className="badge">{s.type}</span>
-                          <span className="nav-name">{s.name || "(unnamed)"}</span>
-                          {pendingId === s.id && <span className="badge">…</span>}
-                          {pendingId !== s.id && selected && selected.id === s.id && <span className="badge sel-badge">selected</span>}
-                          <button
-                            className="nav-caret"
-                            onClick={(e) => { e.stopPropagation(); toggleChildren(s.id); }}
-                            title="Show children"
-                          >
-                            {childOpen ? "▾" : "▸"}
-                          </button>
-                        </div>
-                        {rowErrors[s.id] && <div className="nav-row-error">⚠ {rowErrors[s.id]}</div>}
-                        {childOpen && kids && kids.loading && <div className="member muted" style={{ marginLeft: 28 }}>Loading children…</div>}
-                        {childOpen && kids && kids.error && <div className="nav-row-error" style={{ marginLeft: 36 }}>⚠ {kids.error}</div>}
-                        {childOpen && kids && kids.children && !kids.children.length && (
-                          <div className="member muted" style={{ marginLeft: 28 }}>No children in the index.</div>
-                        )}
-                        {childOpen && kids && kids.children && kids.children.map((c) => (
-                          <React.Fragment key={c.id}>
-                            <div
-                              className={"nav-row section-row depth2" + (selected && selected.id === c.id ? " selected" : "") + (pendingId === c.id ? " pending" : "")}
-                              onClick={() => focus(c.id, c.name || c.id, p.pageName)}
-                              title={`Focus ${c.id} (select + scroll)`}
-                            >
-                              <span className="badge">{c.type}</span>
-                              <span className="nav-name">{c.name || "(unnamed)"}</span>
-                              {pendingId === c.id && <span className="badge">…</span>}
-                              {pendingId !== c.id && selected && selected.id === c.id && <span className="badge sel-badge">selected</span>}
-                            </div>
-                            {rowErrors[c.id] && <div className="nav-row-error" style={{ marginLeft: 36 }}>⚠ {rowErrors[c.id]}</div>}
-                          </React.Fragment>
-                        ))}
-                        {childOpen && kids && kids.children && (kids.truncated || kids.ambiguous) && (
-                          <div className="member muted" style={{ marginLeft: 28, fontSize: 11 }}>
-                            {kids.truncated ? `showing ${kids.children.length} of ${kids.total}` : ""}
-                            {kids.truncated && kids.ambiguous ? " · " : ""}
-                            {kids.ambiguous ? "same-named siblings — children merged" : ""}
-                          </div>
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
+                  {open && !p.sections.length && <div className="member muted" style={{ marginLeft: NAV_INDENT }}>No sections on this page.</div>}
+                  {open && p.sections.map((s) => renderNode(s, 1, p.pageName))}
                 </div>
               );
             })}

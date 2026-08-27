@@ -359,7 +359,7 @@ function loadRelayErrors(opts) {
 }
 
 // src/shared/version.ts
-var PROTOCOL_VERSION = "2.5.5";
+var PROTOCOL_VERSION = "2.6.0";
 function protocolMajor(version) {
   if (typeof version !== "string") return null;
   const major = Number(version.split(".")[0]);
@@ -3811,6 +3811,40 @@ This detailed process ensures you correctly interpret the reaction data, prepare
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error setting current page: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "get_viewport",
+    "Read Figma's current viewport: center, zoom and the canvas rect the user is looking at. Use it before set_viewport to pan/zoom relative to what is on screen.",
+    {},
+    async () => {
+      try {
+        const result = await sendCommandToFigma("get_viewport", {});
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error reading viewport: ${error instanceof Error ? error.message : String(error)}` }] };
+      }
+    }
+  );
+  server.tool(
+    "set_viewport",
+    "Pan and zoom Figma's viewport \u2014 what the user (and the console's live preview) is looking at, without changing the selection. A fit (nodeId or fit) wins over the pan/zoom params; otherwise zoom is applied first and pans then use the post-zoom extent. Figma clamps the zoom and snaps the center, so the response reports the state that actually took effect.",
+    {
+      center: import_zod.z.object({ x: import_zod.z.number(), y: import_zod.z.number() }).optional().describe("Absolute canvas point to center on."),
+      panBy: import_zod.z.object({ x: import_zod.z.number(), y: import_zod.z.number() }).optional().describe("Move the center by this many canvas units."),
+      panByFraction: import_zod.z.object({ x: import_zod.z.number(), y: import_zod.z.number() }).optional().describe("Move the center by this fraction of the visible extent (0.25 = a quarter screen right/down)."),
+      zoom: import_zod.z.number().optional().describe("Absolute zoom (1 = 100%); clamped to Figma's 0.02\u2013256 range."),
+      zoomBy: import_zod.z.number().optional().describe("Multiply the current zoom (2 = zoom in 2x, 0.5 = zoom out)."),
+      fit: import_zod.z.enum(["selection", "page"]).optional().describe("Zoom to fit the current selection or the whole page."),
+      nodeId: import_zod.z.string().optional().describe("Zoom to fit this node (switches pages when it lives on another page). Unlike set_focus this does not change the selection.")
+    },
+    async (params) => {
+      try {
+        const result = await sendCommandToFigma("set_viewport", params);
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error setting viewport: ${error instanceof Error ? error.message : String(error)}` }] };
       }
     }
   );
