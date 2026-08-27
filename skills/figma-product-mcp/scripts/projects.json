@@ -1,6 +1,7 @@
 {
+  "_comment": "defaultProjectIDs is the set a bare run keeps connected. F_Product is configured but not a default: it shares a window with another file and has never separated cleanly, so it is opened deliberately with --project f-product (or --all).",
   "pluginMenuTitle": "Cursor MCP Plugin",
-  "defaultProjectIDs": ["gw-product", "f-product", "gw-apple-watch"],
+  "defaultProjectIDs": ["t-product", "c-product", "gw-product", "gw-apple-watch", "co-product", "d-product"],
   "projects": [
     {"id":"t-product","title":"T_Product","displayTitle":"🟣 T_Product","url":"https://www.figma.com/design/HF3OE95xtnaxfYvhEv11GT/T_Product?m=draw"},
     {"id":"c-product","title":"CA_Product","displayTitle":"🔴 CA_Product","url":"https://www.figma.com/design/kNR5gyONqLJWYOrab9KNyM/C_Product?m=draw"},
