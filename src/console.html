@@ -799,7 +799,33 @@
       // queue up dozens of round trips.
       const VP_ZOOM_STEP = 1.25;
       const VP_PAN_STEP = 0.25;    // a quarter of a screen per arrow press
-      const VP_POLL_MS = 5000;     // keeps the readout honest when Figma is driven by hand
+
+      // How often the readout re-reads the real viewport, and how it retreats
+      // when the read keeps failing. A fixed interval here is a trap: the poll
+      // outlives whatever broke, so a plugin that cannot answer at all turns
+      // this readout into a permanent request generator pointed at the relay
+      // (and, through the tunnel, at Nexus). Two failure shapes, two answers —
+      // transient trouble backs off and recovers, a capability gap parks.
+      // scripts/viewport-poll-policy.test.mjs evaluates this exact block.
+      // >>> viewport-poll-policy
+      const VP_POLL_MS = 5000;           // healthy cadence — keeps the readout honest when Figma is driven by hand
+      const VP_POLL_MAX_MS = 60000;      // ceiling for trouble that fixes itself (plugin restarting, relay blip)
+      const VP_POLL_PARKED_MS = 300000;  // the connected plugin build lacks the command — only a new build changes that
+
+      // "Unknown command" is the plugin's dispatcher saying it has never heard
+      // of this command. Retrying cannot help until a different plugin build
+      // connects, so it is the one failure worth parking on. Everything else —
+      // timeouts, disconnects, no-plugin-yet — is a wait, not a verdict.
+      function isPermanentViewportError(message) {
+        return /unknown command/i.test(String(message == null ? "" : message));
+      }
+
+      function nextViewportPollDelay(currentMs, outcome) {
+        if (outcome && outcome.ok) return VP_POLL_MS;
+        if (isPermanentViewportError(outcome && outcome.error)) return VP_POLL_PARKED_MS;
+        return Math.min((currentMs || VP_POLL_MS) * 2, VP_POLL_MAX_MS);
+      }
+      // <<< viewport-poll-policy
 
       function useViewportControl(projectKey) {
         const [viewport, setViewport] = useState(null);
@@ -807,15 +833,27 @@
         const inflight = useRef(false);
         const pending = useRef(null);
         const flushRef = useRef(null);
+        const pollDelay = useRef(VP_POLL_MS);
 
         const read = useCallback(async () => {
+          // Skipping because a write is in flight is not an outcome — the write
+          // will refresh the readout itself, so the cadence stays untouched.
           if (!projectKey || inflight.current || pending.current) return;
           try {
             const r = await fetch(relayApiUrl("navigator/viewport") + `?project=${encodeURIComponent(projectKey)}`);
             const data = await r.json();
-            if (!r.ok) { setError(data.error || `HTTP ${r.status}`); return; }
+            if (!r.ok) {
+              const message = data.error || `HTTP ${r.status}`;
+              pollDelay.current = nextViewportPollDelay(pollDelay.current, { ok: false, error: message });
+              setError(message);
+              return;
+            }
+            pollDelay.current = nextViewportPollDelay(pollDelay.current, { ok: true });
             setError(null); setViewport(data.result);
-          } catch (e) { setError(String(e)); }
+          } catch (e) {
+            pollDelay.current = nextViewportPollDelay(pollDelay.current, { ok: false, error: String(e) });
+            setError(String(e));
+          }
         }, [projectKey]);
 
         const flush = useCallback(async () => {
@@ -833,7 +871,9 @@
             if (!r.ok) setError(data.error || `HTTP ${r.status}`);
             // Render what Figma actually did — it clamps the zoom and snaps
             // the center, so an optimistic guess would drift out of sync.
-            else { setError(null); setViewport(data.result); }
+            // A write that lands also proves the plugin can talk, so a parked
+            // readout comes straight back rather than waiting out its timer.
+            else { setError(null); setViewport(data.result); pollDelay.current = VP_POLL_MS; }
           } catch (e) { setError(String(e)); }
           finally {
             inflight.current = false;
@@ -858,12 +898,22 @@
 
         const jump = useCallback((body) => { pending.current = body; flush(); }, [flush]);
 
+        // Self-rescheduling, because the next delay is only known once the
+        // current read has answered. Chaining also means a slow read can never
+        // overlap the next one the way a fixed interval allows.
         useEffect(() => {
           setViewport(null); setError(null); pending.current = null;
+          pollDelay.current = VP_POLL_MS;
           if (!projectKey) return;
-          read();
-          const timer = setInterval(read, VP_POLL_MS);
-          return () => clearInterval(timer);
+          let alive = true;
+          let timer = null;
+          const tick = async () => {
+            await read();
+            if (!alive) return;
+            timer = setTimeout(tick, pollDelay.current);
+          };
+          tick();
+          return () => { alive = false; if (timer) clearTimeout(timer); };
         }, [projectKey, read]);
 
         return { viewport, error, nudge, jump };

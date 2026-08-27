@@ -1,0 +1,21 @@
+# The repo had no CI, so nothing was checking the checked-in browser sources —
+# console.html has no build step and is only ever parsed by Babel in the
+# browser, which means a syntax slip or a regressed retry policy ships silently.
+# This runs the checks that need nothing but node; test:http needs bun and a
+# build, so it stays a local/manual step until that toolchain is wired here.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm run test:console
