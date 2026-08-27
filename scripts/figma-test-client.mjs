@@ -66,8 +66,10 @@ ws.on("message", (raw) => {
     process.exit(1);
   }
 
-  // Join acknowledgement (system message with a result) → now send the command.
-  if (!joined && data.type === "system") {
+  // Join acknowledgement is the system frame whose message is an OBJECT with a
+  // result — the relay also sends a plain-string greeting before hello_ack,
+  // which must not trigger the command early (silent TIMEOUT otherwise).
+  if (!joined && data.type === "system" && data.message && typeof data.message === "object" && "result" in data.message) {
     joined = true;
     reqId = rid();
     ws.send(JSON.stringify({

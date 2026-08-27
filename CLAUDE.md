@@ -27,7 +27,7 @@ There is no test suite or linter configured.
 ## Running the Relay (launchd service)
 
 The relay is NOT started manually anymore — it runs as a macOS launchd agent
-(`com.garen.figma-relay`) that auto-starts at login and auto-restarts on crash.
+(`com.helinlabs.tunnel.figma-relay` (nexus 터널 supervision MANAGED — 어드민 터널 화면에서 재시작/업데이트 가능)) that auto-starts at login and auto-restarts on crash.
 Manage it with `scripts/relayctl.sh`:
 
 ```bash

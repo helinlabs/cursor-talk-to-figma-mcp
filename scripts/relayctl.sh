@@ -18,7 +18,8 @@
 #
 set -euo pipefail
 
-LABEL="com.garen.figma-relay"
+# nexus 터널 supervision(MANAGED) 전환(2026-08-27) 후의 라벨 — 구 라벨은 제거됨.
+LABEL="${RELAY_LABEL:-com.helinlabs.tunnel.figma-relay}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLIST_SRC="$PROJECT_DIR/scripts/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"

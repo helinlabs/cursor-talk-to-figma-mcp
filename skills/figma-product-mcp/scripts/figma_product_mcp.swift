@@ -303,7 +303,9 @@ func channel(in window: AXUIElement) -> String? {
 }
 
 func activatePlugin(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement, pluginTitle: String, timeout: TimeInterval) -> Bool {
-    if windowContains(window, text: "Disconnect") && windowContains(window, text: "Connected to server in channel") { return true }
+    // "Disconnect" is hidden in the collapsed (compact) plugin UI since 2.5.4 — the
+    // connected banner alone is sufficient and only appears when actually connected.
+    if windowContains(window, text: "Connected to server in channel") { return true }
     _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     app.activate(options: [.activateAllWindows])
     RunLoop.current.run(until: Date().addingTimeInterval(0.35))
@@ -313,7 +315,7 @@ func activatePlugin(_ app: NSRunningApplication, appElement: AXUIElement, window
     guard waitUntil(timeout: 3, { menuItem(appElement, named: pluginTitle) != nil }),
           let plugin = menuItem(appElement, named: pluginTitle), press(plugin) else { return false }
     return waitUntil(timeout: timeout) {
-        windowContains(window, text: "Disconnect") && windowContains(window, text: "Connected to server in channel")
+        windowContains(window, text: "Connected to server in channel")
     }
 }
 
