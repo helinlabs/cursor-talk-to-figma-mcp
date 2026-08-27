@@ -1,0 +1,4 @@
+interface:
+  display_name: "Figma Product MCP Launcher"
+  short_description: "제품 Figma 창과 Talk To Figma MCP를 일괄 실행"
+  default_prompt: "Use $figma-product-mcp to open all Product files in separate Figma windows and connect Talk To Figma MCP."
