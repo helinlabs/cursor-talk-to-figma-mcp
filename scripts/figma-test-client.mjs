@@ -11,7 +11,21 @@
 // Used to verify plugin-side features against real nodes without going through
 // the MCP tool registration (which only refreshes on a new session).
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import WebSocket from "ws";
+
+// 릴레이는 hello(protocolVersion) 없는 클라이언트를 protocol_mismatch 로 끊는다
+// (2.x). 버전은 공유 소스에서 읽어 하드코딩 드리프트를 막는다.
+const versionSrc = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "src", "shared", "version.ts"),
+  "utf8",
+);
+const PROTOCOL_VERSION = /PROTOCOL_VERSION\s*=\s*"([^"]+)"/.exec(versionSrc)?.[1];
+if (!PROTOCOL_VERSION) {
+  console.error("cannot read PROTOCOL_VERSION from src/shared/version.ts");
+  process.exit(2);
+}
 
 const [, , channel, command, paramsJson] = process.argv;
 if (!channel || !command) {
@@ -34,13 +48,23 @@ const timeout = setTimeout(() => {
 }, 30000);
 
 ws.on("open", () => {
-  const id = rid();
-  ws.send(JSON.stringify({ id, type: "join", channel, message: { id, command: "join", params: { channel } } }));
+  // hello 를 먼저 — 릴레이가 hello_ack 를 준 뒤에야 join 이 유효하다.
+  ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: `test-${rid()}`, protocolVersion: PROTOCOL_VERSION }));
 });
 
 ws.on("message", (raw) => {
   let data;
   try { data = JSON.parse(raw.toString()); } catch { return; }
+
+  if (data.type === "system" && data.event === "hello_ack") {
+    const id = rid();
+    ws.send(JSON.stringify({ id, type: "join", channel, message: { id, command: "join", params: { channel } } }));
+    return;
+  }
+  if (data.type === "system" && data.event === "protocol_mismatch") {
+    console.error("PROTOCOL MISMATCH:", data.message);
+    process.exit(1);
+  }
 
   // Join acknowledgement (system message with a result) → now send the command.
   if (!joined && data.type === "system") {
@@ -70,3 +94,8 @@ ws.on("message", (raw) => {
 });
 
 ws.on("error", (e) => { console.error("WS error:", e.message); process.exit(1); });
+ws.on("close", (code, reason) => {
+  // 이유 없는 TIMEOUT 으로 오인하지 않게 — 4003 등 종료 사유를 그대로 보인다.
+  console.error(`WS closed: ${code} ${reason?.toString() || ""}`);
+  process.exit(1);
+});
