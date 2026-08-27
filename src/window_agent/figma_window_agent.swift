@@ -171,48 +171,115 @@ func frameMatches(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat = 4) -> Bool 
         && abs(lhs.width - rhs.width) <= tolerance && abs(lhs.height - rhs.height) <= tolerance
 }
 
-// A synthetic click lands on whatever window is topmost at that screen point,
-// not on the window whose pixels we streamed — so raise the target first.
-func raiseWindow(_ window: TargetWindow) {
-    guard let app = NSWorkspace.shared.runningApplications.first(where: {
+func figmaApp() -> NSRunningApplication? {
+    NSWorkspace.shared.runningApplications.first {
         $0.bundleIdentifier == "com.figma.Desktop" || $0.localizedName == "Figma"
-    }) else { return }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input delivery without hijacking the machine.
+//
+// Measured on macOS 26: posting to the global HID tap (CGEvent.post) warps the
+// physical cursor to the click point and, together with activating the app,
+// yanks the operator's focus away mid-work. Posting to Figma's process instead
+// (CGEventPostToPid) never touches the cursor — but Figma ignores events while
+// it is not the active app, so posting alone does nothing at all.
+//
+// So: activate Figma only long enough for it to accept events, deliver by pid
+// so the cursor stays put, and hand focus back to whoever had it once the input
+// stops. Focus is restored on an idle timer rather than per event, so a burst
+// of clicks does not pay the activate/restore round trip each time.
+// ---------------------------------------------------------------------------
+final class InputSession {
+    private let lock = NSLock()
+    private var previousApp: NSRunningApplication?
+    private var restoreWorkItem: DispatchWorkItem?
+    private let idleRestore: TimeInterval = 0.8
+
+    // Returns the Figma app once it is ready to accept synthetic events.
+    func begin() -> NSRunningApplication? {
+        guard let app = figmaApp() else { return nil }
+        lock.lock()
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+        let alreadyActive = app.isActive
+        if !alreadyActive && previousApp == nil {
+            previousApp = NSWorkspace.shared.frontmostApplication
+        }
+        lock.unlock()
+        if !alreadyActive {
+            app.activate(options: [])
+            // Figma needs a beat to take key status before it will route events.
+            for _ in 0..<25 where !app.isActive { usleep(20_000) }
+        }
+        return app
+    }
+
+    // Give focus back after the operator stops driving, not between clicks.
+    func end() {
+        lock.lock()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let previous = self.previousApp
+            self.previousApp = nil
+            self.restoreWorkItem = nil
+            self.lock.unlock()
+            previous?.activate(options: [])
+        }
+        restoreWorkItem?.cancel()
+        restoreWorkItem = item
+        lock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + idleRestore, execute: item)
+    }
+}
+
+let inputSession = InputSession()
+
+// Raise the target window WITHIN Figma (z-order only — this is not an app
+// activation), so a click meant for the streamed window cannot land on a
+// sibling window stacked over the same point.
+func raiseWindow(_ app: NSRunningApplication, _ window: TargetWindow) {
     let appElement = AXUIElementCreateApplication(app.processIdentifier)
     var value: CFTypeRef?
-    if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
-       let axWindows = value as? [AXUIElement] {
-        // There is no public way to read a CGWindowID off an AXUIElement, so
-        // match on the frame instead: both APIs report the same screen rect.
-        for axWindow in axWindows where axFrame(axWindow).map({ frameMatches($0, window.bounds) }) == true {
-            AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-            AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
-            break
-        }
+    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+          let axWindows = value as? [AXUIElement] else { return }
+    // There is no public way to read a CGWindowID off an AXUIElement, so match
+    // on the frame instead: both APIs report the same screen rect.
+    for axWindow in axWindows where axFrame(axWindow).map({ frameMatches($0, window.bounds) }) == true {
+        AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+        break
     }
-    app.activate(options: [.activateAllWindows])
 }
 
 @discardableResult
 func postClick(in window: TargetWindow, normX: Double, normY: Double, clickCount: Int, right: Bool) -> Bool {
     // Normalized coordinates keep the console honest: it never has to know the
-    // capture scale, and a point outside the window simply cannot be expressed.
+    // capture scale, and a point outside the window cannot even be expressed.
     guard normX >= 0, normX <= 1, normY >= 0, normY <= 1 else { return false }
-    guard let live = findWindow(match: nil, windowId: window.id) else { return false }
+    guard let live = findWindow(match: nil, windowId: window.id), let app = inputSession.begin() else { return false }
+    defer { inputSession.end() }
+    raiseWindow(app, live)
     let point = CGPoint(x: live.bounds.origin.x + live.bounds.width * normX,
                         y: live.bounds.origin.y + live.bounds.height * normY)
-    raiseWindow(live)
-    usleep(120_000)
+    let pid = app.processIdentifier
     let downType: CGEventType = right ? .rightMouseDown : .leftMouseDown
     let upType: CGEventType = right ? .rightMouseUp : .leftMouseUp
     let button: CGMouseButton = right ? .right : .left
+    // A move first so Figma hit-tests the right window before the press.
+    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: button)?.postToPid(pid)
+    usleep(20_000)
     for index in 1...max(1, min(3, clickCount)) {
         guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: point, mouseButton: button),
               let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: point, mouseButton: button) else { return false }
         down.setIntegerValueField(.mouseEventClickState, value: Int64(index))
         up.setIntegerValueField(.mouseEventClickState, value: Int64(index))
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-        usleep(30_000)
+        down.postToPid(pid)
+        usleep(20_000)
+        up.postToPid(pid)
+        usleep(20_000)
     }
     return true
 }
@@ -220,16 +287,18 @@ func postClick(in window: TargetWindow, normX: Double, normY: Double, clickCount
 @discardableResult
 func postKey(in window: TargetWindow, key: String, modifiers: [String]) -> Bool {
     guard let code = allowedKeys[key] else { return false }
-    guard let live = findWindow(match: nil, windowId: window.id) else { return false }
-    raiseWindow(live)
-    usleep(120_000)
+    guard let live = findWindow(match: nil, windowId: window.id), let app = inputSession.begin() else { return false }
+    defer { inputSession.end() }
+    raiseWindow(app, live)
     let flags = modifierFlags(modifiers)
     guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
           let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return false }
     down.flags = flags
     up.flags = flags
-    down.post(tap: .cghidEventTap)
-    up.post(tap: .cghidEventTap)
+    let pid = app.processIdentifier
+    down.postToPid(pid)
+    usleep(20_000)
+    up.postToPid(pid)
     return true
 }
 
