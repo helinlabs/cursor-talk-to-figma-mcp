@@ -1,0 +1,410 @@
+// ---------------------------------------------------------------------------
+// Live preview over WebRTC.
+//
+// One window-agent process per streamed channel (ScreenCaptureKit capture +
+// hardware H.264, see src/window_agent/), one werift peer per viewer. The
+// relay does no transcoding and no muxing: the agent's Annex-B access units
+// are packetized to RTP (RFC 6184) and written to every viewer's track.
+//
+// Media flows browser ⇄ mac mini directly (P2P, STUN only). The relay's part
+// after signaling is feeding RTP into werift, which delivers over the ICE
+// pair. There is deliberately NO TURN relay: when ICE cannot connect, the
+// console falls back to the old low-rate JPEG capture path instead — decided
+// with the operator, to keep the tunnel out of the media path entirely.
+//
+// The agent is also the input path (clicks + allowlisted keys), because both
+// capture and synthetic input need macOS privacy grants and one binary means
+// one grant. Input is forwarded verbatim; the agent enforces the allowlist.
+// ---------------------------------------------------------------------------
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { access, chmod, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import {
+  MediaStreamTrack,
+  RTCPeerConnection,
+  RTCRtpCodecParameters,
+  RTCSessionDescription,
+  RtpHeader,
+  RtpPacket,
+} from "werift";
+import { MAX_PAYLOAD_BYTES, RtpSequencer, packetizeAccessUnit } from "./h264-rtp";
+
+const execFileAsync = promisify(execFile);
+
+// ---------------------------------------------------------------------------
+// Agent binary: compiled from source on first use, cached by content hash —
+// the same pattern as local-figma-capture's window helper, so deploying is
+// still just `git pull` + relay restart, no build step.
+// ---------------------------------------------------------------------------
+const AGENT_SOURCE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "window_agent", "figma_window_agent.swift");
+let agentBinaryPromise: Promise<string> | null = null;
+
+async function agentBinary(): Promise<string> {
+  if (agentBinaryPromise) return agentBinaryPromise;
+  agentBinaryPromise = (async () => {
+    const source = await readFile(AGENT_SOURCE_PATH, "utf8");
+    const hash = createHash("sha256").update(source).digest("hex").slice(0, 12);
+    const binaryPath = join(tmpdir(), `figma-window-agent-${hash}`);
+    try {
+      await access(binaryPath, fsConstants.X_OK);
+      return binaryPath;
+    } catch {}
+    const buildDir = await mkdtemp(join(tmpdir(), "figma-window-agent-build-"));
+    try {
+      const sourcePath = join(buildDir, "main.swift");
+      const outputPath = join(buildDir, "agent");
+      await writeFile(sourcePath, source, "utf8");
+      await execFileAsync("/usr/bin/swiftc", [sourcePath, "-O", "-o", outputPath], { maxBuffer: 4 * 1024 * 1024 });
+      await chmod(outputPath, 0o755);
+      await rename(outputPath, binaryPath);
+      return binaryPath;
+    } finally {
+      await rm(buildDir, { recursive: true, force: true });
+    }
+  })();
+  agentBinaryPromise.catch(() => { agentBinaryPromise = null; });
+  return agentBinaryPromise;
+}
+
+// ---------------------------------------------------------------------------
+// WindowAgent: one spawned agent process, framed-stdout parsing, JSON stdin.
+// ---------------------------------------------------------------------------
+export interface StreamQuality {
+  fps?: number;
+  maxWidth?: number;
+  bitrate?: number;
+}
+
+type AgentEvent = Record<string, any>;
+
+class WindowAgent {
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private buffer = Buffer.alloc(0);
+  private startPromise: Promise<void> | null = null;
+  onAccessUnit: ((pts90k: number, keyframe: boolean, annexB: Buffer) => void) | null = null;
+  onEvent: ((event: AgentEvent) => void) | null = null;
+  onExit: (() => void) | null = null;
+  lastEvents: AgentEvent[] = [];
+
+  constructor(readonly windowMatch: string) {}
+
+  async start(): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = (async () => {
+      const binary = await agentBinary();
+      const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"] });
+      this.child = child;
+      child.stdout.on("data", (chunk: Buffer) => this.feed(chunk));
+      child.stderr.on("data", (chunk: Buffer) => {
+        const text = chunk.toString().trim();
+        if (text) console.error(`[window-agent:${this.windowMatch}] ${text}`);
+      });
+      child.on("exit", () => {
+        this.child = null;
+        this.startPromise = null;
+        this.onExit?.();
+      });
+      this.send({ cmd: "target", match: this.windowMatch });
+    })();
+    return this.startPromise;
+  }
+
+  private feed(chunk: Buffer): void {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    while (this.buffer.length >= 4) {
+      const length = this.buffer.readUInt32BE(0);
+      if (this.buffer.length < 4 + length) break;
+      const type = this.buffer[4];
+      const payload = this.buffer.subarray(5, 4 + length);
+      this.buffer = this.buffer.subarray(4 + length);
+      if (type === 1) {
+        try {
+          const event = JSON.parse(payload.toString("utf8"));
+          this.lastEvents.push(event);
+          if (this.lastEvents.length > 20) this.lastEvents.shift();
+          this.onEvent?.(event);
+        } catch {}
+      } else if (type === 4 && payload.length > 9) {
+        const pts90k = Number(payload.readBigUInt64BE(0));
+        const keyframe = payload[8] === 1;
+        // Copy out of the parse buffer: subarray views alias memory that the
+        // next concat invalidates.
+        this.onAccessUnit?.(pts90k, keyframe, Buffer.from(payload.subarray(9)));
+      }
+    }
+  }
+
+  send(command: Record<string, any>): void {
+    this.child?.stdin.write(JSON.stringify(command) + "\n");
+  }
+
+  stop(): void {
+    const child = this.child;
+    if (!child) return;
+    this.send({ cmd: "stop" });
+    child.stdin.end();
+    setTimeout(() => {
+      try { child.kill(); } catch {}
+    }, 1500).unref?.();
+    this.child = null;
+    this.startPromise = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Viewer peer: werift peer connection with a single sendonly H.264 track.
+// ---------------------------------------------------------------------------
+const H264_PAYLOAD_TYPE = 96;
+
+interface SignalSender {
+  (message: Record<string, any>): void;
+}
+
+class ViewerPeer {
+  readonly pc: RTCPeerConnection;
+  readonly track: MediaStreamTrack;
+  private readonly sequencer = new RtpSequencer();
+  private closed = false;
+  onNeedKeyframe: (() => void) | null = null;
+  onClosed: (() => void) | null = null;
+  // Until the first keyframe goes out, P-frames reference pictures the viewer
+  // never saw — drop them instead of feeding the decoder garbage.
+  private sentKeyframe = false;
+
+  constructor(private readonly signal: SignalSender) {
+    this.pc = new RTCPeerConnection({
+      codecs: {
+        video: [
+          new RTCRtpCodecParameters({
+            mimeType: "video/H264",
+            clockRate: 90000,
+            rtcpFeedback: [
+              { type: "nack" },
+              { type: "nack", parameter: "pli" },
+              { type: "goog-remb" },
+            ],
+            parameters: "packetization-mode=1;level-asymmetry-allowed=1;profile-level-id=42001f",
+          }),
+        ],
+      },
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+    this.track = new MediaStreamTrack({ kind: "video" });
+    const transceiver = this.pc.addTransceiver(this.track, { direction: "sendonly" });
+    transceiver.sender.onRtcp.subscribe((rtcp: any) => {
+      // PLI or FIR → the viewer lost its picture; answer with an IDR.
+      if (rtcp.type === 206) this.onNeedKeyframe?.();
+    });
+    this.pc.onIceCandidate.subscribe((candidate: any) => {
+      if (candidate) this.signal({ type: "webrtc_ice", candidate: candidate.toJSON() });
+    });
+    this.pc.iceConnectionStateChange.subscribe((state: string) => {
+      this.signal({ type: "webrtc_state", state });
+      if (state === "failed" || state === "closed" || state === "disconnected") this.close();
+    });
+  }
+
+  async offer(): Promise<void> {
+    await this.pc.setLocalDescription(await this.pc.createOffer());
+    this.signal({ type: "webrtc_offer", sdp: this.pc.localDescription!.sdp });
+  }
+
+  async answer(sdp: string): Promise<void> {
+    await this.pc.setRemoteDescription(new RTCSessionDescription(sdp, "answer"));
+  }
+
+  async addIce(candidate: any): Promise<void> {
+    try { await this.pc.addIceCandidate(candidate); } catch {}
+  }
+
+  writeAccessUnit(pts90k: number, keyframe: boolean, annexB: Buffer): void {
+    if (this.closed) return;
+    if (!this.sentKeyframe) {
+      if (!keyframe) { this.onNeedKeyframe?.(); return; }
+      this.sentKeyframe = true;
+    }
+    const timestamp = this.sequencer.timestamp(pts90k);
+    const payloads = packetizeAccessUnit(annexB, MAX_PAYLOAD_BYTES);
+    for (let index = 0; index < payloads.length; index++) {
+      const header = new RtpHeader({
+        version: 2,
+        payloadType: H264_PAYLOAD_TYPE,
+        sequenceNumber: this.sequencer.next(),
+        timestamp,
+        ssrc: this.sequencer.ssrc,
+        marker: index === payloads.length - 1,   // last packet of the access unit
+      });
+      try {
+        this.track.writeRtp(new RtpPacket(header, Buffer.from(payloads[index])));
+      } catch {
+        // A single failed write is a closing transport; the state handler
+        // tears the peer down.
+        return;
+      }
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.pc.close().catch(() => {});
+    this.onClosed?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Manager: channels → agents, sockets → peers.
+// ---------------------------------------------------------------------------
+interface ChannelStream {
+  agent: WindowAgent;
+  peers: Set<ViewerPeer>;
+  signals: Map<ViewerPeer, SignalSender>;
+  quality: Required<StreamQuality>;
+  started: boolean;
+}
+
+const DEFAULT_QUALITY: Required<StreamQuality> = { fps: 12, maxWidth: 1280, bitrate: 800_000 };
+
+export class PreviewStreamManager {
+  private streams = new Map<string, ChannelStream>();
+  private peersBySocket = new Map<unknown, { channel: string; peer: ViewerPeer }>();
+
+  constructor(private readonly windowMatchForChannel: (channel: string) => string | undefined) {}
+
+  private streamFor(channel: string): ChannelStream {
+    let stream = this.streams.get(channel);
+    if (stream) return stream;
+    const match = this.windowMatchForChannel(channel) ?? "";
+    const agent = new WindowAgent(match);
+    stream = { agent, peers: new Set(), signals: new Map(), quality: { ...DEFAULT_QUALITY }, started: false };
+    agent.onAccessUnit = (pts90k, keyframe, annexB) => {
+      for (const peer of stream!.peers) peer.writeAccessUnit(pts90k, keyframe, annexB);
+    };
+    agent.onEvent = (event) => {
+      if (event.event === "error") {
+        console.error(`[preview-stream:${channel}] agent error: ${event.message}`);
+        // A capture that cannot start (window gone, permission missing) would
+        // otherwise leave viewers on a connected-but-black peer: ICE succeeds,
+        // media never comes. Tell them so the console can fall back.
+        for (const [peer, signal] of stream!.signals) {
+          signal({ type: "webrtc_error", message: String(event.message || "capture failed") });
+          peer.close();
+        }
+      }
+    };
+    agent.onExit = () => {
+      // The agent dying (window closed, crash) ends the stream for everyone;
+      // viewers see the ICE state change and fall back on their own.
+      const current = this.streams.get(channel);
+      if (!current) return;
+      for (const peer of [...current.peers]) peer.close();
+      this.streams.delete(channel);
+    };
+    this.streams.set(channel, stream);
+    return stream;
+  }
+
+  /** Browser asked to start a WebRTC preview on this socket. */
+  async startViewer(socket: unknown, channel: string, quality: StreamQuality | undefined, signal: SignalSender): Promise<void> {
+    this.stopViewer(socket);
+    const stream = this.streamFor(channel);
+    if (quality) this.applyQuality(stream, quality);
+
+    const peer = new ViewerPeer(signal);
+    peer.onNeedKeyframe = () => stream.agent.send({ cmd: "keyframe" });
+    peer.onClosed = () => {
+      stream.peers.delete(peer);
+      stream.signals.delete(peer);
+      const entry = this.peersBySocket.get(socket);
+      if (entry?.peer === peer) this.peersBySocket.delete(socket);
+      if (stream.peers.size === 0) {
+        stream.agent.stop();
+        this.streams.delete(channel);
+      }
+    };
+    stream.peers.add(peer);
+    stream.signals.set(peer, signal);
+    this.peersBySocket.set(socket, { channel, peer });
+
+    await stream.agent.start();
+    if (!stream.started) {
+      stream.agent.send({ cmd: "config", ...stream.quality });
+      stream.started = true;
+    } else {
+      // A joining viewer needs an IDR before anything it gets is decodable.
+      stream.agent.send({ cmd: "keyframe" });
+    }
+    await peer.offer();
+  }
+
+  private applyQuality(stream: ChannelStream, quality: StreamQuality): void {
+    stream.quality = {
+      fps: quality.fps ?? stream.quality.fps,
+      maxWidth: quality.maxWidth ?? stream.quality.maxWidth,
+      bitrate: quality.bitrate ?? stream.quality.bitrate,
+    };
+    if (stream.started) stream.agent.send({ cmd: "config", ...stream.quality });
+  }
+
+  /** Quality change from the console (per channel — last writer wins). */
+  setQuality(channel: string, quality: StreamQuality): void {
+    const stream = this.streams.get(channel);
+    if (stream) this.applyQuality(stream, quality);
+  }
+
+  async handleAnswer(socket: unknown, sdp: string): Promise<void> {
+    await this.peersBySocket.get(socket)?.peer.answer(sdp);
+  }
+
+  async handleIce(socket: unknown, candidate: any): Promise<void> {
+    await this.peersBySocket.get(socket)?.peer.addIce(candidate);
+  }
+
+  /** Click / key from the console, forwarded to the channel's agent (which
+   *  enforces the allowlist and coordinate bounds). */
+  sendInput(channel: string, input: Record<string, any>): boolean {
+    const stream = this.streams.get(channel);
+    if (!stream) return false;
+    if (input.type === "click") {
+      stream.agent.send({
+        cmd: "click",
+        x: Number(input.x),
+        y: Number(input.y),
+        clickCount: Number(input.clickCount) || 1,
+        button: input.button === "right" ? "right" : "left",
+      });
+      return true;
+    }
+    if (input.type === "key") {
+      stream.agent.send({
+        cmd: "key",
+        key: String(input.key || ""),
+        modifiers: Array.isArray(input.modifiers) ? input.modifiers.map(String) : [],
+      });
+      return true;
+    }
+    return false;
+  }
+
+  stopViewer(socket: unknown): void {
+    this.peersBySocket.get(socket)?.peer.close();
+    this.peersBySocket.delete(socket);
+  }
+
+  /** For /status introspection. */
+  snapshot(): Record<string, any> {
+    return Object.fromEntries(
+      [...this.streams.entries()].map(([channel, stream]) => [channel, {
+        windowMatch: stream.agent.windowMatch,
+        viewers: stream.peers.size,
+        quality: stream.quality,
+        recentAgentEvents: stream.agent.lastEvents.slice(-5),
+      }])
+    );
+  }
+}
