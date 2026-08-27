@@ -136,6 +136,13 @@
       .preview-head button { margin-left: auto; }
       .preview-stage { min-height: 120px; max-height: 420px; display: flex; align-items: center; justify-content: center; overflow: auto; background: #090a0d; border: 1px solid var(--border); border-radius: 7px; }
       .preview-stage img { display: block; max-width: 100%; max-height: 400px; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+      .preview-stage video { display: block; width: 100%; height: 100%; max-height: 400px; object-fit: contain; user-select: none; }
+      .preview-stage.control { outline: 1px solid var(--blue); outline-offset: -1px; cursor: crosshair; }
+      .preview-stage:focus { outline: 1px solid var(--border); outline-offset: -1px; }
+      .preview-stage.control:focus { outline-color: var(--blue); }
+      .live-badge { color: var(--green); border-color: var(--green); }
+      .control-on { color: var(--blue); border-color: var(--blue); }
+      .quality-select { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-size: 11px; }
       .preview-stage.grab { cursor: grab; }
       .preview-stage.grab:active { cursor: grabbing; }
       .preview-meta { color: var(--muted); font-size: 11px; margin-top: 7px; }
@@ -160,6 +167,7 @@
       .nav-main .preview-panel { border-bottom: none; flex: 1; display: flex; flex-direction: column; }
       .nav-main .preview-stage { flex: 1; max-height: none; }
       .nav-main .preview-stage img { max-height: none; }
+      .nav-main .preview-stage video { max-height: none; }
       .nav-placeholder { flex: 1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
       /* Navigator rows: the WHOLE row is the click target (except the caret),
          so the cursor and the clickable area always match. */
@@ -763,6 +771,26 @@
         );
       }
 
+      // Quality presets for the WebRTC stream. Persisted per browser. The relay
+      // reconfigures the encoder live on change, so a higher preset costs
+      // bandwidth only while somebody is actually watching at it.
+      const QUALITY_PRESETS = {
+        low:      { label: "Low · 8fps 960px",       fps: 8,  maxWidth: 960,  bitrate: 400000 },
+        balanced: { label: "Balanced · 12fps 1280px", fps: 12, maxWidth: 1280, bitrate: 800000 },
+        high:     { label: "High · 24fps 1600px",     fps: 24, maxWidth: 1600, bitrate: 2000000 },
+        ultra:    { label: "Ultra · 30fps 1920px",    fps: 30, maxWidth: 1920, bitrate: 4000000 },
+      };
+      function loadQualityKey() { try { return localStorage.getItem("ttf-preview-quality") || "balanced"; } catch { return "balanced"; } }
+      function saveQualityKey(key) { try { localStorage.setItem("ttf-preview-quality", key); } catch {} }
+      function qualityOf(key) {
+        const preset = QUALITY_PRESETS[key] || QUALITY_PRESETS.balanced;
+        return { fps: preset.fps, maxWidth: preset.maxWidth, bitrate: preset.bitrate };
+      }
+
+      // Browser key -> agent key name. The agent enforces this same allowlist
+      // again server-side; this map is UX, not the security boundary.
+      const CONTROL_KEYS = { "\\": "backslash", Escape: "escape", ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+
       // Drive the Figma viewport from the preview. The preview is a screenshot
       // of the Figma app window, so the only way to move it is to move the real
       // viewport in the plugin: every gesture posts to /navigator/viewport and
@@ -841,10 +869,25 @@
         return { viewport, error, nudge, jump };
       }
 
-      function PreviewPanel({ project, preview, onClose }) {
+      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange }) {
         const { viewport, error: vpError, nudge, jump } = useViewportControl(project ? project.projectKey : null);
         const stageRef = useRef(null);
+        const videoRef = useRef(null);
         const drag = useRef(null);
+        // Control mode: clicks and allowlisted keys go into the real window.
+        // Off by default — the preview is view-only until somebody opts in,
+        // and it needs the live stream (the agent is also the input path).
+        const [control, setControl] = useState(false);
+        const live = rtc && rtc.status === "live";
+
+        useEffect(() => {
+          const video = videoRef.current;
+          if (video && rtc && rtc.stream && video.srcObject !== rtc.stream) {
+            video.srcObject = rtc.stream;
+            video.play().catch(() => {});
+          }
+        }, [rtc && rtc.stream, live]);
+        useEffect(() => { if (!live && control) setControl(false); }, [live]);
 
         // Wheel must be a non-passive native listener: React's synthetic wheel
         // handler is passive, so preventDefault there would not stop the page
@@ -862,13 +905,30 @@
 
         if (!project) return null;
 
-        // Drag deltas are read as a fraction of the preview, which is a
-        // fraction of the *window* — Figma's side panels are part of the shot,
-        // so a drag pans slightly more canvas than the pixels under the cursor.
+        // The stream is the whole window, letterboxed by object-fit: contain —
+        // so a click maps to normalized window coordinates via the video's
+        // content box. Normalized is all the agent accepts: a point outside
+        // the window cannot even be expressed.
+        const normalizedPoint = (e) => {
+          const video = videoRef.current;
+          if (!video || !video.videoWidth) return null;
+          const rect = video.getBoundingClientRect();
+          const scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
+          const contentW = video.videoWidth * scale, contentH = video.videoHeight * scale;
+          const offsetX = rect.left + (rect.width - contentW) / 2;
+          const offsetY = rect.top + (rect.height - contentH) / 2;
+          const x = (e.clientX - offsetX) / contentW;
+          const y = (e.clientY - offsetY) / contentH;
+          if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+          return { x, y };
+        };
+
+        // Drag pans the Figma viewport (as before); in control mode a press
+        // that never travels more than a few pixels is a click into the window.
         const onPointerDown = (e) => {
-          if (e.button !== 0 || !preview?.url) return;
+          if (e.button !== 0 || (!preview?.url && !live)) return;
           const rect = e.currentTarget.getBoundingClientRect();
-          drag.current = { x: e.clientX, y: e.clientY, w: rect.width || 1, h: rect.height || 1 };
+          drag.current = { x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: 0, w: rect.width || 1, h: rect.height || 1 };
           try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
         };
         const onPointerMove = (e) => {
@@ -876,19 +936,44 @@
           if (!d) return;
           const dx = e.clientX - d.x, dy = e.clientY - d.y;
           if (!dx && !dy) return;
+          d.moved = Math.max(d.moved, Math.hypot(e.clientX - d.startX, e.clientY - d.startY));
           d.x = e.clientX; d.y = e.clientY;
           nudge({ panByFraction: { x: -dx / d.w, y: -dy / d.h } });
         };
         const endDrag = (e) => {
+          const d = drag.current;
           drag.current = null;
           try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+          if (control && live && d && d.moved < 4) {
+            const point = normalizedPoint(e);
+            if (point && onInput) onInput({ type: "click", x: point.x, y: point.y, clickCount: Math.min(3, e.detail || 1) });
+          }
         };
+        const onContextMenu = (e) => {
+          if (!control || !live) return;
+          e.preventDefault();
+          const point = normalizedPoint(e);
+          if (point && onInput) onInput({ type: "click", x: point.x, y: point.y, clickCount: 1, button: "right" });
+        };
+        const onKeyDown = (e) => {
+          if (!control || !live) return;
+          const key = CONTROL_KEYS[e.key === "₩" ? "\\" : e.key];   // Korean layout: same physical key reports won-sign
+          if (!key) return;
+          e.preventDefault();
+          if (onInput) onInput({ type: "key", key, modifiers: e.shiftKey ? ["shift"] : [] });
+        };
+        const sendKey = (key, modifiers) => { if (onInput) onInput({ type: "key", key, modifiers: modifiers || [] }); };
+
+        const modeBadge = live ? "LIVE · WebRTC"
+          : rtc && rtc.status === "connecting" ? "connecting…"
+          : rtc && rtc.status === "fallback" ? "JPEG fallback"
+          : "Figma app window";
 
         return (
           <div className="preview-panel">
             <div className="preview-head">
               <strong>Live Figma preview · {project.name || "(untitled)"}</strong>
-              <span className="badge">Figma app window</span>
+              <span className={"badge" + (live ? " live-badge" : "")}>{modeBadge}</span>
               {onClose && <button className="ghost" onClick={onClose}>Close preview</button>}
             </div>
             <div className="preview-controls">
@@ -903,24 +988,65 @@
               <span className="vp-sep" />
               <button className="ghost" title="Zoom to fit this page" onClick={() => jump({ fit: "page" })}>Fit page</button>
               <button className="ghost" title="Zoom to fit the current Figma selection" onClick={() => jump({ fit: "selection" })}>Fit selection</button>
+              <span className="vp-sep" />
+              <select
+                className="quality-select"
+                title="Stream quality (frame rate / resolution / bitrate) — applies live"
+                value={qualityKey}
+                onChange={(e) => onQualityChange && onQualityChange(e.target.value)}
+              >
+                {Object.entries(QUALITY_PRESETS).map(([key, preset]) => <option key={key} value={key}>{preset.label}</option>)}
+              </select>
+              <button
+                className={"ghost" + (control ? " control-on" : "")}
+                disabled={!live}
+                title={live ? "Send clicks and view keys into the real Figma window" : "Control needs the live WebRTC stream"}
+                onClick={() => setControl((value) => !value)}
+              >
+                {control ? "🎮 Control ON" : "Control"}
+              </button>
+              {control && live && (
+                <>
+                  <button className="ghost" title="Toggle Figma's UI (backslash / ₩)" onClick={() => sendKey("backslash")}>\ UI</button>
+                  <button className="ghost" title="Escape" onClick={() => sendKey("escape")}>Esc</button>
+                  <button className="ghost" title="Zoom to fit (Shift+1)" onClick={() => sendKey("one", ["shift"])}>⇧1</button>
+                  <button className="ghost" title="Zoom to 100% (Shift+0)" onClick={() => sendKey("zero", ["shift"])}>⇧0</button>
+                </>
+              )}
               {vpError && <code className="bad" title={vpError}>⚠ {vpError}</code>}
             </div>
             <div
-              className={"preview-stage" + (preview?.url ? " grab" : "")}
+              className={"preview-stage" + (preview?.url || live ? " grab" : "") + (control && live ? " control" : "")}
               ref={stageRef}
+              tabIndex={0}
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={endDrag}
               onPointerCancel={endDrag}
+              onContextMenu={onContextMenu}
+              onKeyDown={onKeyDown}
             >
-              {preview?.url
+              <video
+                ref={videoRef}
+                style={{ display: live ? "block" : "none" }}
+                autoPlay
+                muted
+                playsInline
+                draggable={false}
+              />
+              {!live && (preview?.url
                 ? <img src={preview.url} alt={`Live preview of ${project.name || "Figma project"}`} draggable={false} />
-                : <span className={preview?.error ? "bad" : "muted"}>{preview?.error || "Waiting for the Figma plugin…"}</span>}
+                : <span className={preview?.error ? "bad" : "muted"}>
+                    {preview?.error || (rtc && rtc.status === "connecting" ? "Negotiating the live stream…" : "Waiting for the Figma plugin…")}
+                  </span>)}
             </div>
-            {preview?.meta && (
+            {(preview?.meta || live) && (
               <div className="preview-meta">
-                {preview.meta.pageName || "Current page"} · {preview.meta.nodeName || "frame"} · {preview.meta.source || "preview"} · {preview.meta.width || "?"}×{preview.meta.height || "?"} · {Math.round((preview.meta.byteLength || 0) / 1024)} KB
+                {live
+                  ? `WebRTC · H.264 · ${(QUALITY_PRESETS[qualityKey] || QUALITY_PRESETS.balanced).label}`
+                  : `${preview.meta.pageName || "Current page"} · ${preview.meta.nodeName || "frame"} · ${preview.meta.source || "preview"} · ${preview.meta.width || "?"}×${preview.meta.height || "?"} · ${Math.round((preview.meta.byteLength || 0) / 1024)} KB`}
                 {viewport ? ` · viewport ${Math.round(viewport.center.x)}, ${Math.round(viewport.center.y)} @ ${Math.round(viewport.zoom * 100)}%` : ""}
+                {control && live ? " · control: click = real click, right-click, \\ / Esc / arrows" : ""}
               </div>
             )}
           </div>
@@ -2129,6 +2255,13 @@
         const [selectedProject, setSelectedProject] = useState(null);
         const [navProjectKey, setNavProjectKey] = useState(null); // Navigator tab's project
         const [preview, setPreview] = useState(null);
+        // WebRTC live stream state. Media goes browser <-> capture machine
+        // directly (STUN only); on any failure the console falls back to the
+        // relayed JPEG frames rather than trying a TURN hop.
+        const [rtc, setRtc] = useState({ status: "off", stream: null });
+        const [qualityKey, setQualityKey] = useState(loadQualityKey());
+        const qualityKeyRef = useRef(qualityKey);
+        const rtcRef = useRef(null); // { channel, pc, timer }
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
         const desiredPreviewChannelRef = useRef(null);
@@ -2136,6 +2269,49 @@
         pausedRef.current = paused;
 
         const getEvents = useCallback(() => bufRef.current, []);
+
+        // These touch only refs and setState (all stable), so the versions the
+        // mount-effect's socket handlers capture stay correct forever.
+        const wsSend = (payload) => {
+          const ws = monitorRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+        };
+        const stopRtc = (notifyRelay = true) => {
+          const current = rtcRef.current;
+          rtcRef.current = null;
+          if (current) {
+            clearTimeout(current.timer);
+            try { current.pc && current.pc.close(); } catch {}
+          }
+          if (notifyRelay) wsSend({ type: "webrtc_stop" });
+        };
+        const fallbackToJpeg = (channel) => {
+          stopRtc();
+          setRtc({ status: "fallback", stream: null });
+          wsSend({ type: "preview_subscribe", channel, mode: "app-window" });
+        };
+        const startRtc = (channel) => {
+          stopRtc();
+          setRtc({ status: "connecting", stream: null });
+          wsSend({ type: "webrtc_start", channel, quality: qualityOf(qualityKeyRef.current) });
+          rtcRef.current = {
+            channel,
+            pc: null,
+            // ICE that has not connected in 10s is not going to; JPEG instead.
+            timer: setTimeout(() => fallbackToJpeg(channel), 10000),
+          };
+        };
+        const changeQuality = (key) => {
+          setQualityKey(key);
+          qualityKeyRef.current = key;
+          saveQualityKey(key);
+          const current = rtcRef.current;
+          if (current) wsSend({ type: "preview_quality", channel: current.channel, quality: qualityOf(key) });
+        };
+        const sendPreviewInput = (input) => {
+          const channel = desiredPreviewChannelRef.current;
+          if (channel) wsSend({ type: "preview_input", channel, input });
+        };
 
         useEffect(() => {
           let ws, alive = true, retry;
@@ -2148,7 +2324,8 @@
               ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: "dashboard-monitor", protocolVersion: PROTOCOL_VERSION, deviceName: "Web console monitor", platform: navigator.platform || navigator.userAgent, capabilities: ["binaryFrames", "livePreview"] }));
               ws.send(JSON.stringify({ type: "monitor" }));
               if (desiredPreviewChannelRef.current) {
-                ws.send(JSON.stringify({ type: "preview_subscribe", channel: desiredPreviewChannelRef.current, mode: "app-window" }));
+                // The server-side peer died with the old socket; renegotiate.
+                startRtc(desiredPreviewChannelRef.current);
               }
             };
             ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 1500); };
@@ -2165,6 +2342,53 @@
                   previewPayload = decoded.payload;
                 }
               } catch { return; }
+              if (msg.type === "webrtc_offer") {
+                const current = rtcRef.current;
+                if (!current || current.channel !== msg.channel) return;
+                const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+                current.pc = pc;
+                pc.ontrack = (e) => {
+                  const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+                  setRtc((previous) => ({ ...previous, stream }));
+                };
+                pc.onicecandidate = (e) => {
+                  if (e.candidate) wsSend({ type: "webrtc_ice", candidate: e.candidate.toJSON() });
+                };
+                pc.oniceconnectionstatechange = () => {
+                  const state = pc.iceConnectionState;
+                  const live = rtcRef.current;
+                  if (!live || live.pc !== pc) return;
+                  if (state === "connected" || state === "completed") {
+                    clearTimeout(live.timer);
+                    setRtc((previous) => ({ ...previous, status: "live" }));
+                  } else if (state === "failed" || state === "disconnected") {
+                    fallbackToJpeg(live.channel);
+                  }
+                };
+                (async () => {
+                  try {
+                    await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    wsSend({ type: "webrtc_answer", sdp: answer.sdp });
+                  } catch (error) {
+                    fallbackToJpeg(msg.channel);
+                  }
+                })();
+                return;
+              }
+              if (msg.type === "webrtc_ice") {
+                const current = rtcRef.current;
+                if (current && current.pc) current.pc.addIceCandidate(msg.candidate).catch(() => {});
+                return;
+              }
+              if (msg.type === "webrtc_error") {
+                const current = rtcRef.current;
+                if (current && current.channel === msg.channel) fallbackToJpeg(msg.channel);
+                return;
+              }
+              if (msg.type === "webrtc_state") return; // relay-side ICE state, informational
+
               if (msg.kind === "preview_frame") {
                 const bytes = previewPayload || (msg.preview?.imageData
                   ? Uint8Array.from(atob(msg.preview.imageData), (c) => c.charCodeAt(0))
@@ -2228,14 +2452,19 @@
           : null;
         desiredPreviewChannelRef.current = desiredPreviewChannel;
         useEffect(() => {
-          const ws = monitorRef.current;
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "preview_subscribe", channel: desiredPreviewChannel, mode: "app-window" }));
-          }
+          // Drop the JPEG subscription and any old peer, then try WebRTC for
+          // the new channel; JPEG comes back only as the fallback.
+          wsSend({ type: "preview_subscribe", channel: null, mode: "app-window" });
           setPreview((previous) => {
             if (previous?.url) URL.revokeObjectURL(previous.url);
             return null;
           });
+          if (desiredPreviewChannel) {
+            startRtc(desiredPreviewChannel);
+          } else {
+            stopRtc();
+            setRtc({ status: "off", stream: null });
+          }
         }, [desiredPreviewChannel]);
 
         const clear = () => { bufRef.current = []; queueRef.current = []; setVersion((v) => v + 1); };
@@ -2292,7 +2521,7 @@
                     <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); }} onClearEmpty={clearEmpty} />
                   </div>
                   <div className="logwrap">
-                    <PreviewPanel project={selectedProject} preview={preview} onClose={() => setSelectedProject(null)} />
+                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} onClose={() => setSelectedProject(null)} />
                     <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
                   </div>
                 </>
@@ -2304,7 +2533,7 @@
                   </div>
                   <div className="nav-main">
                     {navProject
-                      ? <PreviewPanel project={navProject} preview={preview} />
+                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} />
                       : <div className="nav-placeholder">
                           No live plugin for this project — the preview mirrors the Figma app window.<br />
                           Open the file in Figma and run the Talk-to-Figma plugin; browsing the index still works.

@@ -36,6 +36,7 @@ import {
 } from "./shared/errors-store";
 
 import { PROTOCOL_VERSION } from "./shared/version";
+import { PreviewStreamManager } from "./webrtc/preview-stream";
 const BINARY_MAGIC = new Uint8Array([0x54, 0x54, 0x46, 0x42]); // "TTFB"
 
 function encodeBinaryFrame(envelope: any, payload: Uint8Array): Uint8Array {
@@ -148,6 +149,12 @@ const bulkJobs = new Map<string, any>();
 type PreviewMode = "app-window";
 interface PreviewSubscription { channel: string; mode: PreviewMode }
 const previewSubscriptions = new Map<ServerWebSocket<any>, PreviewSubscription>();
+// WebRTC path: per-channel window agent + per-viewer peer. The window match is
+// the document name the plugin announced — the same identity the JPEG capture
+// path uses.
+const previewStreams = new PreviewStreamManager(
+  (channel) => channelDocs.get(channel)?.documentName
+);
 let localPreviewTimer: ReturnType<typeof setInterval> | null = null;
 let localPreviewBusy = false;
 
@@ -1657,6 +1664,7 @@ const server = Bun.serve({
         projects: snapshotProjects(),
         requestsInFlight: requests.size,
         bulkJobs: [...bulkJobs.values()],
+        previewStreams: previewStreams.snapshot(),
       }, null, 2), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
@@ -1815,6 +1823,61 @@ const server = Bun.serve({
           }
           refreshLocalPreviewLoop();
           pushChannels();
+          return;
+        }
+
+        // --- WebRTC live preview signaling (console only) --------------------
+        // The console asks to stream a channel; the relay answers with an SDP
+        // offer and trickles ICE. Media then flows browser ⇄ this machine
+        // directly. No TURN fallback by design: when ICE fails the console
+        // drops back to the JPEG path above.
+        if (data.type === "webrtc_start") {
+          if (!meta?.isMonitor) return;
+          const channel = typeof data.channel === "string" ? data.channel : "";
+          if (!channel || !channels.has(channel)) {
+            ws.send(JSON.stringify({ type: "webrtc_error", message: `Unknown channel "${channel}"` }));
+            return;
+          }
+          previewStreams
+            .startViewer(ws, channel, data.quality, (message) => {
+              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ...message, channel }));
+            })
+            .catch((error) => {
+              const message = error instanceof Error ? error.message : String(error);
+              recordRelayError({ source: "relay", project: channelProjectInfo(channel).name, command: "webrtc_start", message });
+              if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "webrtc_error", channel, message }));
+            });
+          return;
+        }
+        if (data.type === "webrtc_answer") {
+          if (!meta?.isMonitor) return;
+          void previewStreams.handleAnswer(ws, String(data.sdp || ""));
+          return;
+        }
+        if (data.type === "webrtc_ice") {
+          if (!meta?.isMonitor) return;
+          void previewStreams.handleIce(ws, data.candidate);
+          return;
+        }
+        if (data.type === "webrtc_stop") {
+          if (!meta?.isMonitor) return;
+          previewStreams.stopViewer(ws);
+          return;
+        }
+        if (data.type === "preview_quality") {
+          if (!meta?.isMonitor) return;
+          if (typeof data.channel === "string") previewStreams.setQuality(data.channel, data.quality || {});
+          return;
+        }
+        // Click / allowlisted key into the streamed window. The agent enforces
+        // the key allowlist and the 0..1 coordinate bounds; this is a pipe.
+        if (data.type === "preview_input") {
+          if (!meta?.isMonitor) return;
+          const channel = typeof data.channel === "string" ? data.channel : "";
+          const ok = channel ? previewStreams.sendInput(channel, data.input || {}) : false;
+          if (!ok && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "webrtc_error", channel, message: "No active stream for this channel — start the live preview first" }));
+          }
           return;
         }
 
@@ -2197,6 +2260,7 @@ const server = Bun.serve({
 
       monitors.delete(ws);
       previewSubscriptions.delete(ws);
+      previewStreams.stopViewer(ws);
       refreshLocalPreviewLoop();
 
       for (const [id, request] of requests) {
