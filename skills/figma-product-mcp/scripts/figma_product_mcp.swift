@@ -278,6 +278,16 @@ func pointAndSize(_ element: AXUIElement) -> (CGPoint, CGSize)? {
     return (point, size)
 }
 
+func leftClick(_ element: AXUIElement) -> Bool {
+    guard let (point, size) = pointAndSize(element) else { return false }
+    let center = CGPoint(x: point.x + size.width / 2, y: point.y + size.height / 2)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: center, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: center, mouseButton: .left) else { return false }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    return true
+}
+
 func rightClick(_ element: AXUIElement) -> Bool {
     guard let (point, size) = pointAndSize(element) else { return false }
     let center = CGPoint(x: point.x + size.width / 2, y: point.y + size.height / 2)
@@ -289,8 +299,12 @@ func rightClick(_ element: AXUIElement) -> Bool {
 }
 
 func menuItem(_ appElement: AXUIElement, named title: String) -> AXUIElement? {
+    menuItem(appElement) { axText($0) == title }
+}
+
+func menuItem(_ appElement: AXUIElement, where matches: (AXUIElement) -> Bool) -> AXUIElement? {
     descendants(appElement, maxDepth: 16).first {
-        role($0) == (kAXMenuItemRole as String) && axText($0) == title
+        role($0) == (kAXMenuItemRole as String) && matches($0)
     }
 }
 
@@ -434,18 +448,43 @@ func dismissOpenMenus() {
     up.post(tap: .cghidEventTap)
 }
 
-// Raising a window is not the same as making it key, and Figma's menu bar
-// follows the KEY window. Set it explicitly, then wait for Figma to agree.
-func focusWindow(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement, timeout: TimeInterval) -> Bool {
+// Make a design window key. The success test is "Figma's menu bar now has a
+// Plugins menu", not "AXFocusedWindow points at the window": measured on
+// macmini-1, AXRaise plus setting AXMain/AXFocusedWindow makes AX report the
+// design window as focused while Figma keeps its file-browser (Recents) window
+// key and keeps publishing the browser menu bar (Apple/Figma/File/Edit/View/
+// Window/Help — no Plugins). Only Figma's own activation paths move it, so
+// escalate through them until the menu proves it worked.
+func pluginsMenuIsUp(_ appElement: AXUIElement) -> Bool {
+    menuBarItem(appElement, named: "Plugins") != nil
+}
+
+func focusWindow(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> Bool {
+    // 1. The cheap way: ask AX and the workspace.
     _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
     _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
     app.activate(options: [.activateAllWindows])
-    return waitUntil(timeout: min(timeout, 8)) {
-        guard let focused = axValue(appElement, kAXFocusedWindowAttribute as CFString),
-              CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
-        return CFHash(focused as! AXUIElement) == CFHash(window)
+    if waitUntil(timeout: 3, { pluginsMenuIsUp(appElement) }) { return true }
+
+    // 2. Figma's own Window menu: picking the document there is the activation
+    //    path Figma implements itself, so its menu bar follows.
+    if let windowMenu = menuBarItem(appElement, named: "Window"), press(windowMenu) {
+        if waitUntil(timeout: 2, { menuItem(appElement, where: { projectMatch($0, project: project) }) != nil }),
+           let entry = menuItem(appElement, where: { projectMatch($0, project: project) }), press(entry) {
+            if waitUntil(timeout: min(timeout, 6), { pluginsMenuIsUp(appElement) }) { return true }
+        } else {
+            dismissOpenMenus()
+        }
     }
+
+    // 3. Click the project's own tab inside that window — a real mouse event,
+    //    which Figma cannot ignore. Selecting a tab it already shows is a no-op
+    //    for the document.
+    if let (tabWindow, tab) = projectTab(appElement, project: project), CFHash(tabWindow) == CFHash(window), leftClick(tab) {
+        if waitUntil(timeout: min(timeout, 6), { pluginsMenuIsUp(appElement) }) { return true }
+    }
+    return false
 }
 
 func windowContains(_ window: AXUIElement, text: String) -> Bool {
@@ -485,16 +524,14 @@ func activatePlugin(
     relayReachable: Bool,
     timeout: TimeInterval
 ) -> ActivationOutcome {
-    guard focusWindow(app, appElement: appElement, window: window, timeout: timeout) else {
-        return .failed(step: "focus_window", detail: "The project window never became Figma's key window", menuBar: menuBarTitles(appElement))
-    }
-    // Figma drops the Plugins menu entirely when a file-browser (Recents)
-    // window is key, so say that out loud instead of "did not reach connected".
-    guard waitUntil(timeout: 5, { menuBarItem(appElement, named: "Plugins") != nil }) else {
+    // Figma publishes a different menu bar per key window and the file-browser
+    // one has no Plugins menu at all, so getting the design window key IS the
+    // precondition; focusWindow escalates until the Plugins menu proves it.
+    guard focusWindow(app, appElement: appElement, project: project, window: window, timeout: timeout) else {
         let titles = menuBarTitles(appElement)
         return .failed(
             step: "plugins_menu_missing",
-            detail: "Figma's menu bar has no Plugins menu (\(titles.joined(separator: ", "))) — a Figma file-browser window is key instead of this design window",
+            detail: "Could not make this design window key — Figma's menu bar still has no Plugins menu (\(titles.joined(separator: ", ")))",
             menuBar: titles
         )
     }
