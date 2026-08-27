@@ -22,6 +22,13 @@ struct ProjectResult: Codable {
     var status: String
     var detail: String
     var channel: String?
+    // Which step of the plugin handshake gave up. "did not reach connected
+    // state" alone is unactionable — the step name is what makes a failed run
+    // diagnosable without re-running it by hand.
+    var step: String?
+    // Protocol version the relay sees this window's plugin speaking. Differing
+    // from relayProtocolVersion means Figma is still running stale plugin code.
+    var pluginVersion: String?
 }
 
 struct Report: Codable {
@@ -29,6 +36,13 @@ struct Report: Codable {
     let dryRun: Bool
     let timestamp: String
     let results: [ProjectResult]
+    // Relay ground truth: which plugins are actually connected, and at what
+    // version. Absent when the relay could not be reached (then the launcher
+    // falls back to reading the plugin panel's banner text).
+    var relayReachable: Bool?
+    var relayProtocolVersion: String?
+    // Figma's menu bar titles at the moment a Plugins-menu lookup failed.
+    var menuBar: [String]?
 }
 
 enum LauncherError: Error, CustomStringConvertible {
@@ -51,7 +65,9 @@ struct Options {
     var openOnly = false
     var promptAccessibility = false
     var allProjects = false
+    var forceReconnect = false
     var timeout: TimeInterval = 25
+    var relayURL = ProcessInfo.processInfo.environment["TALK_TO_FIGMA_RELAY_URL"] ?? "http://127.0.0.1:3055"
     var selectedIDs = Set<String>()
 }
 
@@ -72,12 +88,30 @@ func parseOptions() throws -> Options {
                 throw LauncherError.usage("--timeout requires a positive number")
             }
             options.timeout = value
+        case "--relay-url":
+            guard !args.isEmpty else { throw LauncherError.usage("--relay-url requires a URL") }
+            options.relayURL = args.removeFirst()
         case "--dry-run": options.dryRun = true
         case "--open-only": options.openOnly = true
         case "--all": options.allProjects = true
+        case "--force-reconnect": options.forceReconnect = true
         case "--prompt-accessibility": options.promptAccessibility = true
         case "--help", "-h":
-            print("Usage: run.sh [--dry-run] [--open-only] [--all | --project ID] [--timeout SECONDS] [--prompt-accessibility]")
+            print("""
+            Usage: run.sh [--dry-run] [--open-only] [--all | --project ID]
+                          [--force-reconnect] [--timeout SECONDS] [--relay-url URL]
+                          [--prompt-accessibility]
+
+            --force-reconnect  Re-run the plugin even in windows that are already
+                               connected. Needed after a plugin code deploy: Figma
+                               only re-reads code.js when the plugin is run again.
+                               (A plugin whose version differs from the relay's is
+                               re-run anyway, without this flag.)
+
+            Exit codes: 0 all target projects connected · 1 one or more projects
+            failed (see each result's status/step) · 2 usage/config/accessibility
+            problem · 70 unexpected error.
+            """)
             exit(0)
         default: throw LauncherError.usage("Unknown argument: \(arg)")
         }
@@ -285,6 +319,135 @@ func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredP
     }
 }
 
+// ---------------------------------------------------------------------------
+// Relay ground truth.
+//
+// The plugin panel's "Connected to server in channel" banner is a label, not a
+// fact: it survives a relay restart that already dropped the socket, it says
+// nothing about WHICH code.js Figma loaded, and since the compact plugin UI it
+// may not even live inside the project window's accessibility tree. The relay
+// knows all three, so ask it: GET /channels lists every live plugin with the
+// document it announced and the protocol version it speaks.
+// ---------------------------------------------------------------------------
+struct RelayConnection {
+    let channel: String
+    let pluginVersion: String?
+}
+
+struct RelaySnapshot {
+    let protocolVersion: String?
+    let connectionsByDocument: [String: [RelayConnection]]
+}
+
+func fetchRelaySnapshot(baseURL: String, timeout: TimeInterval = 3) -> RelaySnapshot? {
+    guard let url = URL(string: baseURL.hasSuffix("/") ? baseURL + "channels" : baseURL + "/channels") else { return nil }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = timeout
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    guard semaphore.wait(timeout: .now() + timeout + 1) == .success,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+
+    var byDocument: [String: [RelayConnection]] = [:]
+    for project in root["projects"] as? [[String: Any]] ?? [] {
+        guard let name = project["name"] as? String else { continue }
+        var live: [RelayConnection] = []
+        for connection in project["connections"] as? [[String: Any]] ?? [] {
+            let channel = connection["channel"] as? String ?? ""
+            for client in connection["clients"] as? [[String: Any]] ?? [] {
+                guard (client["role"] as? String) == "figma" else { continue }
+                live.append(RelayConnection(channel: channel, pluginVersion: client["protocolVersion"] as? String))
+            }
+        }
+        if !live.isEmpty { byDocument[name] = live }
+    }
+    return RelaySnapshot(protocolVersion: root["protocolVersion"] as? String, connectionsByDocument: byDocument)
+}
+
+// The plugin announces the Figma document name, which is the config's
+// displayTitle (emoji included). Exact match first so near-identical titles
+// (CO_Product / C_Product) cannot swap places.
+func relayConnection(_ snapshot: RelaySnapshot, for project: Project) -> RelayConnection? {
+    if let exact = snapshot.connectionsByDocument[project.displayTitle] { return exact.first }
+    for (name, connections) in snapshot.connectionsByDocument
+    where name == project.title || name.localizedCaseInsensitiveContains(project.title) {
+        return connections.first
+    }
+    return nil
+}
+
+enum PluginState {
+    case missing
+    case stale(String?)              // connected, but running other code than the relay
+    case current(String?, String?)   // version, channel
+}
+
+func pluginState(_ snapshot: RelaySnapshot?, project: Project, window: AXUIElement?) -> PluginState {
+    guard let snapshot else {
+        // No relay: the banner text is all we have. It cannot distinguish a
+        // stale plugin from a current one, so never report "stale" from here.
+        guard let window, windowContains(window, text: "Connected to server in channel") else { return .missing }
+        return .current(nil, nil)
+    }
+    guard let connection = relayConnection(snapshot, for: project) else { return .missing }
+    guard let expected = snapshot.protocolVersion, connection.pluginVersion != expected else {
+        return .current(connection.pluginVersion, connection.channel)
+    }
+    return .stale(connection.pluginVersion)
+}
+
+// ---------------------------------------------------------------------------
+// Menu bar access.
+//
+// The menu bar hangs off the application element's AXMenuBar attribute, not its
+// children, and Figma rewrites it per key window: with a file-browser (Recents)
+// window key the bar is Figma/File/Edit/View/Window/Help — no Plugins menu at
+// all. Reading AXMenuBar directly is both correct and cheap; the old walk
+// searched every open document window to depth 8 to find the same item.
+// ---------------------------------------------------------------------------
+func menuBar(_ appElement: AXUIElement) -> AXUIElement? {
+    guard let value = axValue(appElement, kAXMenuBarAttribute as CFString), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return (value as! AXUIElement)
+}
+
+func menuBarTitles(_ appElement: AXUIElement) -> [String] {
+    guard let bar = menuBar(appElement) else { return [] }
+    return axChildren(bar).map(axText).filter { !$0.isEmpty }
+}
+
+func menuBarItem(_ appElement: AXUIElement, named title: String) -> AXUIElement? {
+    guard let bar = menuBar(appElement) else { return nil }
+    return axChildren(bar).first { axText($0) == title }
+}
+
+// A menu left open by a failed step swallows every later click, so each failure
+// path closes it before returning.
+func dismissOpenMenus() {
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: false) else { return }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+}
+
+// Raising a window is not the same as making it key, and Figma's menu bar
+// follows the KEY window. Set it explicitly, then wait for Figma to agree.
+func focusWindow(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement, timeout: TimeInterval) -> Bool {
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+    app.activate(options: [.activateAllWindows])
+    return waitUntil(timeout: min(timeout, 8)) {
+        guard let focused = axValue(appElement, kAXFocusedWindowAttribute as CFString),
+              CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+        return CFHash(focused as! AXUIElement) == CFHash(window)
+    }
+}
+
 func windowContains(_ window: AXUIElement, text: String) -> Bool {
     descendants(window).contains { axText($0).localizedCaseInsensitiveContains(text) }
 }
@@ -302,37 +465,132 @@ func channel(in window: AXUIElement) -> String? {
     return nil
 }
 
-func activatePlugin(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement, pluginTitle: String, timeout: TimeInterval) -> Bool {
-    // "Disconnect" is hidden in the collapsed (compact) plugin UI since 2.5.4 — the
-    // connected banner alone is sufficient and only appears when actually connected.
-    if windowContains(window, text: "Connected to server in channel") { return true }
-    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-    app.activate(options: [.activateAllWindows])
-    RunLoop.current.run(until: Date().addingTimeInterval(0.35))
-    guard let plugins = descendants(appElement, maxDepth: 8).first(where: {
-        role($0) == (kAXMenuBarItemRole as String) && axText($0) == "Plugins"
-    }), press(plugins) else { return false }
-    guard waitUntil(timeout: 3, { menuItem(appElement, named: pluginTitle) != nil }),
-          let plugin = menuItem(appElement, named: pluginTitle), press(plugin) else { return false }
-    return waitUntil(timeout: timeout) {
-        windowContains(window, text: "Connected to server in channel")
-    }
+enum ActivationOutcome {
+    case connected(version: String?, channel: String?)
+    case failed(step: String, detail: String, menuBar: [String]?)
 }
+
+// Run `Plugins > Development > <plugin>` in this window and wait for the RELAY
+// to report the window's plugin connected at the relay's own protocol version.
+// Waiting on the relay rather than on the panel's banner text is what makes a
+// plugin-code deploy verifiable: re-running stale code would still print the
+// banner, but it would keep reporting the old version.
+func activatePlugin(
+    _ app: NSRunningApplication,
+    appElement: AXUIElement,
+    window: AXUIElement,
+    project: Project,
+    pluginTitle: String,
+    relayURL: String,
+    relayReachable: Bool,
+    timeout: TimeInterval
+) -> ActivationOutcome {
+    guard focusWindow(app, appElement: appElement, window: window, timeout: timeout) else {
+        return .failed(step: "focus_window", detail: "The project window never became Figma's key window", menuBar: menuBarTitles(appElement))
+    }
+    // Figma drops the Plugins menu entirely when a file-browser (Recents)
+    // window is key, so say that out loud instead of "did not reach connected".
+    guard waitUntil(timeout: 5, { menuBarItem(appElement, named: "Plugins") != nil }) else {
+        let titles = menuBarTitles(appElement)
+        return .failed(
+            step: "plugins_menu_missing",
+            detail: "Figma's menu bar has no Plugins menu (\(titles.joined(separator: ", "))) — a Figma file-browser window is key instead of this design window",
+            menuBar: titles
+        )
+    }
+    guard let plugins = menuBarItem(appElement, named: "Plugins"), press(plugins) else {
+        return .failed(step: "plugins_menu_press", detail: "Could not open Figma's Plugins menu", menuBar: menuBarTitles(appElement))
+    }
+    guard waitUntil(timeout: 3, { menuItem(appElement, named: pluginTitle) != nil }),
+          let plugin = menuItem(appElement, named: pluginTitle) else {
+        dismissOpenMenus()
+        return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window", menuBar: nil)
+    }
+    guard press(plugin) else {
+        dismissOpenMenus()
+        return .failed(step: "plugin_menu_item_press", detail: "Could not run \(pluginTitle)", menuBar: nil)
+    }
+    guard relayReachable else {
+        // No relay to ask — fall back to the banner, which at least proves the
+        // plugin started, and let the report say the version is unverified.
+        if waitUntil(timeout: timeout, { windowContains(window, text: "Connected to server in channel") }) {
+            return .connected(version: nil, channel: channel(in: window))
+        }
+        return .failed(step: "connect_timeout", detail: "Plugin ran but the panel never showed a connected banner", menuBar: nil)
+    }
+    var lastSeen: String?
+    let settled = waitUntil(timeout: timeout, interval: 0.5) {
+        guard let snapshot = fetchRelaySnapshot(baseURL: relayURL) else { return false }
+        if case .current = pluginState(snapshot, project: project, window: window) { return true }
+        if case .stale(let version) = pluginState(snapshot, project: project, window: window) { lastSeen = version }
+        return false
+    }
+    guard settled, let snapshot = fetchRelaySnapshot(baseURL: relayURL),
+          case .current(let version, let channelName) = pluginState(snapshot, project: project, window: window) else {
+        let expected = fetchRelaySnapshot(baseURL: relayURL)?.protocolVersion ?? "?"
+        return .failed(
+            step: "connect_timeout",
+            detail: lastSeen == nil
+                ? "Plugin ran but the relay never saw \(project.displayTitle) connect"
+                : "Plugin reconnected still speaking v\(lastSeen!) (relay v\(expected)) — Figma reloaded the old code.js",
+            menuBar: nil
+        )
+    }
+    return .connected(version: version, channel: channelName)
+}
+
+// stdout for the caller, stderr so a nonzero exit still carries the reason
+// (job runners keep the error text but often replace a failed step's output),
+// and a file so a follow-up session can read what happened without re-running.
+let reportPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".talk-to-figma")
+    .appendingPathComponent("launcher-report.json")
 
 func emitReport(_ report: Report) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    if let data = try? encoder.encode(report), let text = String(data: data, encoding: .utf8) { print(text) }
+    guard let data = try? encoder.encode(report), let text = String(data: data, encoding: .utf8) else { return }
+    print(text)
+    if !report.ok {
+        FileHandle.standardError.write(Data(text.utf8))
+    }
+    try? FileManager.default.createDirectory(at: reportPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: reportPath)
 }
 
 do {
     let options = try parseOptions()
     let config = try loadConfig(path: options.configPath, selectedIDs: options.selectedIDs, allProjects: options.allProjects)
     var results = config.projects.map {
-        ProjectResult(id: $0.id, title: $0.title, url: $0.url, status: options.dryRun ? "configured" : "pending", detail: "", channel: nil)
+        ProjectResult(
+            id: $0.id, title: $0.title, url: $0.url,
+            status: options.dryRun ? "configured" : "pending", detail: "",
+            channel: nil, step: nil, pluginVersion: nil
+        )
     }
     if options.dryRun {
-        emitReport(Report(ok: true, dryRun: true, timestamp: ISO8601DateFormatter().string(from: Date()), results: results))
+        // A dry run is also the status report: no UI is touched, but the relay
+        // is asked what is connected and whether it is running current code.
+        let probe = fetchRelaySnapshot(baseURL: options.relayURL)
+        for (index, project) in config.projects.enumerated() {
+            switch pluginState(probe, project: project, window: nil) {
+            case .missing:
+                results[index].detail = probe == nil ? "relay unreachable — connection state unknown" : "no live plugin"
+            case .stale(let version):
+                results[index].detail = "stale plugin (v\(version ?? "?") vs relay v\(probe?.protocolVersion ?? "?")) — needs a re-run"
+                results[index].pluginVersion = version
+            case .current(let version, let channelName):
+                results[index].detail = "connected"
+                results[index].pluginVersion = version
+                results[index].channel = channelName
+            }
+        }
+        emitReport(Report(
+            ok: true, dryRun: true,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results,
+            relayReachable: probe != nil, relayProtocolVersion: probe?.protocolVersion, menuBar: nil
+        ))
         exit(0)
     }
 
@@ -361,6 +619,8 @@ do {
             results[index].detail = "Could not move the design tab to a distinct window"
         }
     }
+    var snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+    var menuBarSeen: [String]?
     if !options.openOnly {
         for (index, project) in config.projects.enumerated() where results[index].status == "separated" {
             guard let window = projectWindow(root, project: project) else {
@@ -368,22 +628,65 @@ do {
                 results[index].detail = "Project window disappeared before plugin launch"
                 continue
             }
-            if activatePlugin(app, appElement: root, window: window, pluginTitle: config.pluginMenuTitle, timeout: options.timeout) {
+            // Already connected AND running the relay's own version: leave it
+            // alone (re-running would drop a healthy channel). A stale plugin is
+            // re-run without asking — that is the whole point of a deploy.
+            if case .current(let version, let channelName) = pluginState(snapshot, project: project, window: window), !options.forceReconnect {
                 results[index].status = "connected"
                 results[index].detail = "Talk To Figma MCP is connected"
-                results[index].channel = channel(in: window)
-            } else {
-                results[index].status = "plugin_failed"
-                results[index].detail = "Cursor MCP Plugin did not reach connected state"
+                results[index].pluginVersion = version
+                results[index].channel = channelName ?? channel(in: window)
+                continue
             }
+            let outcome = activatePlugin(
+                app,
+                appElement: root,
+                window: window,
+                project: project,
+                pluginTitle: config.pluginMenuTitle,
+                relayURL: options.relayURL,
+                relayReachable: snapshot != nil,
+                timeout: options.timeout
+            )
+            switch outcome {
+            case .connected(let version, let channelName):
+                results[index].status = "connected"
+                results[index].detail = "Talk To Figma MCP is connected"
+                results[index].pluginVersion = version
+                results[index].channel = channelName ?? channel(in: window)
+            case .failed(let step, let detail, let menuBar):
+                results[index].status = "plugin_failed"
+                results[index].detail = detail
+                results[index].step = step
+                if let menuBar, menuBarSeen == nil { menuBarSeen = menuBar }
+            }
+            // Channels change on every plugin re-run, so re-read ground truth.
+            snapshot = fetchRelaySnapshot(baseURL: options.relayURL) ?? snapshot
         }
     }
     let expected = options.openOnly ? "opened" : "connected"
     let ok = results.allSatisfy { $0.status == expected }
-    emitReport(Report(ok: ok, dryRun: false, timestamp: ISO8601DateFormatter().string(from: Date()), results: results))
+    emitReport(Report(
+        ok: ok,
+        dryRun: false,
+        timestamp: ISO8601DateFormatter().string(from: Date()),
+        results: results,
+        relayReachable: snapshot != nil,
+        relayProtocolVersion: snapshot?.protocolVersion,
+        menuBar: menuBarSeen
+    ))
     exit(ok ? 0 : 1)
 } catch {
-    let result = ProjectResult(id: "launcher", title: "launcher", url: "", status: "launcher_failed", detail: String(describing: error), channel: nil)
-    emitReport(Report(ok: false, dryRun: false, timestamp: ISO8601DateFormatter().string(from: Date()), results: [result]))
+    let result = ProjectResult(
+        id: "launcher", title: "launcher", url: "",
+        status: "launcher_failed", detail: String(describing: error),
+        channel: nil, step: nil, pluginVersion: nil
+    )
+    emitReport(Report(
+        ok: false, dryRun: false,
+        timestamp: ISO8601DateFormatter().string(from: Date()),
+        results: [result],
+        relayReachable: nil, relayProtocolVersion: nil, menuBar: nil
+    ))
     exit(error is LauncherError ? 2 : 70)
 }
