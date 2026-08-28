@@ -93,8 +93,22 @@ func normalized(_ value: String) -> String {
 
 // Figma windows only, ordered front to back, so a title match cannot pick a
 // menu, tooltip or shadow layer.
+//
+// Enumerate ALL windows, not just the current Space's: on the fleet the Figma
+// windows routinely live on another Space or behind a hidden app, the plugin
+// sockets stay connected, and .optionOnScreenOnly then reports "no Figma
+// window" for a document that is very much open (measured). The capture
+// filter is desktop-independent, so an off-Space window streams fine — the
+// lookup was the only thing refusing to see it. On-screen windows still win
+// ties: they come first in the list.
 func figmaWindows() -> [TargetWindow] {
-    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let onScreen = figmaWindows(options: [.optionOnScreenOnly, .excludeDesktopElements])
+    let all = figmaWindows(options: [.optionAll, .excludeDesktopElements])
+    var seen = Set(onScreen.map(\.id))
+    return onScreen + all.filter { seen.insert($0.id).inserted }
+}
+
+private func figmaWindows(options: CGWindowListOption) -> [TargetWindow] {
     guard let rows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
     return rows.compactMap { row in
         guard (row[kCGWindowOwnerName as String] as? String) == "Figma",
@@ -102,6 +116,8 @@ func figmaWindows() -> [TargetWindow] {
               let number = (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
               let boundsDict = row[kCGWindowBounds as String] as? [String: Any],
               let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else { return nil }
+        // Zero-sized rows are window-server bookkeeping, not documents.
+        guard bounds.width > 100, bounds.height > 100 else { return nil }
         return TargetWindow(id: number, title: row[kCGWindowName as String] as? String ?? "", bounds: bounds)
     }
 }
