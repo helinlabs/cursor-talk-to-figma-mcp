@@ -234,7 +234,9 @@ final class InputSession {
     private var restoreWorkItem: DispatchWorkItem?
     private let idleRestore: TimeInterval = 0.8
 
-    // Returns the Figma app once it is ready to accept synthetic events.
+    // Returns the Figma app once it is ready to accept synthetic events, or
+    // nil when it could not be brought frontmost — in which case posting
+    // would be silently ignored, so the caller must report failure instead.
     func begin() -> NSRunningApplication? {
         guard let app = figmaApp() else { return nil }
         lock.lock()
@@ -249,6 +251,16 @@ final class InputSession {
             app.activate(options: [])
             // Figma needs a beat to take key status before it will route events.
             for _ in 0..<25 where !app.isActive { usleep(20_000) }
+            if !app.isActive {
+                // From a launchd background context NSRunningApplication.activate
+                // is simply ignored (no foreground rights), which is exactly the
+                // relay's situation on the fleet — measured: ok:true posts with
+                // zero effect. The Accessibility route works from anywhere.
+                let appElement = AXUIElementCreateApplication(app.processIdentifier)
+                AXUIElementSetAttributeValue(appElement, "AXFrontmost" as CFString, kCFBooleanTrue)
+                for _ in 0..<25 where !app.isActive { usleep(20_000) }
+            }
+            guard app.isActive else { return nil }
         }
         return app
     }
@@ -296,7 +308,8 @@ func postClick(in window: TargetWindow, normX: Double, normY: Double, clickCount
     // Normalized coordinates keep the console honest: it never has to know the
     // capture scale, and a point outside the window cannot even be expressed.
     guard normX >= 0, normX <= 1, normY >= 0, normY <= 1 else { return false }
-    guard let live = findWindow(match: nil, windowId: window.id), let app = inputSession.begin() else { return false }
+    guard let live = findWindow(match: nil, windowId: window.id) else { return false }
+    guard let app = inputSession.begin() else { return false }   // could not bring Figma frontmost
     defer { inputSession.end() }
     raiseWindow(app, live)
     let point = CGPoint(x: live.bounds.origin.x + live.bounds.width * normX,
@@ -853,7 +866,7 @@ func handle(_ line: String) async {
             }
             let ok = postKey(in: window, key: key, modifiers: object["modifiers"] as? [String] ?? [])
             emitEvent(["event": "key", "ok": ok, "key": key,
-                       "reason": ok ? "" : "허용 목록에 없는 키이거나 창을 찾지 못했습니다"])
+                       "reason": ok ? "" : "Figma를 전면으로 가져오지 못했거나(백그라운드 컨텍스트) 창을 찾지 못했습니다"])
         case "keyframe":
             streamer.requestKeyframe()
         case "ping":
