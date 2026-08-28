@@ -263,10 +263,24 @@ func projectMatch(_ element: AXUIElement, project: Project) -> Bool {
         || (!projectKey(project).isEmpty && text.contains(projectKey(project)))
 }
 
+// A window that merely MENTIONS the file is not a window showing it.
+//
+// Figma's file-browser ("Recents") window lists every recently viewed file as a
+// card, so matching any descendant's text let one impersonate all seven
+// projects. openProject then reported a file it had never opened as already
+// open, and the run failed downstream as separation_failed — "Could not move
+// the design tab to a distinct window" for a file that was not open at all,
+// which reads as a tab problem and sent repair at the wrong thing entirely.
+//
+// A window actually showing the file proves it one of two ways: its title is
+// the file (Figma titles a window after its ACTIVE tab), or it carries the
+// file's TAB, which is how a file open in the background is still found. A
+// Recents window has neither — its tabs are Home, Recently viewed, Shared
+// files and Shared folders, and the file names are only card labels.
 func projectWindow(_ appElement: AXUIElement, project: Project) -> AXUIElement? {
     windows(appElement).first { window in
         projectMatch(window, project: project)
-            || descendants(window).contains { projectMatch($0, project: project) }
+            || descendants(window).contains { isTab($0) && projectMatch($0, project: project) }
     }
 }
 
