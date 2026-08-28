@@ -12,3 +12,25 @@ Use this only after `scripts/run.sh` exits nonzero.
 8. Do not close, reload, or reconnect design windows already reported as connected. Retry each failed file once, then stop and report the exact failed file and observed state.
 
 If macOS reports that Accessibility access is missing (launcher exit code `2`), do not attempt UI clicks. Ask the user to enable Accessibility access for the invoking terminal or agent, then rerun the deterministic launcher.
+
+## After the repair: fix the launcher, not just the symptom (2026-08-28)
+
+A fallback run means the deterministic launcher failed at something Computer Use
+could do — that gap is a launcher defect until proven otherwise. Once repair is
+done (or confirmed unnecessary):
+
+1. Diagnose WHY the primary failed: pair the launcher's JSON report (`status`,
+   `detail`, per-entry `step`) with what you actually had to do in the UI.
+2. If the cause is fixable in `scripts/figma_product_mcp.swift` /
+   `scripts/projects.json` / `run.sh` (wrong menu path, changed window title,
+   missing wait, stale selector, config drift), implement the fix in this
+   repo's checkout, then **open a PR** — branch + push + PR, never a direct
+   push to main. Include the failing report snippet and the repro in the PR
+   body. `swiftc -parse` the swift file and `run.sh --dry-run` before pushing.
+3. If the cause is environmental (login expired, permission revoked, display
+   asleep), do NOT patch the launcher for it — report it as an operational
+   finding instead. Only mechanize what is deterministic.
+4. One PR per fallback run at most; if a previous fallback PR for the same
+   cause is already open, comment on it instead of opening another.
+5. Whether or not you opened a PR, end your report with: primary failure cause,
+   repair performed, and improvement action taken (PR link or "none — environmental").
