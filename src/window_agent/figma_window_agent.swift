@@ -606,8 +606,6 @@ func handle(_ line: String) async {
     }
 }
 
-let semaphore = DispatchSemaphore(value: 0)
-
 Task.detached {
     emitEvent(["event": "ready", "pid": ProcessInfo.processInfo.processIdentifier])
     // Report the TCC verdicts up front so a stalled stream is diagnosable from
@@ -622,7 +620,12 @@ Task.detached {
         await handle(line)
     }
     await streamer.stop()
-    semaphore.signal()
+    exit(0)
 }
 
-semaphore.wait()
+// The main thread must stay parked in dispatch, NOT in a semaphore: on the
+// fleet, SCShareableContent's verdicts arrive as main-queue callbacks, and
+// with the main thread blocked in semaphore.wait() they can never run — the
+// lookup then hangs forever with the Screen Recording grant in place.
+// dispatchMain() parks the thread while still draining the main queue.
+dispatchMain()
