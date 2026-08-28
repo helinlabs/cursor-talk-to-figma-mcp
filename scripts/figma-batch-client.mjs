@@ -13,7 +13,21 @@
 // `--fresh` 를 주면 기존 결과를 무시하고 처음부터 돌린다.
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+
+// 릴레이는 hello(protocolVersion) 없는 클라이언트를 protocol_mismatch 로 끊는다 (2.x).
+// 버전은 공유 소스에서 읽어 하드코딩 드리프트를 막는다 — figma-test-client 와 같은 방식.
+const versionSrc = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "..", "src", "shared", "version.ts"),
+  "utf8",
+);
+const PROTOCOL_VERSION = /PROTOCOL_VERSION\s*=\s*"([^"]+)"/.exec(versionSrc)?.[1];
+if (!PROTOCOL_VERSION) {
+  console.error("cannot read PROTOCOL_VERSION from src/shared/version.ts");
+  process.exit(2);
+}
 
 const argv = process.argv.slice(2);
 const fresh = argv.includes("--fresh");
@@ -80,15 +94,31 @@ function finish(code) {
 }
 
 ws.on("open", () => {
-  const id = rid();
-  ws.send(JSON.stringify({ id, type: "join", channel, message: { id, command: "join", params: { channel } } }));
+  // hello 를 먼저 — 릴레이가 hello_ack 를 준 뒤에야 join 이 유효하다.
+  ws.send(JSON.stringify({ type: "hello", role: "controller", requesterId: `batch-${rid()}`, protocolVersion: PROTOCOL_VERSION }));
 });
 
 ws.on("message", (raw) => {
   let data;
   try { data = JSON.parse(raw.toString()); } catch { return; }
 
-  if (!joined && data.type === "system") { joined = true; return send(); }
+  if (data.type === "system" && data.event === "hello_ack") {
+    const id = rid();
+    ws.send(JSON.stringify({ id, type: "join", channel, message: { id, command: "join", params: { channel } } }));
+    return;
+  }
+  if (data.type === "system" && data.event === "protocol_mismatch") {
+    console.error("PROTOCOL MISMATCH:", data.message);
+    process.exit(1);
+  }
+
+  // 채널 합류 확인은 message 가 result 를 든 OBJECT 인 system 프레임이다. 릴레이는
+  // hello_ack 앞에 평문 인사도 보내는데, 그걸 합류로 오인하면 join 전에 명령을 쏴
+  // 릴레이가 버리고 조용히 TIMEOUT 난다.
+  if (!joined && data.type === "system" && data.message && typeof data.message === "object" && "result" in data.message) {
+    joined = true;
+    return send();
+  }
   if (data.type === "progress_update") return arm(); // 살아 있다 — 타이머만 연장
 
   const msg = data.message;
