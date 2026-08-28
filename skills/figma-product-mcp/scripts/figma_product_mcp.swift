@@ -620,7 +620,14 @@ func activatePlugin(
     guard let plugins = menuBarItem(appElement, named: "Plugins"), press(plugins) else {
         return .failed(step: "plugins_menu_press", detail: "Could not open Figma's Plugins menu", menuBar: menuBarTitles(appElement))
     }
-    guard waitUntil(timeout: 3, { menuItem(appElement, named: pluginTitle) != nil }),
+    // A file the launcher just opened has not finished registering its
+    // development plugins yet, and 3s was not enough for one: `--project
+    // f-product` failed with this step, yet a dump showed the item present and
+    // an immediate retry against the now-warm document connected. Nothing on
+    // the healthy path waits longer — the item is already there — so this only
+    // stops a cold open from being called a missing plugin.
+    let menuItemWait = max(3, min(timeout, 12))
+    guard waitUntil(timeout: menuItemWait, { menuItem(appElement, named: pluginTitle) != nil }),
           let plugin = menuItem(appElement, named: pluginTitle) else {
         dismissOpenMenus()
         return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window", menuBar: nil)
