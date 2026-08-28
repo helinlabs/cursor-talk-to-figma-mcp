@@ -1195,6 +1195,7 @@
                     ? `${preview.meta.pageName || "Current page"} · ${preview.meta.nodeName || "frame"} · ${preview.meta.source || "preview"} · ${preview.meta.width || "?"}×${preview.meta.height || "?"} · ${Math.round((preview.meta.byteLength || 0) / 1024)} KB`
                     : ""}
                 {!live && rtc && rtc.reason ? ` · ${rtc.reason}` : ""}
+                {!live && statsOn ? " · Stats는 WebRTC 스트림에서만 표시됩니다" : ""}
                 {inputNotice ? <span className="bad">{` · ⚠ ${inputNotice}`}</span> : null}
                 {control && agentTcc && agentTcc.accessibility === false ? <span className="bad">{" · ⚠ 손쉬운 사용 권한 없음 — 입력 불가"}</span> : null}
                 {live && statsOn && hud ? [
