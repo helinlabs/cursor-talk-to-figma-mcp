@@ -820,10 +820,31 @@ do {
                 results[index].pluginVersion = version
                 results[index].channel = channelName ?? channel(in: window)
             case .failed(let step, let detail, let menuBar):
-                results[index].status = "plugin_failed"
-                results[index].detail = detail
-                results[index].step = step
-                if let menuBar, menuBarSeen == nil { menuBarSeen = menuBar }
+                // A re-run that did not land is only a failure if it leaves the
+                // project without usable code. Ask the relay again: `.current`
+                // means this window is connected at the relay's OWN protocol
+                // version, which is the exact definition of "not stale" — the
+                // connection already in hand is the one a successful re-run
+                // would have produced, so keep it. A `.stale` or missing plugin
+                // still fails, which is what makes a deploy verifiable.
+                //
+                // Without this, `--all --force-reconnect` reports a healthy
+                // device as broken: on 2026-08-28 it hit
+                // plugin_menu_item_missing in 5 of 7 windows that were
+                // connected at v2.6.0 before, during, and after the run, and
+                // exited 1 with nothing actually wrong.
+                let afterFailure = fetchRelaySnapshot(baseURL: options.relayURL) ?? snapshot
+                if case .current(let version, let channelName) = pluginState(afterFailure, project: project, window: window) {
+                    results[index].status = "connected"
+                    results[index].detail = "Kept the existing connection — the re-run did not land (\(step)), but the plugin is already current"
+                    results[index].pluginVersion = version
+                    results[index].channel = channelName ?? channel(in: window)
+                } else {
+                    results[index].status = "plugin_failed"
+                    results[index].detail = detail
+                    results[index].step = step
+                    if let menuBar, menuBarSeen == nil { menuBarSeen = menuBar }
+                }
             }
             // Channels change on every plugin re-run, so re-read ground truth.
             snapshot = fetchRelaySnapshot(baseURL: options.relayURL) ?? snapshot
