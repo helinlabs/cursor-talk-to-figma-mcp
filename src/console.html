@@ -926,7 +926,7 @@
         return { viewport, error, nudge, jump };
       }
 
-      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange, previewMode, onModeChange, getPc, onRtcStall }) {
+      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange, previewMode, onModeChange, getPc, onRtcStall, inputNotice, agentTcc }) {
         const { viewport, error: vpError, nudge, jump } = useViewportControl(project ? project.projectKey : null);
         const stageRef = useRef(null);
         const videoRef = useRef(null);
@@ -1138,7 +1138,10 @@
               <button
                 className={"ghost" + (control ? " control-on" : "")}
                 disabled={!live}
-                title={live ? "Send clicks and view keys into the real Figma window" : "Control needs the live WebRTC stream"}
+                title={!live ? "Control needs the live WebRTC stream"
+                  : agentTcc && agentTcc.accessibility === false
+                    ? "⚠ 캡처 머신에 손쉬운 사용(Accessibility) 권한이 없어 입력이 전달되지 않습니다 — 시스템 설정에서 릴레이 런타임을 허용하세요"
+                    : "Send clicks and view keys into the real Figma window"}
                 onClick={() => setControl((value) => !value)}
               >
                 {control ? "🎮 Control ON" : "Control"}
@@ -1192,6 +1195,8 @@
                     ? `${preview.meta.pageName || "Current page"} · ${preview.meta.nodeName || "frame"} · ${preview.meta.source || "preview"} · ${preview.meta.width || "?"}×${preview.meta.height || "?"} · ${Math.round((preview.meta.byteLength || 0) / 1024)} KB`
                     : ""}
                 {!live && rtc && rtc.reason ? ` · ${rtc.reason}` : ""}
+                {inputNotice ? <span className="bad">{` · ⚠ ${inputNotice}`}</span> : null}
+                {control && agentTcc && agentTcc.accessibility === false ? <span className="bad">{" · ⚠ 손쉬운 사용 권한 없음 — 입력 불가"}</span> : null}
                 {live && statsOn && hud ? [
                   hud.fps != null ? `${hud.fps.toFixed(1)}fps` : null,
                   hud.kbps != null ? `${Math.round(hud.kbps)}kbps` : null,
@@ -2419,6 +2424,9 @@
         const qualityKeyRef = useRef(qualityKey);
         const [previewMode, setPreviewModeState] = useState(loadPreviewMode());
         const previewModeRef = useRef(previewMode);
+        const [inputNotice, setInputNotice] = useState(null); // last failed input, transient
+        const inputNoticeTimer = useRef(null);
+        const [agentTcc, setAgentTcc] = useState(null);       // capture machine's TCC verdicts
         const rtcRef = useRef(null); // { channel, pc, timer }
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
@@ -2473,8 +2481,15 @@
             setRtc({ status: "fallback", stream: null, reason: "수동 JPEG 모드" });
             wsSend({ type: "preview_subscribe", channel, mode: "app-window" });
           } else {
+            // Hybrid switchover: keep the JPEG frames flowing while WebRTC
+            // negotiates, so a mode/quality/project switch shows pictures the
+            // whole way instead of seconds of black. The subscription is
+            // dropped the moment the stream goes live.
+            wsSend({ type: "preview_subscribe", channel, mode: "app-window" });
             startRtc(channel);
           }
+          setAgentTcc(null);
+          setInputNotice(null);
         };
         const changePreviewMode = (mode) => {
           setPreviewModeState(mode);
@@ -2558,6 +2573,12 @@
                   if (state === "connected" || state === "completed") {
                     clearTimeout(live.timer);
                     setRtc((previous) => ({ ...previous, status: "live" }));
+                    // The hybrid JPEG feed has done its job; stop paying for it.
+                    wsSend({ type: "preview_subscribe", channel: null, mode: "app-window" });
+                    setPreview((previous) => {
+                      if (previous?.url) URL.revokeObjectURL(previous.url);
+                      return null;
+                    });
                   } else if (state === "failed" || state === "disconnected") {
                     handleRtcFailure(live.channel, "ICE " + state);
                   }
@@ -2593,6 +2614,18 @@
                 return;
               }
               if (msg.type === "webrtc_state") return; // relay-side ICE state, informational
+              if (msg.type === "preview_input_result") {
+                if (!msg.ok) {
+                  setInputNotice(msg.reason || `${msg.input} 실패`);
+                  clearTimeout(inputNoticeTimer.current);
+                  inputNoticeTimer.current = setTimeout(() => setInputNotice(null), 6000);
+                }
+                return;
+              }
+              if (msg.type === "agent_tcc") {
+                setAgentTcc({ screenCapture: msg.screenCapture, accessibility: msg.accessibility });
+                return;
+              }
 
               if (msg.kind === "preview_frame") {
                 const bytes = previewPayload || (msg.preview?.imageData
@@ -2714,7 +2747,7 @@
                     <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); }} onClearEmpty={clearEmpty} />
                   </div>
                   <div className="logwrap">
-                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} onClose={() => setSelectedProject(null)} />
+                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} inputNotice={inputNotice} agentTcc={agentTcc} onClose={() => setSelectedProject(null)} />
                     <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
                   </div>
                 </>
@@ -2726,7 +2759,7 @@
                   </div>
                   <div className="nav-main">
                     {navProject
-                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} />
+                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} inputNotice={inputNotice} agentTcc={agentTcc} />
                       : <div className="nav-placeholder">
                           No live plugin for this project — the preview mirrors the Figma app window.<br />
                           Open the file in Figma and run the Talk-to-Figma plugin; browsing the index still works.

@@ -67,6 +67,9 @@ struct Config: Codable {
     // Deliberately conservative defaults: this stream crosses a shared tunnel,
     // so the console opts UP into quality rather than starting expensive.
     var fps: Int = 12
+    // Cap on the LONGEST edge, not the width: windows come in every aspect
+    // ratio, and a width cap gave a tall narrow window either a huge height
+    // or a uselessly small one depending on how it was sized.
     var maxWidth: Int = 1280
     var bitrate: Int = 800_000
     var showsCursor: Bool = true
@@ -327,6 +330,24 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var forceKeyframe = true       // the first frame a viewer sees must be an IDR
     private var sentParameterSets = false
     private var ptsOrigin: Double?         // capture clock is mach-absolute; rebase to ~0
+    // Shareable-content lookup is the slow part of starting (multiple seconds
+    // on a window-heavy machine) and its answer barely changes — cache it and
+    // refresh only when the target window is not in the cached list.
+    private var cachedContent: SCShareableContent?
+    // Idle refresh: SCStream stops delivering frames the moment the window
+    // stops changing, so whatever quality the LAST frame had is what the
+    // viewer stares at. Keep that frame and, once the window has been still
+    // for a beat, re-encode it once at a much higher bitrate — a static view
+    // deserves a sharp picture, and one boosted IDR costs almost nothing.
+    private var lastPixelBuffer: CVPixelBuffer?
+    private var lastPresentationSeconds: Double = 0
+    private var idleTimer: DispatchSourceTimer?
+    private var idleRefreshDone = false
+    // Window geometry poll: the capture resolution is fixed at start, so a
+    // resized window would otherwise stream stretched or letterboxed forever.
+    private var resizeTimer: DispatchSourceTimer?
+    private var capturedBounds: CGRect = .zero
+    private var restarting = false
 
     var config = Config()
     private(set) var target: TargetWindow?
@@ -368,23 +389,38 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             )
         }
 
+        let startedAt = Date()
         // Belt and braces: even with the grant, treat a shareable-content
         // lookup that takes >10s as failed rather than hanging the stream.
-        let content = try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
-            group.addTask { try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 10_000_000_000)
-                throw AgentError.message("SCShareableContent timed out after 10s — screen capture is blocked for this process")
+        // The lookup is also the slow part of every (re)start — seconds on a
+        // window-heavy machine — so the answer is cached and only refreshed
+        // when the target window is missing from it.
+        func lookupContent() async throws -> SCShareableContent {
+            try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
+                group.addTask { try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 10_000_000_000)
+                    throw AgentError.message("SCShareableContent timed out after 10s — screen capture is blocked for this process")
+                }
+                let value = try await group.next()!
+                group.cancelAll()
+                return value
             }
-            let value = try await group.next()!
-            group.cancelAll()
-            return value
+        }
+        var content: SCShareableContent
+        if let cached = cachedContent, cached.windows.contains(where: { $0.windowID == target.id }) {
+            content = cached
+        } else {
+            content = try await lookupContent()
+            cachedContent = content
         }
         guard let scWindow = content.windows.first(where: { $0.windowID == target.id }) else {
             throw AgentError.message("window \(target.id) is no longer shareable — was it closed?")
         }
 
-        let scale = min(1.0, Double(config.maxWidth) / max(1.0, Double(scWindow.frame.width)))
+        // Scale by the LONGEST edge so every aspect ratio gets a sane budget.
+        let longEdge = max(scWindow.frame.width, scWindow.frame.height)
+        let scale = min(1.0, Double(config.maxWidth) / max(1.0, Double(longEdge)))
         // H.264 wants even dimensions.
         let width = max(2, Int((Double(scWindow.frame.width) * scale).rounded(.down)) & ~1)
         let height = max(2, Int((Double(scWindow.frame.height) * scale).rounded(.down)) & ~1)
@@ -404,10 +440,81 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try await stream.startCapture()
         self.stream = stream
+        queue.sync {
+            capturedBounds = scWindow.frame
+            idleRefreshDone = false
+        }
+        startResizeWatch()
         emitEvent([
             "event": "started", "windowId": Int(target.id), "title": target.title,
             "width": width, "height": height, "fps": config.fps, "bitrate": config.bitrate,
+            "elapsedMs": Int(Date().timeIntervalSince(startedAt) * 1000),
         ])
+    }
+
+    // Re-arm on every delivered frame; fires only after the window has been
+    // still for a moment. Runs on the capture queue.
+    private func armIdleRefresh() {
+        idleTimer?.cancel()
+        idleRefreshDone = false
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1.2)
+        timer.setEventHandler { [weak self] in self?.performIdleRefresh() }
+        timer.resume()
+        idleTimer = timer
+    }
+
+    private func performIdleRefresh() {
+        guard !idleRefreshDone, let session, let pixelBuffer = lastPixelBuffer else { return }
+        idleRefreshDone = true
+        // Boost, re-encode the held frame once as an IDR, restore. RealTime
+        // encoders honor bitrate changes mid-session.
+        let boostedBitrate = min(20_000_000, config.bitrate * 6)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: boostedBitrate))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: [NSNumber(value: boostedBitrate / 4), NSNumber(value: 0.25)] as CFArray)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: NSNumber(value: 0.9))
+        let pts = CMTime(seconds: lastPresentationSeconds + 1.0 / Double(config.fps), preferredTimescale: 600)
+        lastPresentationSeconds = pts.seconds
+        let properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+        VTCompressionSessionEncodeFrame(
+            session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
+            duration: .invalid, frameProperties: properties, infoFlagsOut: nil
+        ) { [weak self] status, _, buffer in
+            guard let self else { return }
+            if status == noErr, let buffer { self.emitAccessUnit(buffer) }
+            self.queue.async {
+                guard let session = self.session else { return }
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: self.config.bitrate))
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                                     value: [NSNumber(value: self.config.bitrate * 2 / 8), NSNumber(value: 1.0)] as CFArray)
+            }
+        }
+    }
+
+    // Poll the live window rect; a moved-only window is fine (capture is
+    // window-relative) but a RESIZED one needs a new capture geometry.
+    private func startResizeWatch() {
+        resizeTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            guard let self, let target = self.target, !self.restarting else { return }
+            guard let live = findWindow(match: nil, windowId: target.id) else { return }
+            let captured = self.capturedBounds
+            if abs(live.bounds.width - captured.width) > 4 || abs(live.bounds.height - captured.height) > 4 {
+                self.restarting = true
+                self.cachedContent = nil   // sizes come from the cached lookup; force fresh
+                emitEvent(["event": "resize", "width": Int(live.bounds.width), "height": Int(live.bounds.height)])
+                Task { [weak self] in
+                    guard let self else { return }
+                    do { try await self.start() } catch { emitEvent(["event": "error", "message": String(describing: error)]) }
+                    self.queue.async { self.restarting = false }
+                }
+            }
+        }
+        timer.resume()
+        resizeTimer = timer
     }
 
     func stop() async {
@@ -416,6 +523,11 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             self.stream = nil
         }
         queue.sync {
+            idleTimer?.cancel()
+            idleTimer = nil
+            resizeTimer?.cancel()
+            resizeTimer = nil
+            lastPixelBuffer = nil
             if let session {
                 VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
                 VTCompressionSessionInvalidate(session)
@@ -465,6 +577,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let session, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        lastPixelBuffer = pixelBuffer
+        lastPresentationSeconds = CMTimeGetSeconds(presentationTime)
+        armIdleRefresh()
         var properties: CFDictionary?
         if forceKeyframe {
             properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
@@ -599,17 +714,37 @@ func handle(_ line: String) async {
             await streamer.stop()
             emitEvent(["event": "stopped"])
         case "click":
-            guard let window = streamer.target else { return }
+            guard let window = streamer.target else {
+                emitEvent(["event": "click", "ok": false, "reason": "no target window"])
+                return
+            }
+            // Posting events without the Accessibility grant fails SILENTLY —
+            // post() returns as if it worked and nothing happens on screen.
+            // Name the cause instead of letting the click vanish.
+            guard AXIsProcessTrusted() else {
+                emitEvent(["event": "click", "ok": false,
+                           "reason": "손쉬운 사용(Accessibility) 권한이 없어 입력을 보낼 수 없습니다 — 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 릴레이 런타임을 허용하세요"])
+                return
+            }
             let ok = postClick(in: window,
                                normX: object["x"] as? Double ?? -1,
                                normY: object["y"] as? Double ?? -1,
                                clickCount: object["clickCount"] as? Int ?? 1,
                                right: (object["button"] as? String) == "right")
-            emitEvent(["event": "click", "ok": ok])
+            emitEvent(["event": "click", "ok": ok] as [String: Any])
         case "key":
-            guard let window = streamer.target, let key = object["key"] as? String else { return }
+            guard let window = streamer.target, let key = object["key"] as? String else {
+                emitEvent(["event": "key", "ok": false, "reason": "no target window"])
+                return
+            }
+            guard AXIsProcessTrusted() else {
+                emitEvent(["event": "key", "ok": false, "key": key,
+                           "reason": "손쉬운 사용(Accessibility) 권한이 없어 입력을 보낼 수 없습니다 — 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 릴레이 런타임을 허용하세요"])
+                return
+            }
             let ok = postKey(in: window, key: key, modifiers: object["modifiers"] as? [String] ?? [])
-            emitEvent(["event": "key", "ok": ok, "key": key])
+            emitEvent(["event": "key", "ok": ok, "key": key,
+                       "reason": ok ? "" : "허용 목록에 없는 키이거나 창을 찾지 못했습니다"])
         case "keyframe":
             streamer.requestKeyframe()
         case "ping":
@@ -621,6 +756,22 @@ func handle(_ line: String) async {
         emitEvent(["event": "error", "message": String(describing: error)])
     }
 }
+
+// ---------------------------------------------------------------------------
+// Orphan protection. If start() hangs (an overlapping capture, a wedged
+// tccd), the readLine loop is stuck in that await and will never see stdin's
+// EOF — and if the relay then dies, this process lives on forever, holding
+// the window and killing every successor's capture with "connection
+// interrupted". Seven such orphans were found piled up on one machine.
+// The watchdog: re-parented to launchd (ppid 1) means the relay is gone —
+// exit no matter what handle() is stuck inside. (A dispatch read-source on
+// stdin was tried first and raced readLine into false-EOF exits; the ppid
+// poll plus the relay's SIGTERM→SIGKILL escalation covers every case.)
+// ---------------------------------------------------------------------------
+let parentWatch = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+parentWatch.schedule(deadline: .now() + 2, repeating: 2)
+parentWatch.setEventHandler { if getppid() == 1 { exit(0) } }
+parentWatch.resume()
 
 Task.detached {
     emitEvent(["event": "ready", "pid": ProcessInfo.processInfo.processIdentifier])
