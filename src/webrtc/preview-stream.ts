@@ -31,6 +31,7 @@ import {
   RTCSessionDescription,
   RtpHeader,
   RtpPacket,
+  RTCRtpHeaderExtensionParameters,
 } from "werift";
 import { MAX_PAYLOAD_BYTES, RtpSequencer, packetizeAccessUnit } from "./h264-rtp";
 
@@ -191,6 +192,17 @@ class WindowAgent {
 // ---------------------------------------------------------------------------
 // Viewer peer: werift peer connection with a single sendonly H.264 track.
 // ---------------------------------------------------------------------------
+// Chrome's playout-delay extension (a Google experiment extension, the one
+// their own screen sharing uses). Payload is 12 bits of minimum delay then 12
+// bits of maximum, both in 10ms units.
+const PLAYOUT_DELAY_URI = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
+
+function playoutDelayPayload(minMs: number, maxMs: number): Buffer {
+  const min = Math.max(0, Math.min(0xfff, Math.round(minMs / 10)));
+  const max = Math.max(min, Math.min(0xfff, Math.round(maxMs / 10)));
+  return Buffer.from([min >> 4, ((min & 0x0f) << 4) | (max >> 8), max & 0xff]);
+}
+
 const H264_PAYLOAD_TYPE = 96;
 
 interface SignalSender {
@@ -210,6 +222,10 @@ class ViewerPeer {
   // Until the first keyframe goes out, P-frames reference pictures the viewer
   // never saw — drop them instead of feeding the decoder garbage.
   private sentKeyframe = false;
+  private transceiver: any = null;
+  // Resolved after negotiation: the id the answer agreed on for playout-delay.
+  private playoutDelayExt: { id: number; payload: Buffer } | null = null;
+  private playoutDelayResolved = false;
 
   constructor(private readonly signal: SignalSender) {
     this.pc = new RTCPeerConnection({
@@ -227,6 +243,16 @@ class ViewerPeer {
           }),
         ],
       },
+      // Chrome sizes its jitter buffer from observed inter-arrival and frame
+      // SIZE variance, and a screen share is pathological on both counts: long
+      // still gaps then a burst, and keyframes tens of times larger than the
+      // P-frames around them. Measured here: mean 2.7KB, sd 9.8KB, max 24x mean
+      // — which grew the buffer to 235ms and put it straight into the click-to
+      // -pixel path. This extension lets the SENDER bound the receiver's
+      // playout delay directly, so the estimator's opinion stops mattering.
+      headerExtensions: {
+        video: [new RTCRtpHeaderExtensionParameters({ uri: PLAYOUT_DELAY_URI })],
+      },
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
     // Control channel on the SAME peer as the video. Viewport drags used to
@@ -241,6 +267,7 @@ class ViewerPeer {
 
     this.track = new MediaStreamTrack({ kind: "video" });
     const transceiver = this.pc.addTransceiver(this.track, { direction: "sendonly" });
+    this.transceiver = transceiver;
     transceiver.sender.onRtcp.subscribe((rtcp: any) => {
       // PLI or FIR → the viewer lost its picture; answer with an IDR.
       if (rtcp.type === 206) this.onNeedKeyframe?.();
@@ -302,6 +329,11 @@ class ViewerPeer {
         ssrc: this.sequencer.ssrc,
         marker: index === payloads.length - 1,   // last packet of the access unit
       });
+      // werift's sender drops extension URIs it has no serialiser for, but it
+      // merges back anything already on the header, so setting it here is what
+      // actually puts the bytes on the wire.
+      const playout = this.playoutDelayExtension();
+      if (playout) header.extensions = [playout];
       try {
         this.track.writeRtp(new RtpPacket(header, Buffer.from(payloads[index])));
       } catch {
@@ -310,6 +342,22 @@ class ViewerPeer {
         return;
       }
     }
+  }
+
+  // The extension id comes from negotiation, not from us, so read it back
+  // rather than assuming the 1 werift happens to assign today.
+  private playoutDelayExtension(): { id: number; payload: Buffer } | null {
+    if (this.playoutDelayResolved) return this.playoutDelayExt;
+    const extensions = this.transceiver?.sender?.headerExtensions
+      ?? this.transceiver?.headerExtensions;
+    if (!Array.isArray(extensions) || extensions.length === 0) return null;
+    this.playoutDelayResolved = true;
+    const match = extensions.find((extension: any) => extension?.uri === PLAYOUT_DELAY_URI);
+    // min 0 / max 0 is the "render as soon as it decodes" signal. This is a
+    // LAN-to-tunnel screen share where a late frame is better dropped than
+    // held: holding is exactly the delay being complained about.
+    if (match) this.playoutDelayExt = { id: match.id, payload: playoutDelayPayload(0, 0) };
+    return this.playoutDelayExt;
   }
 
   close(): void {
