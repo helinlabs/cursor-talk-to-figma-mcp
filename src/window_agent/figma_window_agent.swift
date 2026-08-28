@@ -320,21 +320,29 @@ func postClick(in window: TargetWindow, normX: Double, normY: Double, clickCount
     raiseWindow(app, live)
     let point = CGPoint(x: live.bounds.origin.x + live.bounds.width * normX,
                         y: live.bounds.origin.y + live.bounds.height * normY)
-    let pid = app.processIdentifier
+    // Global tap, not postToPid: Figma (Electron) drops pid-targeted events
+    // even while active — measured on the fleet, ok:true with zero effect.
+    // The app is already frontmost (the session ladder ran), keys never touch
+    // the cursor, and for clicks the cursor is warped and RESTORED so an
+    // operator at the machine sees at most a blink.
+    let savedCursor = CGEvent(source: nil)?.location
+    defer {
+        if let savedCursor { CGWarpMouseCursorPosition(savedCursor) }
+    }
     let downType: CGEventType = right ? .rightMouseDown : .leftMouseDown
     let upType: CGEventType = right ? .rightMouseUp : .leftMouseUp
     let button: CGMouseButton = right ? .right : .left
     // A move first so Figma hit-tests the right window before the press.
-    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: button)?.postToPid(pid)
+    CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: button)?.post(tap: .cghidEventTap)
     usleep(20_000)
     for index in 1...max(1, min(3, clickCount)) {
         guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: point, mouseButton: button),
               let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: point, mouseButton: button) else { return false }
         down.setIntegerValueField(.mouseEventClickState, value: Int64(index))
         up.setIntegerValueField(.mouseEventClickState, value: Int64(index))
-        down.postToPid(pid)
+        down.post(tap: .cghidEventTap)
         usleep(20_000)
-        up.postToPid(pid)
+        up.post(tap: .cghidEventTap)
         usleep(20_000)
     }
     return true
@@ -351,10 +359,10 @@ func postKey(in window: TargetWindow, key: String, modifiers: [String]) -> Bool 
           let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return false }
     down.flags = flags
     up.flags = flags
-    let pid = app.processIdentifier
-    down.postToPid(pid)
+    _ = app   // frontmost is what routes the key; the pid target proved useless
+    down.post(tap: .cghidEventTap)
     usleep(20_000)
-    up.postToPid(pid)
+    up.post(tap: .cghidEventTap)
     return true
 }
 
