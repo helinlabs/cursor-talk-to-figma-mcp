@@ -383,7 +383,18 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // A browser sends PLI when it joins or loses packets; answer with an IDR
     // instead of leaving it on a grey frame until the next periodic keyframe.
-    func requestKeyframe() { queue.async { self.forceKeyframe = true } }
+    // On a STILL window no further frames are coming (unchanged content is
+    // not encoded), so a queued flag would never fire — re-emit the boosted
+    // refresh from the held frame immediately instead.
+    func requestKeyframe() {
+        queue.async {
+            self.forceKeyframe = true
+            if self.stillStreak > 0 {
+                self.idleRefreshDone = false
+                self.performIdleRefresh()
+            }
+        }
+    }
 
     func start() async throws {
         guard let target else { throw AgentError.message("no target window selected") }
@@ -517,6 +528,21 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: self.config.bitrate))
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
                                      value: [NSNumber(value: self.config.bitrate * 2 / 8), NSNumber(value: 1.0)] as CFArray)
+                // Chrome's jitter buffer can sit on the LAST frame of a stream
+                // that then goes silent — the sharp IDR arrives but is never
+                // shown, and the operator keeps looking at the blurry frame
+                // before it. Encode the same held frame once more as a tiny
+                // trailing P-frame so the decoder is pushed past the IDR.
+                if let held = self.lastPixelBuffer {
+                    let flushPts = CMTime(seconds: self.lastPresentationSeconds + 1.0 / Double(self.config.fps), preferredTimescale: 600)
+                    self.lastPresentationSeconds = flushPts.seconds
+                    VTCompressionSessionEncodeFrame(
+                        session, imageBuffer: held, presentationTimeStamp: flushPts,
+                        duration: .invalid, frameProperties: nil, infoFlagsOut: nil
+                    ) { [weak self] flushStatus, _, flushBuffer in
+                        if flushStatus == noErr, let flushBuffer { self?.emitAccessUnit(flushBuffer) }
+                    }
+                }
             }
         }
     }
@@ -647,7 +673,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         // sharp static picture and zero bandwidth. Any real change resumes
         // normal encoding on the very next frame.
         let fingerprint = Self.fingerprint(of: pixelBuffer)
-        let changed = fingerprint != lastFingerprint || lastFingerprint.isEmpty
+        // A pending keyframe request (viewer joined, PLI) always encodes,
+        // still content or not — the skip path must never starve it.
+        let changed = fingerprint != lastFingerprint || lastFingerprint.isEmpty || forceKeyframe
         lastFingerprint = fingerprint
         if changed {
             stillStreak = 0
