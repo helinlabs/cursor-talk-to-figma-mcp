@@ -292,6 +292,23 @@
         ? location.pathname.slice(0, -"console".length)
         : location.pathname;
       const WS_URL = `${wsProtocol}//${location.host}${wsPath || "/"}`;
+      // The tunnel answers with PLAIN TEXT while the relay restarts ("로컬
+      // 서비스 응답 실패: EOF"), and a bare r.json() then surfaces a raw
+      // SyntaxError in the UI (operator-reported). Every relay fetch goes
+      // through this: JSON when it is JSON, a readable message when not.
+      async function fetchRelayJson(url, options) {
+        const { ok: rOk, status: rStatus, data } = await fetchRelayJson(url, options);
+        const text = await r.text();
+        try {
+          return { ok: r.ok, status: r.status, data: JSON.parse(text) };
+        } catch {
+          const hint = text.trim().replace(/\s+/g, " ").slice(0, 90);
+          throw new Error(r.ok
+            ? `릴레이가 JSON이 아닌 응답을 반환: ${hint}`
+            : `릴레이 응답 없음 (HTTP ${r.status}) — 재시작 중일 수 있습니다: ${hint}`);
+        }
+      }
+
       function relayApiUrl(endpoint) {
         const url = new URL(WS_URL);
         url.protocol = url.protocol === "wss:" ? "https:" : "http:";
@@ -847,10 +864,9 @@
           // will refresh the readout itself, so the cadence stays untouched.
           if (!projectKey || inflight.current || pending.current) return;
           try {
-            const r = await fetch(relayApiUrl("navigator/viewport") + `?project=${encodeURIComponent(projectKey)}`);
-            const data = await r.json();
-            if (!r.ok) {
-              const message = data.error || `HTTP ${r.status}`;
+            const { ok, status, data } = await fetchRelayJson(relayApiUrl("navigator/viewport") + `?project=${encodeURIComponent(projectKey)}`);
+            if (!ok) {
+              const message = data.error || `HTTP ${status}`;
               pollDelay.current = nextViewportPollDelay(pollDelay.current, { ok: false, error: message });
               setError(message);
               return;
@@ -869,13 +885,12 @@
           pending.current = null;
           inflight.current = true;
           try {
-            const r = await fetch(relayApiUrl("navigator/viewport"), {
+            const { ok, status, data } = await fetchRelayJson(relayApiUrl("navigator/viewport"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ project: projectKey, ...body }),
             });
-            const data = await r.json();
-            if (!r.ok) setError(data.error || `HTTP ${r.status}`);
+            if (!ok) setError(data.error || `HTTP ${status}`);
             // Render what Figma actually did — it clamps the zoom and snaps
             // the center, so an optimistic guess would drift out of sync.
             // A write that lands also proves the plugin can talk, so a parked
@@ -1291,8 +1306,8 @@
 
         const refresh = useCallback(async () => {
           try {
-            const r = await fetch(relayApiUrl("index/status"));
-            setStatus(await r.json());
+            const { data: statusData } = await fetchRelayJson(relayApiUrl("index/status"));
+            setStatus(statusData);
           } catch (e) { setStatus({ error: String(e) }); }
         }, []);
 
@@ -1305,9 +1320,8 @@
         const loadDetail = useCallback(async (projectKey) => {
           setDetail({ loading: true });
           try {
-            const r = await fetch(relayApiUrl("index/project") + `?project=${encodeURIComponent(projectKey)}`);
-            const data = await r.json();
-            setDetail(r.ok ? data : { error: data.error || `HTTP ${r.status}` });
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("index/project") + `?project=${encodeURIComponent(projectKey)}`);
+            setDetail(rOk ? data : { error: data.error || `HTTP ${rStatus}` });
           } catch (e) { setDetail({ error: String(e) }); }
         }, []);
 
@@ -1335,14 +1349,13 @@
           setPageBusy((s) => ({ ...s, [pageId]: true }));
           setPageMsg((s) => ({ ...s, [pageId]: null }));
           try {
-            const r = await fetch(relayApiUrl("index/rebuild-page"), {
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("index/rebuild-page"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ project: detailKey, pageId }),
             });
-            const data = await r.json();
             if (r.status === 202) setPageMsg((s) => ({ ...s, [pageId]: "queued — another refresh is busy; picked up within 5 min" }));
-            else if (!r.ok) setPageMsg((s) => ({ ...s, [pageId]: "⚠ " + (data.error || `HTTP ${r.status}`) }));
+            else if (!rOk) setPageMsg((s) => ({ ...s, [pageId]: "⚠ " + (data.error || `HTTP ${rStatus}`) }));
             await loadDetail(detailKey);
             await refresh();
           } catch (e) {
@@ -1354,9 +1367,8 @@
 
         const fetchCache = async (projectKey) => {
           try {
-            const r = await fetch(relayApiUrl("index/cache-status") + `?project=${encodeURIComponent(projectKey)}`);
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("index/cache-status") + `?project=${encodeURIComponent(projectKey)}`);
             setCacheStatus((s) => ({ ...s, [projectKey]: null }));
-            const data = await r.json();
             setCacheStatus((s) => ({ ...s, [projectKey]: data }));
           } catch (e) {
             setCacheStatus((s) => ({ ...s, [projectKey]: { error: String(e) } }));
@@ -1505,8 +1517,7 @@
         useEffect(() => {
           (async () => {
             try {
-              const r = await fetch(relayApiUrl("index/status"));
-              const data = await r.json();
+              const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("index/status"));
               setDiskProjects((data.diskIndexes || []).map((d) => ({ projectKey: d.projectKey, name: d.projectName || d.projectKey })));
             } catch {}
           })();
@@ -1532,9 +1543,8 @@
           if (!key) return;
           setError(null);
           try {
-            const r = await fetch(relayApiUrl("navigator/pages") + `?project=${encodeURIComponent(key)}`);
-            const data = await r.json();
-            if (!r.ok) { setPages(null); setError(data.error || `HTTP ${r.status}`); return; }
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("navigator/pages") + `?project=${encodeURIComponent(key)}`);
+            if (!rOk) { setPages(null); setError(data.error || `HTTP ${rStatus}`); return; }
             setPages(data);
           } catch (e) { setPages(null); setError(String(e)); }
         }, []);
@@ -1553,13 +1563,12 @@
           setPendingId(rowId);
           setRowErrors((s) => ({ ...s, [rowId]: null }));
           try {
-            const r = await fetch(relayApiUrl(endpoint), {
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl(endpoint), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ project: effectiveKey, ...body }),
             });
-            const data = await r.json();
-            if (!r.ok) { setRowErrors((s) => ({ ...s, [rowId]: data.error || `HTTP ${r.status}` })); return null; }
+            if (!rOk) { setRowErrors((s) => ({ ...s, [rowId]: data.error || `HTTP ${rStatus}` })); return null; }
             return data;
           } catch (e) {
             setRowErrors((s) => ({ ...s, [rowId]: String(e) }));
@@ -1597,9 +1606,8 @@
           setChildrenMap((s) => ({ ...s, [sectionId]: { loading: true } }));
           (async () => {
             try {
-              const r = await fetch(relayApiUrl("navigator/children") + `?project=${encodeURIComponent(effectiveKey)}&nodeId=${encodeURIComponent(sectionId)}`);
-              const data = await r.json();
-              setChildrenMap((s) => ({ ...s, [sectionId]: r.ok ? data : { error: data.error || `HTTP ${r.status}` } }));
+              const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("navigator/children") + `?project=${encodeURIComponent(effectiveKey)}&nodeId=${encodeURIComponent(sectionId)}`);
+              setChildrenMap((s) => ({ ...s, [sectionId]: rOk ? data : { error: data.error || `HTTP ${rStatus}` } }));
             } catch (e) {
               setChildrenMap((s) => ({ ...s, [sectionId]: { error: String(e) } }));
             }
@@ -1611,9 +1619,8 @@
           if (!q || !effectiveKey) return;
           setBusy(true); setError(null);
           try {
-            const r = await fetch(relayApiUrl("navigator/search") + `?project=${encodeURIComponent(effectiveKey)}&q=${encodeURIComponent(q)}&limit=50`);
-            const data = await r.json();
-            if (!r.ok) { setSearchResults(null); setError(data.error || `HTTP ${r.status}`); return; }
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("navigator/search") + `?project=${encodeURIComponent(effectiveKey)}&q=${encodeURIComponent(q)}&limit=50`);
+            if (!rOk) { setSearchResults(null); setError(data.error || `HTTP ${rStatus}`); return; }
             setSearchResults(data.results || []);
           } catch (e) { setError(String(e)); }
           finally { setBusy(false); }
@@ -1781,9 +1788,8 @@
           if (!key) return;
           setBusy(true); setError(null); setSavedAt(null);
           try {
-            const r = await fetch(relayApiUrl("project-context") + `?project=${encodeURIComponent(key)}`);
-            const data = await r.json();
-            if (!r.ok && r.status !== 404) { setError(data.error || `HTTP ${r.status}`); setDoc(null); setText(""); return; }
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("project-context") + `?project=${encodeURIComponent(key)}`);
+            if (!r.ok && r.status !== 404) { setError(data.error || `HTTP ${rStatus}`); setDoc(null); setText(""); return; }
             setDoc(data);
             setText(data.content || "");
           } catch (e) { setError(String(e)); }
@@ -1795,13 +1801,12 @@
         const save = async () => {
           setBusy(true); setError(null); setSavedAt(null);
           try {
-            const r = await fetch(relayApiUrl("project-context") + `?project=${encodeURIComponent(effectiveKey)}`, {
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("project-context") + `?project=${encodeURIComponent(effectiveKey)}`, {
               method: "PUT",
               headers: { "Content-Type": "text/plain; charset=utf-8" },
               body: text,
             });
-            const data = await r.json();
-            if (!r.ok) { setError(data.error || `HTTP ${r.status}`); return; }
+            if (!rOk) { setError(data.error || `HTTP ${rStatus}`); return; }
             setSavedAt(data.updatedAt || new Date().toISOString());
             load(effectiveKey);
           } catch (e) { setError(String(e)); }
@@ -1854,13 +1859,12 @@
               try { params = JSON.parse(paramsText); }
               catch (e) { setOutput({ error: "params is not valid JSON: " + e }); setBusy(false); return; }
             }
-            const r = await fetch(relayApiUrl("script/run") + `?project=${encodeURIComponent(effectiveKey)}`, {
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("script/run") + `?project=${encodeURIComponent(effectiveKey)}`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ code, params }),
             });
-            const data = await r.json();
-            if (!r.ok) setOutput({ error: data.error || `HTTP ${r.status}` });
+            if (!rOk) setOutput({ error: data.error || `HTTP ${rStatus}` });
             else setOutput(data);
           } catch (e) { setOutput({ error: String(e) }); }
           finally { setBusy(false); }
@@ -1900,8 +1904,7 @@
 
         const refresh = useCallback(async () => {
           try {
-            const r = await fetch(relayApiUrl("search/annotations"));
-            const data = await r.json();
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("search/annotations"));
             setItems(data.annotations || []);
           } catch (e) { setError(String(e)); }
         }, []);
@@ -1911,13 +1914,12 @@
         const add = async () => {
           setError(null);
           const projectKey = form.projectKey || (projects[0] && projects[0].projectKey) || "";
-          const r = await fetch(relayApiUrl("search/annotations"), {
+          const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("search/annotations"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ keyword: form.keyword, projectKey, nodeId: form.nodeId, note: form.note || undefined }),
           });
-          const data = await r.json();
-          if (!r.ok) { setError(data.error || "failed"); return; }
+          if (!rOk) { setError(data.error || "failed"); return; }
           setForm({ keyword: "", projectKey: form.projectKey, nodeId: "", note: "" });
           refresh();
         };
@@ -1971,8 +1973,7 @@
         const refresh = useCallback(async () => {
           try {
             const qs = source ? `?source=${encodeURIComponent(source)}&limit=50` : "?limit=50";
-            const r = await fetch(relayApiUrl("errors") + qs);
-            const data = await r.json();
+            const { ok: rOk, status: rStatus, data } = await fetchRelayJson(relayApiUrl("errors") + qs);
             setItems(data.errors || []);
             setError(null);
           } catch (e) { setError(String(e)); }
