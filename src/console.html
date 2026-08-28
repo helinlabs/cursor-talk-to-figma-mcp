@@ -1094,10 +1094,15 @@
         };
         const onKeyDown = (e) => {
           if (!control || !live) return;
-          const key = CONTROL_KEYS[e.key === "₩" ? "\\" : e.key];   // Korean layout: same physical key reports won-sign
+          const normalized = e.key === "₩" ? "\\" : e.key;   // Korean layout reports the won sign for the same physical key
+          const key = CONTROL_KEYS[normalized];
           if (!key) return;
           e.preventDefault();
-          if (onInput) onInput({ type: "key", key, modifiers: e.shiftKey ? ["shift"] : [] });
+          const modifiers = e.shiftKey ? ["shift"] : [];
+          if (e.metaKey) modifiers.push("command");
+          // Bare backslash IS the UI-toggle intent; Figma binds that to ⌘\.
+          if (key === "backslash" && !modifiers.includes("command")) modifiers.push("command");
+          if (onInput) onInput({ type: "key", key, modifiers });
         };
         const sendKey = (key, modifiers) => { if (onInput) onInput({ type: "key", key, modifiers: modifiers || [] }); };
 
@@ -1163,7 +1168,7 @@
               </button>
               {control && live && (
                 <>
-                  <button className="ghost" title="Toggle Figma's UI (backslash / ₩)" onClick={() => sendKey("backslash")}>\ UI</button>
+                  <button className="ghost" title="Figma UI 숨기기/보이기 (⌘\\)" onClick={() => sendKey("backslash", ["command"])}>⌘\ UI</button>
                   <button className="ghost" title="Escape" onClick={() => sendKey("escape")}>Esc</button>
                   <button className="ghost" title="Zoom to fit (Shift+1)" onClick={() => sendKey("one", ["shift"])}>⇧1</button>
                   <button className="ghost" title="Zoom to 100% (Shift+0)" onClick={() => sendKey("zero", ["shift"])}>⇧0</button>
