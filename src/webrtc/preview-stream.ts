@@ -86,6 +86,11 @@ class WindowAgent {
   private child: ChildProcessWithoutNullStreams | null = null;
   private buffer = Buffer.alloc(0);
   private startPromise: Promise<void> | null = null;
+  private exitResolve: (() => void) | null = null;
+  /** Resolves once the process is truly gone. Two agents capturing the same
+   *  window make SCStream fail with "connection interrupted" (measured), so a
+   *  successor must wait on this before spawning. */
+  exited: Promise<void> = Promise.resolve();
   onAccessUnit: ((pts90k: number, keyframe: boolean, annexB: Buffer) => void) | null = null;
   onEvent: ((event: AgentEvent) => void) | null = null;
   onExit: (() => void) | null = null;
@@ -99,6 +104,7 @@ class WindowAgent {
       const binary = await agentBinary();
       const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"] });
       this.child = child;
+      this.exited = new Promise((resolve) => { this.exitResolve = resolve; });
       child.stdout.on("data", (chunk: Buffer) => this.feed(chunk));
       child.stderr.on("data", (chunk: Buffer) => {
         const text = chunk.toString().trim();
@@ -107,6 +113,7 @@ class WindowAgent {
       child.on("exit", () => {
         this.child = null;
         this.startPromise = null;
+        this.exitResolve?.();
         this.onExit?.();
       });
       this.send({ cmd: "target", match: this.windowMatch });
@@ -151,6 +158,8 @@ class WindowAgent {
     setTimeout(() => {
       try { child.kill(); } catch {}
     }, 1500).unref?.();
+    // `exited` stays pending until the process is actually gone; the child's
+    // exit handler resolves it even though this.child is cleared here.
     this.child = null;
     this.startPromise = null;
   }
@@ -252,6 +261,10 @@ class ViewerPeer {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Tell the viewer the stream is gone. The browser's own ICE layer can take
+    // tens of seconds to notice a closed remote peer, and until then the
+    // console showed a live badge over a black frame — measured, not guessed.
+    try { this.signal({ type: "webrtc_closed" }); } catch {}
     this.pc.close().catch(() => {});
     this.onClosed?.();
   }
@@ -266,13 +279,22 @@ interface ChannelStream {
   signals: Map<ViewerPeer, SignalSender>;
   quality: Required<StreamQuality>;
   started: boolean;
+  lingerTimer: ReturnType<typeof setTimeout> | null;
 }
+
+// How long a viewer-less agent keeps running before it is stopped. Reloads and
+// mode toggles rejoin within seconds, and reusing the live agent both skips
+// the re-negotiation stall and — more importantly — avoids overlapping agents
+// on one window, which SCStream punishes with "connection interrupted".
+const AGENT_LINGER_MS = 10_000;
 
 const DEFAULT_QUALITY: Required<StreamQuality> = { fps: 12, maxWidth: 1280, bitrate: 800_000 };
 
 export class PreviewStreamManager {
   private streams = new Map<string, ChannelStream>();
   private peersBySocket = new Map<unknown, { channel: string; peer: ViewerPeer }>();
+  // Last agent stopped per channel — a successor awaits its exit first.
+  private stopping = new Map<string, Promise<void>>();
 
   constructor(private readonly windowMatchForChannel: (channel: string) => string | undefined) {}
 
@@ -281,7 +303,7 @@ export class PreviewStreamManager {
     if (stream) return stream;
     const match = this.windowMatchForChannel(channel) ?? "";
     const agent = new WindowAgent(match);
-    stream = { agent, peers: new Set(), signals: new Map(), quality: { ...DEFAULT_QUALITY }, started: false };
+    stream = { agent, peers: new Set(), signals: new Map(), quality: { ...DEFAULT_QUALITY }, started: false, lingerTimer: null };
     agent.onAccessUnit = (pts90k, keyframe, annexB) => {
       for (const peer of stream!.peers) peer.writeAccessUnit(pts90k, keyframe, annexB);
     };
@@ -298,10 +320,10 @@ export class PreviewStreamManager {
       }
     };
     agent.onExit = () => {
-      // The agent dying (window closed, crash) ends the stream for everyone;
-      // viewers see the ICE state change and fall back on their own.
+      // The agent dying (window closed, crash) ends the stream for everyone.
       const current = this.streams.get(channel);
-      if (!current) return;
+      if (!current || current.agent !== agent) return;
+      if (current.lingerTimer) clearTimeout(current.lingerTimer);
       for (const peer of [...current.peers]) peer.close();
       this.streams.delete(channel);
     };
@@ -312,7 +334,18 @@ export class PreviewStreamManager {
   /** Browser asked to start a WebRTC preview on this socket. */
   async startViewer(socket: unknown, channel: string, quality: StreamQuality | undefined, signal: SignalSender): Promise<void> {
     this.stopViewer(socket);
+    // Never let a new agent race a predecessor still letting go of the same
+    // window — SCStream fails both with "connection interrupted" (measured).
+    const predecessor = this.stopping.get(channel);
+    if (predecessor) {
+      await predecessor;
+      this.stopping.delete(channel);
+    }
     const stream = this.streamFor(channel);
+    if (stream.lingerTimer) {
+      clearTimeout(stream.lingerTimer);
+      stream.lingerTimer = null;
+    }
     if (quality) this.applyQuality(stream, quality);
 
     const peer = new ViewerPeer(signal);
@@ -322,9 +355,16 @@ export class PreviewStreamManager {
       stream.signals.delete(peer);
       const entry = this.peersBySocket.get(socket);
       if (entry?.peer === peer) this.peersBySocket.delete(socket);
-      if (stream.peers.size === 0) {
-        stream.agent.stop();
-        this.streams.delete(channel);
+      if (stream.peers.size === 0 && !stream.lingerTimer) {
+        // Keep the agent warm for quick rejoins instead of stopping it now.
+        stream.lingerTimer = setTimeout(() => {
+          const current = this.streams.get(channel);
+          if (!current || current !== stream || current.peers.size > 0) return;
+          this.streams.delete(channel);
+          this.stopping.set(channel, stream.agent.exited);
+          stream.agent.stop();
+        }, AGENT_LINGER_MS);
+        (stream.lingerTimer as any).unref?.();
       }
     };
     stream.peers.add(peer);

@@ -781,6 +781,13 @@
         ultra:    { label: "Ultra · 30fps 1920px",    fps: 30, maxWidth: 1920, bitrate: 4000000 },
       };
       function loadQualityKey() { try { return localStorage.getItem("ttf-preview-quality") || "balanced"; } catch { return "balanced"; } }
+      // Preview transport: auto (WebRTC, JPEG on failure), or forced either way.
+      // Forced modes exist because an auto-fallback that fails to fire leaves a
+      // live badge over a black frame with no way out — measured, not guessed.
+      function loadPreviewMode() { try { const m = localStorage.getItem("ttf-preview-mode"); return ["auto","webrtc","jpeg"].includes(m) ? m : "auto"; } catch { return "auto"; } }
+      function savePreviewMode(mode) { try { localStorage.setItem("ttf-preview-mode", mode); } catch {} }
+      function loadStatsOn() { try { return localStorage.getItem("ttf-preview-stats") === "1"; } catch { return false; } }
+      function saveStatsOn(on) { try { localStorage.setItem("ttf-preview-stats", on ? "1" : "0"); } catch {} }
       function saveQualityKey(key) { try { localStorage.setItem("ttf-preview-quality", key); } catch {} }
       function qualityOf(key) {
         const preset = QUALITY_PRESETS[key] || QUALITY_PRESETS.balanced;
@@ -869,7 +876,7 @@
         return { viewport, error, nudge, jump };
       }
 
-      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange }) {
+      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange, previewMode, onModeChange, getPc, onRtcStall }) {
         const { viewport, error: vpError, nudge, jump } = useViewportControl(project ? project.projectKey : null);
         const stageRef = useRef(null);
         const videoRef = useRef(null);
@@ -878,6 +885,11 @@
         // Off by default — the preview is view-only until somebody opts in,
         // and it needs the live stream (the agent is also the input path).
         const [control, setControl] = useState(false);
+        // Stats HUD is opt-in and costs nothing while off: the getStats poll
+        // only exists while the toggle is on AND the stream is live.
+        const [statsOn, setStatsOnState] = useState(loadStatsOn());
+        const [hud, setHud] = useState(null);
+        const prevStatsRef = useRef(null);
         const live = rtc && rtc.status === "live";
 
         useEffect(() => {
@@ -886,8 +898,68 @@
             video.srcObject = rtc.stream;
             video.play().catch(() => {});
           }
+          // Leaving the live stream must also drop the old srcObject, or the
+          // last decoded frame lingers as a ghost behind the JPEG fallback.
+          if (video && !live && video.srcObject) {
+            video.srcObject = null;
+            try { video.load(); } catch {}
+          }
         }, [rtc && rtc.stream, live]);
         useEffect(() => { if (!live && control) setControl(false); }, [live]);
+
+        // Media watchdog: ICE can connect while no media ever arrives (agent
+        // capture failed server-side). Cheap check on the video element only —
+        // no getStats — and it retires itself after the first decoded frame,
+        // so a genuinely static window can never false-trigger it.
+        useEffect(() => {
+          if (!live || !onRtcStall) return;
+          const startedAt = Date.now();
+          const timer = setInterval(() => {
+            const video = videoRef.current;
+            if (!video) return;
+            if (video.getVideoPlaybackQuality().totalVideoFrames > 0) { clearInterval(timer); return; }
+            if (Date.now() - startedAt > 8000) {
+              clearInterval(timer);
+              onRtcStall("연결은 됐지만 8초간 프레임이 오지 않음");
+            }
+          }, 2000);
+          return () => clearInterval(timer);
+        }, [live]);
+
+        // Stats poll — exists only while (statsOn && live).
+        useEffect(() => {
+          if (!statsOn || !live || !getPc) { setHud(null); prevStatsRef.current = null; return; }
+          const timer = setInterval(async () => {
+            const pc = getPc();
+            if (!pc) return;
+            try {
+              const stats = await pc.getStats();
+              let inbound = null, pair = null;
+              stats.forEach((s) => {
+                if (s.type === "inbound-rtp" && s.kind === "video") inbound = s;
+                if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") pair = s;
+              });
+              if (!inbound) return;
+              const now = performance.now();
+              const prev = prevStatsRef.current;
+              const dt = prev ? (now - prev.t) / 1000 : 0;
+              setHud({
+                fps: prev && dt > 0 ? (inbound.framesDecoded - prev.frames) / dt : null,
+                kbps: prev && dt > 0 ? ((inbound.bytesReceived - prev.bytes) * 8) / dt / 1000 : null,
+                rtt: pair && pair.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : null,
+                jb: prev && (inbound.jitterBufferEmittedCount || 0) > prev.jbc
+                  ? ((inbound.jitterBufferDelay - prev.jbd) / (inbound.jitterBufferEmittedCount - prev.jbc)) * 1000
+                  : null,
+                res: inbound.frameWidth ? inbound.frameWidth + "×" + inbound.frameHeight : null,
+                mb: inbound.bytesReceived / 1048576,
+                lost: inbound.packetsLost || 0,
+              });
+              prevStatsRef.current = { t: now, frames: inbound.framesDecoded, bytes: inbound.bytesReceived, jbd: inbound.jitterBufferDelay || 0, jbc: inbound.jitterBufferEmittedCount || 0 };
+            } catch {}
+          }, 1000);
+          return () => { clearInterval(timer); setHud(null); prevStatsRef.current = null; };
+        }, [statsOn, live]);
+        const setStatsOn = (on) => { setStatsOnState(on); saveStatsOn(on); };
 
         // Wheel must be a non-passive native listener: React's synthetic wheel
         // handler is passive, so preventDefault there would not stop the page
@@ -966,14 +1038,30 @@
 
         const modeBadge = live ? "LIVE · WebRTC"
           : rtc && rtc.status === "connecting" ? "connecting…"
-          : rtc && rtc.status === "fallback" ? "JPEG fallback"
+          : rtc && rtc.status === "failed" ? "WebRTC 실패"
+          : rtc && rtc.status === "fallback" ? "JPEG"
           : "Figma app window";
 
         return (
           <div className="preview-panel">
             <div className="preview-head">
               <strong>Live Figma preview · {project.name || "(untitled)"}</strong>
-              <span className={"badge" + (live ? " live-badge" : "")}>{modeBadge}</span>
+              <span className={"badge" + (live ? " live-badge" : "")} title={rtc && rtc.reason ? rtc.reason : undefined}>{modeBadge}</span>
+              <select
+                className="quality-select"
+                title="전송 방식 — Auto: WebRTC 우선, 실패 시 JPEG · 강제 선택 가능"
+                value={previewMode}
+                onChange={(e) => onModeChange && onModeChange(e.target.value)}
+              >
+                <option value="auto">Auto</option>
+                <option value="webrtc">WebRTC</option>
+                <option value="jpeg">JPEG</option>
+              </select>
+              <button
+                className={"ghost" + (statsOn ? " control-on" : "")}
+                title="fps·비트레이트·RTT·버퍼 지연 모니터링 — 꺼두면 폴링 자체가 없음"
+                onClick={() => setStatsOn(!statsOn)}
+              >Stats</button>
               {onClose && <button className="ghost" onClick={onClose}>Close preview</button>}
             </div>
             <div className="preview-controls">
@@ -1034,17 +1122,35 @@
                 playsInline
                 draggable={false}
               />
-              {!live && (preview?.url
+              {!live && rtc && rtc.status === "failed" && (
+                <span className="bad" style={{ textAlign: "center", padding: 16 }}>
+                  WebRTC 스트림 실패: {rtc.reason || "원인 미상"}<br />
+                  <span className="muted">위의 전송 방식에서 Auto 또는 JPEG로 전환할 수 있습니다.</span>
+                </span>
+              )}
+              {!live && (!rtc || rtc.status !== "failed") && (preview?.url
                 ? <img src={preview.url} alt={`Live preview of ${project.name || "Figma project"}`} draggable={false} />
                 : <span className={preview?.error ? "bad" : "muted"}>
                     {preview?.error || (rtc && rtc.status === "connecting" ? "Negotiating the live stream…" : "Waiting for the Figma plugin…")}
                   </span>)}
             </div>
-            {(preview?.meta || live) && (
+            {(preview?.meta || live || (rtc && rtc.reason)) && (
               <div className="preview-meta">
                 {live
                   ? `WebRTC · H.264 · ${(QUALITY_PRESETS[qualityKey] || QUALITY_PRESETS.balanced).label}`
-                  : `${preview.meta.pageName || "Current page"} · ${preview.meta.nodeName || "frame"} · ${preview.meta.source || "preview"} · ${preview.meta.width || "?"}×${preview.meta.height || "?"} · ${Math.round((preview.meta.byteLength || 0) / 1024)} KB`}
+                  : preview?.meta
+                    ? `${preview.meta.pageName || "Current page"} · ${preview.meta.nodeName || "frame"} · ${preview.meta.source || "preview"} · ${preview.meta.width || "?"}×${preview.meta.height || "?"} · ${Math.round((preview.meta.byteLength || 0) / 1024)} KB`
+                    : ""}
+                {!live && rtc && rtc.reason ? ` · ${rtc.reason}` : ""}
+                {live && statsOn && hud ? [
+                  hud.fps != null ? `${hud.fps.toFixed(1)}fps` : null,
+                  hud.kbps != null ? `${Math.round(hud.kbps)}kbps` : null,
+                  hud.rtt != null ? `RTT ${Math.round(hud.rtt)}ms` : null,
+                  hud.jb != null ? `버퍼 ${Math.round(hud.jb)}ms` : null,
+                  hud.res,
+                  `누적 ${hud.mb.toFixed(1)}MB`,
+                  hud.lost ? `손실 ${hud.lost}` : null,
+                ].filter(Boolean).map((t) => ` · ${t}`).join("") : ""}
                 {viewport ? ` · viewport ${Math.round(viewport.center.x)}, ${Math.round(viewport.center.y)} @ ${Math.round(viewport.zoom * 100)}%` : ""}
                 {control && live ? " · control: click = real click, right-click, \\ / Esc / arrows" : ""}
               </div>
@@ -2261,6 +2367,8 @@
         const [rtc, setRtc] = useState({ status: "off", stream: null });
         const [qualityKey, setQualityKey] = useState(loadQualityKey());
         const qualityKeyRef = useRef(qualityKey);
+        const [previewMode, setPreviewModeState] = useState(loadPreviewMode());
+        const previewModeRef = useRef(previewMode);
         const rtcRef = useRef(null); // { channel, pc, timer }
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
@@ -2285,10 +2393,49 @@
           }
           if (notifyRelay) wsSend({ type: "webrtc_stop" });
         };
-        const fallbackToJpeg = (channel) => {
+        // Every WebRTC failure funnels here with a human-readable reason. In
+        // auto mode it swaps to the JPEG frames; in forced-WebRTC mode it shows
+        // the failure instead (the user asked for WebRTC, so say why it died).
+        const handleRtcFailure = (channel, reason) => {
           stopRtc();
-          setRtc({ status: "fallback", stream: null });
-          wsSend({ type: "preview_subscribe", channel, mode: "app-window" });
+          if (previewModeRef.current === "webrtc") {
+            setRtc({ status: "failed", stream: null, reason });
+          } else {
+            setRtc({ status: "fallback", stream: null, reason });
+            wsSend({ type: "preview_subscribe", channel, mode: "app-window" });
+          }
+        };
+        // One entry point for "show this channel with the current mode" — the
+        // channel effect, the socket reconnect, and the mode switch all use it.
+        const applyPreview = (channel) => {
+          wsSend({ type: "preview_subscribe", channel: null, mode: "app-window" });
+          setPreview((previous) => {
+            if (previous?.url) URL.revokeObjectURL(previous.url);
+            return null;
+          });
+          if (!channel) {
+            stopRtc();
+            setRtc({ status: "off", stream: null });
+            return;
+          }
+          if (previewModeRef.current === "jpeg") {
+            stopRtc();
+            setRtc({ status: "fallback", stream: null, reason: "수동 JPEG 모드" });
+            wsSend({ type: "preview_subscribe", channel, mode: "app-window" });
+          } else {
+            startRtc(channel);
+          }
+        };
+        const changePreviewMode = (mode) => {
+          setPreviewModeState(mode);
+          previewModeRef.current = mode;
+          savePreviewMode(mode);
+          applyPreview(desiredPreviewChannelRef.current);
+        };
+        const getPc = () => (rtcRef.current && rtcRef.current.pc) || null;
+        const onRtcStall = (reason) => {
+          const current = rtcRef.current;
+          if (current) handleRtcFailure(current.channel, reason);
         };
         const startRtc = (channel) => {
           stopRtc();
@@ -2298,7 +2445,7 @@
             channel,
             pc: null,
             // ICE that has not connected in 10s is not going to; JPEG instead.
-            timer: setTimeout(() => fallbackToJpeg(channel), 10000),
+            timer: setTimeout(() => handleRtcFailure(channel, "협상이 10초 안에 끝나지 않음"), 10000),
           };
         };
         const changeQuality = (key) => {
@@ -2325,7 +2472,7 @@
               ws.send(JSON.stringify({ type: "monitor" }));
               if (desiredPreviewChannelRef.current) {
                 // The server-side peer died with the old socket; renegotiate.
-                startRtc(desiredPreviewChannelRef.current);
+                applyPreview(desiredPreviewChannelRef.current);
               }
             };
             ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 1500); };
@@ -2362,7 +2509,7 @@
                     clearTimeout(live.timer);
                     setRtc((previous) => ({ ...previous, status: "live" }));
                   } else if (state === "failed" || state === "disconnected") {
-                    fallbackToJpeg(live.channel);
+                    handleRtcFailure(live.channel, "ICE " + state);
                   }
                 };
                 (async () => {
@@ -2372,7 +2519,7 @@
                     await pc.setLocalDescription(answer);
                     wsSend({ type: "webrtc_answer", sdp: answer.sdp });
                   } catch (error) {
-                    fallbackToJpeg(msg.channel);
+                    handleRtcFailure(msg.channel, "SDP 협상 실패");
                   }
                 })();
                 return;
@@ -2384,7 +2531,15 @@
               }
               if (msg.type === "webrtc_error") {
                 const current = rtcRef.current;
-                if (current && current.channel === msg.channel) fallbackToJpeg(msg.channel);
+                if (current && (!msg.channel || current.channel === msg.channel)) handleRtcFailure(current.channel, msg.message || "서버 오류");
+                return;
+              }
+              if (msg.type === "webrtc_closed") {
+                // The relay closed our peer (agent died, capture failed). The
+                // browser's ICE layer takes tens of seconds to notice on its
+                // own — this is what un-sticks the LIVE-badge-over-black state.
+                const current = rtcRef.current;
+                if (current && (!msg.channel || current.channel === msg.channel)) handleRtcFailure(current.channel, "서버가 스트림을 종료함");
                 return;
               }
               if (msg.type === "webrtc_state") return; // relay-side ICE state, informational
@@ -2452,19 +2607,7 @@
           : null;
         desiredPreviewChannelRef.current = desiredPreviewChannel;
         useEffect(() => {
-          // Drop the JPEG subscription and any old peer, then try WebRTC for
-          // the new channel; JPEG comes back only as the fallback.
-          wsSend({ type: "preview_subscribe", channel: null, mode: "app-window" });
-          setPreview((previous) => {
-            if (previous?.url) URL.revokeObjectURL(previous.url);
-            return null;
-          });
-          if (desiredPreviewChannel) {
-            startRtc(desiredPreviewChannel);
-          } else {
-            stopRtc();
-            setRtc({ status: "off", stream: null });
-          }
+          applyPreview(desiredPreviewChannel);
         }, [desiredPreviewChannel]);
 
         const clear = () => { bufRef.current = []; queueRef.current = []; setVersion((v) => v + 1); };
@@ -2521,7 +2664,7 @@
                     <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); }} onClearEmpty={clearEmpty} />
                   </div>
                   <div className="logwrap">
-                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} onClose={() => setSelectedProject(null)} />
+                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} onClose={() => setSelectedProject(null)} />
                     <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
                   </div>
                 </>
@@ -2533,7 +2676,7 @@
                   </div>
                   <div className="nav-main">
                     {navProject
-                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} />
+                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} />
                       : <div className="nav-placeholder">
                           No live plugin for this project — the preview mirrors the Figma app window.<br />
                           Open the file in Figma and run the Talk-to-Figma plugin; browsing the index still works.
