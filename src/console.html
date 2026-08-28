@@ -998,6 +998,14 @@
             const pc = getPc();
             if (!pc) return;
             try {
+              // Re-assert the low playout delay every tick. Chrome resets the
+              // hint on its own when it re-evaluates the jitter buffer, and a
+              // single set at ontrack drifted back to ~200ms within a minute
+              // (measured); re-applying is idempotent and costs nothing.
+              for (const receiver of pc.getReceivers()) {
+                if ("playoutDelayHint" in receiver && receiver.playoutDelayHint !== 0) receiver.playoutDelayHint = 0;
+                if ("jitterBufferTarget" in receiver && receiver.jitterBufferTarget !== 0) receiver.jitterBufferTarget = 0;
+              }
               const stats = await pc.getStats();
               let inbound = null, pair = null;
               stats.forEach((s) => {
