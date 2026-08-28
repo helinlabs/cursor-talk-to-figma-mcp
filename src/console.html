@@ -851,7 +851,10 @@
       }
       // <<< viewport-poll-policy
 
-      function useViewportControl(projectKey) {
+      // sendOverPeer: (params) => Promise<{ok,result,error}> | null. Returning
+      // null means the P2P control channel is not up, so the caller falls back
+      // to the tunnel POST.
+      function useViewportControl(projectKey, sendOverPeer) {
         const [viewport, setViewport] = useState(null);
         const [error, setError] = useState(null);
         const inflight = useRef(false);
@@ -885,11 +888,16 @@
           pending.current = null;
           inflight.current = true;
           try {
-            const { ok, status, data } = await fetchRelayJson(relayApiUrl("navigator/viewport"), {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ project: projectKey, ...body }),
-            });
+            // P2P first: a drag serialised through the tunnel is capped at
+            // ~10 updates/sec by its RTT; the peer link is an order faster.
+            const viaPeer = sendOverPeer ? sendOverPeer(body) : null;
+            const { ok, status, data } = viaPeer
+              ? await viaPeer.then((r) => ({ ok: !!r.ok, status: r.ok ? 200 : 502, data: r.ok ? { result: r.result } : { error: r.error } }))
+              : await fetchRelayJson(relayApiUrl("navigator/viewport"), {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ project: projectKey, ...body }),
+                });
             if (!ok) setError(data.error || `HTTP ${status}`);
             // Render what Figma actually did — it clamps the zoom and snaps
             // the center, so an optimistic guess would drift out of sync.
@@ -941,8 +949,8 @@
         return { viewport, error, nudge, jump };
       }
 
-      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange, previewMode, onModeChange, getPc, onRtcStall, inputNotice, agentTcc }) {
-        const { viewport, error: vpError, nudge, jump } = useViewportControl(project ? project.projectKey : null);
+      function PreviewPanel({ project, preview, rtc, onClose, onInput, qualityKey, onQualityChange, previewMode, onModeChange, getPc, onRtcStall, inputNotice, agentTcc, viewportOverPeer }) {
+        const { viewport, error: vpError, nudge, jump } = useViewportControl(project ? project.projectKey : null, viewportOverPeer);
         const stageRef = useRef(null);
         const videoRef = useRef(null);
         const drag = useRef(null);
@@ -2456,7 +2464,9 @@
         const [inputNotice, setInputNotice] = useState(null); // last failed input, transient
         const inputNoticeTimer = useRef(null);
         const [agentTcc, setAgentTcc] = useState(null);       // capture machine's TCC verdicts
-        const rtcRef = useRef(null); // { channel, pc, timer }
+        const rtcRef = useRef(null); // { channel, pc, timer, control }
+        const controlPending = useRef(new Map()); // id -> resolve
+        const controlSeq = useRef(0);
         const seqRef = useRef(0);
         const monitorRef = useRef(null); // live monitor socket, for sending actions
         const desiredPreviewChannelRef = useRef(null);
@@ -2478,7 +2488,32 @@
             clearTimeout(current.timer);
             try { current.pc && current.pc.close(); } catch {}
           }
+          // Nobody is coming back to these promises.
+          for (const resolve of controlPending.current.values()) resolve({ ok: false, error: "stream closed" });
+          controlPending.current.clear();
           if (notifyRelay) wsSend({ type: "webrtc_stop" });
+        };
+        // Send over the P2P control channel when it is open. Returns null when
+        // it is not, so callers fall back to the tunnel path rather than
+        // silently dropping the gesture.
+        const controlRequest = (payload) => {
+          const current = rtcRef.current;
+          const channel = current && current.control;
+          if (!channel || channel.readyState !== "open") return null;
+          const id = ++controlSeq.current;
+          return new Promise((resolve) => {
+            controlPending.current.set(id, resolve);
+            // A reply that never arrives must not wedge the caller's queue.
+            setTimeout(() => {
+              if (controlPending.current.delete(id)) resolve({ ok: false, error: "control channel timeout" });
+            }, 5000);
+            try {
+              channel.send(JSON.stringify({ id, ...payload }));
+            } catch (error) {
+              controlPending.current.delete(id);
+              resolve({ ok: false, error: String(error) });
+            }
+          });
         };
         // Every WebRTC failure funnels here with a human-readable reason. In
         // auto mode it swaps to the JPEG frames; in forced-WebRTC mode it shows
@@ -2527,6 +2562,7 @@
           applyPreview(desiredPreviewChannelRef.current);
         };
         const getPc = () => (rtcRef.current && rtcRef.current.pc) || null;
+        const viewportOverPeer = (params) => controlRequest({ type: "viewport", command: "set_viewport", params });
         const onRtcStall = (reason) => {
           const current = rtcRef.current;
           if (current) handleRtcFailure(current.channel, reason);
@@ -2551,7 +2587,9 @@
         };
         const sendPreviewInput = (input) => {
           const channel = desiredPreviewChannelRef.current;
-          if (channel) wsSend({ type: "preview_input", channel, input });
+          if (!channel) return;
+          if (controlRequest({ type: "input", input })) return;   // P2P path
+          wsSend({ type: "preview_input", channel, input });      // tunnel fallback
         };
 
         useEffect(() => {
@@ -2599,6 +2637,17 @@
                     if (receiver && "jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
                   } catch {}
                   setRtc((previous) => ({ ...previous, stream }));
+                };
+                pc.ondatachannel = (e) => {
+                  if (e.channel.label !== "control") return;
+                  const live = rtcRef.current;
+                  if (live && live.pc === pc) live.control = e.channel;
+                  e.channel.onmessage = (event) => {
+                    let msg;
+                    try { msg = JSON.parse(event.data); } catch { return; }
+                    const resolve = controlPending.current.get(msg.id);
+                    if (resolve) { controlPending.current.delete(msg.id); resolve(msg); }
+                  };
                 };
                 pc.onicecandidate = (e) => {
                   if (e.candidate) wsSend({ type: "webrtc_ice", candidate: e.candidate.toJSON() });
@@ -2784,7 +2833,7 @@
                     <Channels channels={channels} onPick={(ch) => { setSelectedProject(null); setFilter(ch); }} onClearEmpty={clearEmpty} />
                   </div>
                   <div className="logwrap">
-                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} inputNotice={inputNotice} agentTcc={agentTcc} onClose={() => setSelectedProject(null)} />
+                    <PreviewPanel project={selectedProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} inputNotice={inputNotice} agentTcc={agentTcc} viewportOverPeer={viewportOverPeer} onClose={() => setSelectedProject(null)} />
                     <LogPanel getEvents={getEvents} version={version} filter={filter} setFilter={setFilter} />
                   </div>
                 </>
@@ -2796,7 +2845,7 @@
                   </div>
                   <div className="nav-main">
                     {navProject
-                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} inputNotice={inputNotice} agentTcc={agentTcc} />
+                      ? <PreviewPanel project={navProject} preview={preview} rtc={rtc} qualityKey={qualityKey} onQualityChange={changeQuality} onInput={sendPreviewInput} previewMode={previewMode} onModeChange={changePreviewMode} getPc={getPc} onRtcStall={onRtcStall} inputNotice={inputNotice} agentTcc={agentTcc} viewportOverPeer={viewportOverPeer} />
                       : <div className="nav-placeholder">
                           No live plugin for this project — the preview mirrors the Figma app window.<br />
                           Open the file in Figma and run the Talk-to-Figma plugin; browsing the index still works.

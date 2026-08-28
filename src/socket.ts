@@ -153,7 +153,8 @@ const previewSubscriptions = new Map<ServerWebSocket<any>, PreviewSubscription>(
 // the document name the plugin announced — the same identity the JPEG capture
 // path uses.
 const previewStreams = new PreviewStreamManager(
-  (channel) => channelDocs.get(channel)?.documentName
+  (channel) => channelDocs.get(channel)?.documentName,
+  (channel, command, params) => sendInternalCommand(channel, command, params, 15_000),
 );
 warmAgentBinary();
 let localPreviewTimer: ReturnType<typeof setInterval> | null = null;
