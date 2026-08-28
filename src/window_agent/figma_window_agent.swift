@@ -354,12 +354,16 @@ func postKey(in window: TargetWindow, key: String, modifiers: [String]) -> Bool 
     guard let live = findWindow(match: nil, windowId: window.id), let app = inputSession.begin() else { return false }
     defer { inputSession.end() }
     raiseWindow(app, live)
+    // Clicks carry a screen point and land wherever that point is; KEYS go to
+    // whatever app is frontmost. Measured on the fleet: clicks worked while
+    // keys silently went to another app because Figma was never actually
+    // activated. Verify frontmost right before posting and report honestly.
+    guard app.isActive else { return false }
     let flags = modifierFlags(modifiers)
     guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
           let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return false }
     down.flags = flags
     up.flags = flags
-    _ = app   // frontmost is what routes the key; the pid target proved useless
     down.post(tap: .cghidEventTap)
     usleep(20_000)
     up.post(tap: .cghidEventTap)
@@ -498,7 +502,9 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(config.fps))
         configuration.showsCursor = config.showsCursor
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        configuration.queueDepth = 5
+        // A deep queue trades latency for resilience; 3 is enough to absorb a
+        // hiccup without adding visible lag to an interactive stream.
+        configuration.queueDepth = 3
 
         let filter = SCContentFilter(desktopIndependentWindow: scWindow)
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
@@ -674,6 +680,10 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: config.bitrate))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: config.fps))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: 4))
+        // Emit each frame as soon as it is encoded instead of letting the
+        // encoder hold a lookahead window — a screen share is judged on how
+        // fast a drag shows up, not on rate-control smoothness.
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 1))
         // A hard cap the encoder must not exceed even on a full-screen redraw,
         // so one scroll cannot blow out the viewer's link.
         let ceiling = [NSNumber(value: config.bitrate * 2 / 8), NSNumber(value: 1.0)] as CFArray
@@ -880,7 +890,7 @@ func handle(_ line: String) async {
             }
             let ok = postKey(in: window, key: key, modifiers: object["modifiers"] as? [String] ?? [])
             emitEvent(["event": "key", "ok": ok, "key": key,
-                       "reason": ok ? "" : "Figma를 전면으로 가져오지 못했거나(백그라운드 컨텍스트) 창을 찾지 못했습니다"])
+                       "reason": ok ? "" : "키는 최전면 앱으로만 전달됩니다 — Figma를 전면으로 가져오지 못했습니다(클릭은 좌표로 가므로 계속 동작합니다)"])
         case "keyframe":
             streamer.requestKeyframe()
         case "ping":

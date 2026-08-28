@@ -1012,6 +1012,19 @@
                 fps: prev && dt > 0 ? (inbound.framesDecoded - prev.frames) / dt : null,
                 kbps: prev && dt > 0 ? ((inbound.bytesReceived - prev.bytes) * 8) / dt / 1000 : null,
                 rtt: pair && pair.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : null,
+                // What the operator actually feels: capture → on screen. The
+                // network leg is half the RTT; the rest is the receiver's
+                // jitter buffer plus decode, both reported per frame by
+                // getStats. RTT alone hid the buffer, which dominates.
+                glassToGlass: (() => {
+                  const network = pair && pair.currentRoundTripTime != null ? (pair.currentRoundTripTime * 1000) / 2 : 0;
+                  const emitted = inbound.jitterBufferEmittedCount || 0;
+                  const buffer = prev && emitted > prev.jbc
+                    ? ((inbound.jitterBufferDelay - prev.jbd) / (emitted - prev.jbc)) * 1000 : 0;
+                  const decode = prev && inbound.framesDecoded > prev.frames
+                    ? ((inbound.totalDecodeTime - prev.decode) / (inbound.framesDecoded - prev.frames)) * 1000 : 0;
+                  return network + buffer + decode;
+                })(),
                 jb: prev && (inbound.jitterBufferEmittedCount || 0) > prev.jbc
                   ? ((inbound.jitterBufferDelay - prev.jbd) / (inbound.jitterBufferEmittedCount - prev.jbc)) * 1000
                   : null,
@@ -1019,7 +1032,7 @@
                 mb: inbound.bytesReceived / 1048576,
                 lost: inbound.packetsLost || 0,
               });
-              prevStatsRef.current = { t: now, frames: inbound.framesDecoded, bytes: inbound.bytesReceived, jbd: inbound.jitterBufferDelay || 0, jbc: inbound.jitterBufferEmittedCount || 0 };
+              prevStatsRef.current = { t: now, frames: inbound.framesDecoded, bytes: inbound.bytesReceived, jbd: inbound.jitterBufferDelay || 0, jbc: inbound.jitterBufferEmittedCount || 0, decode: inbound.totalDecodeTime || 0 };
             } catch {}
           }, 1000);
           return () => { clearInterval(timer); setHud(null); prevStatsRef.current = null; };
@@ -1221,6 +1234,7 @@
                 {live && statsOn && hud ? [
                   hud.fps != null ? `${hud.fps.toFixed(1)}fps` : null,
                   hud.kbps != null ? `${Math.round(hud.kbps)}kbps` : null,
+                  hud.glassToGlass ? `지연 ${Math.round(hud.glassToGlass)}ms` : null,
                   hud.rtt != null ? `RTT ${Math.round(hud.rtt)}ms` : null,
                   hud.jb != null ? `버퍼 ${Math.round(hud.jb)}ms` : null,
                   hud.res,
@@ -2568,6 +2582,14 @@
                 current.pc = pc;
                 pc.ontrack = (e) => {
                   const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+                  // Chrome buffers ~hundreds of ms by default for smoothness.
+                  // This is a screen share, not a movie: ask for the smallest
+                  // playout delay so the picture tracks the operator's input.
+                  try {
+                    const receiver = pc.getReceivers().find((r) => r.track === e.track);
+                    if (receiver && "playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;
+                    if (receiver && "jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
+                  } catch {}
                   setRtc((previous) => ({ ...previous, stream }));
                 };
                 pc.onicecandidate = (e) => {
