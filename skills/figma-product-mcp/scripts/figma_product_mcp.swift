@@ -507,6 +507,40 @@ func pluginsMenuIsUp(_ appElement: AXUIElement) -> Bool {
     menuBarItem(appElement, named: "Plugins") != nil
 }
 
+// A Figma window whose renderer has crashed keeps its title, its position and
+// its shell web area, so every check the launcher makes looks reasonable right
+// up to the plugin handshake — which then times out. That is exactly how two
+// projects sat offline for hours today: `connect_timeout` was reported and the
+// run stopped, because re-running the plugin cannot help a window that has no
+// document to run it in. What is actually on screen is Figma's "Something went
+// wrong" page with a Reload button, and pressing it brings the document back.
+func rendererIsUp(_ window: AXUIElement) -> Bool {
+    descendants(window).contains { element in
+        role(element) == "AXWebArea" && axText(element).localizedCaseInsensitiveContains("\u{2013} Figma")
+    }
+}
+
+func reloadCrashedRenderer(
+    _ app: NSRunningApplication,
+    appElement: AXUIElement,
+    window: AXUIElement,
+    timeout: TimeInterval
+) -> Bool {
+    if rendererIsUp(window) { return true }
+    guard let reload = descendants(window).first(where: {
+        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
+    }) else { return false }
+    // Raise only this window. The other projects hold live plugin channels and
+    // a repair of one of them must not disturb the rest.
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+    app.activate(options: [.activateAllWindows])
+    _ = waitUntil(timeout: 2) { (axValue(window, kAXMainAttribute as CFString) as? Bool) ?? false }
+    if !press(reload), !leftClick(reload) { return false }
+    return waitUntil(timeout: timeout) { rendererIsUp(window) }
+}
+
 func focusWindow(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> Bool {
     // 1. The cheap way: ask AX and the workspace.
     _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
@@ -722,6 +756,21 @@ do {
                 results[index].status = "window_missing"
                 results[index].detail = "Project window disappeared before plugin launch"
                 continue
+            }
+            // Put a crashed renderer back before judging anything else, or the
+            // run reports a plugin timeout for a window that never had a
+            // document to begin with.
+            if !rendererIsUp(window) {
+                if reloadCrashedRenderer(app, appElement: root, window: window, timeout: options.timeout) {
+                    // The reload replaces the renderer, so any channel this
+                    // project held is gone — re-read before deciding.
+                    snapshot = fetchRelaySnapshot(baseURL: options.relayURL) ?? snapshot
+                } else {
+                    results[index].status = "plugin_failed"
+                    results[index].step = "renderer_crashed"
+                    results[index].detail = "Window's renderer had crashed and Reload did not bring the document back"
+                    continue
+                }
             }
             // Already connected AND running the relay's own version: leave it
             // alone (re-running would drop a healthy channel). A stale plugin is

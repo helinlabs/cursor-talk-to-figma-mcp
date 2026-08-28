@@ -36,6 +36,7 @@ Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and
 | `plugins_menu_missing` | Figma's menu bar had no **Plugins** menu. Figma rewrites the menu bar per key window and a **file-browser (Recents) window has no Plugins menu at all** — the report's `menuBar` field shows what was there instead. |
 | `plugins_menu_press` / `plugin_menu_item_press` | The menu item was found but would not activate. |
 | `plugin_menu_item_missing` | `Cursor MCP Plugin` is not under `Plugins > Development` in that window. |
+| `renderer_crashed` | The window's Figma renderer had crashed (title and shell intact, but the document replaced by a "Something went wrong" page) and the launcher's Reload click did not bring it back. The launcher repairs this automatically before touching the plugin, so seeing it means the reload itself failed. |
 | `connect_timeout` | The plugin ran, but the relay never reported it connected — or it reconnected still speaking the old version, meaning Figma reloaded stale `code.js`. |
 
 Exit codes: `0` everything connected · `1` one or more projects failed (read the report) · `2` usage / config / Accessibility problem · `70` unexpected error.
