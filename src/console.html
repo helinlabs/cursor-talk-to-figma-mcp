@@ -297,7 +297,7 @@
       // SyntaxError in the UI (operator-reported). Every relay fetch goes
       // through this: JSON when it is JSON, a readable message when not.
       async function fetchRelayJson(url, options) {
-        const { ok: rOk, status: rStatus, data } = await fetchRelayJson(url, options);
+        const r = await fetch(url, options);
         const text = await r.text();
         try {
           return { ok: r.ok, status: r.status, data: JSON.parse(text) };
