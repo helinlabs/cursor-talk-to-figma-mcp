@@ -255,9 +255,15 @@ final class InputSession {
                 // From a launchd background context NSRunningApplication.activate
                 // is simply ignored (no foreground rights), which is exactly the
                 // relay's situation on the fleet — measured: ok:true posts with
-                // zero effect. The Accessibility route works from anywhere.
+                // zero effect. Climb the ladder until one activation sticks.
                 let appElement = AXUIElementCreateApplication(app.processIdentifier)
                 AXUIElementSetAttributeValue(appElement, "AXFrontmost" as CFString, kCFBooleanTrue)
+                for _ in 0..<25 where !app.isActive { usleep(20_000) }
+            }
+            if !app.isActive {
+                // Apple Events reach the app's own activation path and work
+                // from daemons (TCC Automation prompt appears once on-screen).
+                NSAppleScript(source: "tell application \"Figma\" to activate")?.executeAndReturnError(nil)
                 for _ in 0..<25 where !app.isActive { usleep(20_000) }
             }
             guard app.isActive else { return nil }
