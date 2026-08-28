@@ -201,9 +201,12 @@ class ViewerPeer {
   readonly pc: RTCPeerConnection;
   readonly track: MediaStreamTrack;
   private readonly sequencer = new RtpSequencer();
+  private readonly control: any;
   private closed = false;
   onNeedKeyframe: (() => void) | null = null;
   onClosed: (() => void) | null = null;
+  // Viewport gestures and input arriving over the peer instead of the tunnel.
+  onControl: ((message: any, reply: (payload: any) => void) => void) | null = null;
   // Until the first keyframe goes out, P-frames reference pictures the viewer
   // never saw — drop them instead of feeding the decoder garbage.
   private sentKeyframe = false;
@@ -226,6 +229,16 @@ class ViewerPeer {
       },
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
+    // Control channel on the SAME peer as the video. Viewport drags used to
+    // go out as one HTTP POST per gesture through the nexus tunnel, and the
+    // console serialises them one-in-flight — at the tunnel's 34-150ms RTT
+    // that caps a drag at ~10 updates/sec and feels steppy. This path is the
+    // already-established P2P link (measured 15ms on the same LAN), and it
+    // inherits the peer's DTLS plus the signaling channel's auth.
+    this.control = this.pc.createDataChannel("control", { ordered: true });
+    this.control.onMessage?.subscribe((data: any) => this.handleControl(data));
+    this.control.message?.subscribe?.((data: any) => this.handleControl(data));
+
     this.track = new MediaStreamTrack({ kind: "video" });
     const transceiver = this.pc.addTransceiver(this.track, { direction: "sendonly" });
     transceiver.sender.onRtcp.subscribe((rtcp: any) => {
@@ -238,6 +251,24 @@ class ViewerPeer {
     this.pc.iceConnectionStateChange.subscribe((state: string) => {
       this.signal({ type: "webrtc_state", state });
       if (state === "failed" || state === "closed" || state === "disconnected") this.close();
+    });
+  }
+
+  private handleControl(data: any): void {
+    let message: any;
+    try {
+      message = JSON.parse(typeof data === "string" ? data : Buffer.from(data).toString("utf8"));
+    } catch {
+      return;
+    }
+    // Every request carries an id so the console can resolve its promise; a
+    // reply that cannot be sent (channel closing) is dropped, not thrown.
+    this.onControl?.(message, (payload) => {
+      try {
+        if (this.control?.readyState === "open") {
+          this.control.send(JSON.stringify({ id: message.id, ...payload }));
+        }
+      } catch {}
     });
   }
 
@@ -322,7 +353,12 @@ export class PreviewStreamManager {
   // Last agent stopped per channel — a successor awaits its exit first.
   private stopping = new Map<string, Promise<void>>();
 
-  constructor(private readonly windowMatchForChannel: (channel: string) => string | undefined) {}
+  constructor(
+    private readonly windowMatchForChannel: (channel: string) => string | undefined,
+    // Forwards a command to the channel's Figma plugin (the relay owns that
+    // socket); used for viewport gestures arriving over the control channel.
+    private readonly sendPluginCommand?: (channel: string, command: string, params: any) => Promise<any>,
+  ) {}
 
   private streamFor(channel: string): ChannelStream {
     let stream = this.streams.get(channel);
@@ -406,6 +442,20 @@ export class PreviewStreamManager {
         }, AGENT_LINGER_MS);
         (stream.lingerTimer as any).unref?.();
       }
+    };
+    peer.onControl = (message, reply) => {
+      if (message?.type === "viewport") {
+        if (!this.sendPluginCommand) { reply({ ok: false, error: "viewport bridge unavailable" }); return; }
+        this.sendPluginCommand(channel, message.command || "set_viewport", message.params || {})
+          .then((result) => reply({ ok: true, result }))
+          .catch((error) => reply({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+        return;
+      }
+      if (message?.type === "input") {
+        reply({ ok: this.sendInput(channel, message.input || {}) });
+        return;
+      }
+      reply({ ok: false, error: `unknown control message: ${message?.type}` });
     };
     stream.peers.add(peer);
     stream.signals.set(peer, signal);
