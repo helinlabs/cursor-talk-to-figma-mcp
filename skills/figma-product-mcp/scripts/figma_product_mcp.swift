@@ -162,15 +162,29 @@ func axText(_ element: AXUIElement) -> String {
         .joined(separator: " ")
 }
 
+// Identity for an AXUIElement. `CFHash` alone is NOT one: on this Figma build
+// the values are dense enough that unrelated elements collide, so a raw
+// `Set<CFHashCode>` visited-set drops the colliding element AND its whole
+// subtree. Measured with all seven product files open, a CA_Product AXButton
+// and the menu bar's `Plugins` AXMenu both hash to 1768949919 — the Plugins
+// submenu was popped as "already seen", `Development > Cursor MCP Plugin`
+// never entered the traversal, and every activation failed
+// `plugin_menu_item_missing` while the item was plainly in the menu. Hash the
+// same way but settle ties with `CFEqual`: the cycle guard still holds and the
+// false drops stop.
+struct ElementKey: Hashable {
+    let element: AXUIElement
+    static func == (lhs: ElementKey, rhs: ElementKey) -> Bool { CFEqual(lhs.element, rhs.element) }
+    func hash(into hasher: inout Hasher) { hasher.combine(CFHash(element)) }
+}
+
 func descendants(_ root: AXUIElement, maxDepth: Int = 22) -> [AXUIElement] {
     var output: [AXUIElement] = []
     var queue: [(AXUIElement, Int)] = [(root, 0)]
-    var seen = Set<CFHashCode>()
+    var seen = Set<ElementKey>()
     while !queue.isEmpty {
         let (element, depth) = queue.removeFirst()
-        let key = CFHash(element)
-        if seen.contains(key) { continue }
-        seen.insert(key)
+        if !seen.insert(ElementKey(element: element)).inserted { continue }
         output.append(element)
         if depth < maxDepth {
             queue.append(contentsOf: axChildren(element).map { ($0, depth + 1) })
@@ -391,7 +405,7 @@ func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredP
     }
     return waitUntil(timeout: timeout) {
         guard let newProjectWindow = projectWindow(appElement, project: project) else { return false }
-        return CFHash(newProjectWindow) != CFHash(originalWindow)
+        return !CFEqual(newProjectWindow, originalWindow)
     }
 }
 
@@ -577,7 +591,7 @@ func focusWindow(_ app: NSRunningApplication, appElement: AXUIElement, project: 
     // 3. Click the project's own tab inside that window — a real mouse event,
     //    which Figma cannot ignore. Selecting a tab it already shows is a no-op
     //    for the document.
-    if let (tabWindow, tab) = projectTab(appElement, project: project), CFHash(tabWindow) == CFHash(window), leftClick(tab) {
+    if let (tabWindow, tab) = projectTab(appElement, project: project), CFEqual(tabWindow, window), leftClick(tab) {
         if waitUntil(timeout: min(timeout, 6), { pluginsMenuIsUp(appElement) }) { return true }
     }
     return false
