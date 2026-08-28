@@ -157,6 +157,24 @@ let allowedKeys: [String: CGKeyCode] = [
     "n": 0x2D,           // shift+N zoom to fit selection in some builds
 ]
 
+// AXIsProcessTrusted alone never puts the process in the System Settings
+// list — CGEvent posting raises no prompt, so the operator had nothing to
+// toggle. The prompting variant REGISTERS the responsible process in
+// Accessibility (off) and shows the dialog when a GUI session is present;
+// after that, enabling input is one toggle instead of a manual "+" hunt.
+private var axPromptRequested = false
+func axTrustedOrRegister() -> Bool {
+    if AXIsProcessTrusted() { return true }
+    if !axPromptRequested {
+        axPromptRequested = true
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        DispatchQueue.global().async {
+            _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+        }
+    }
+    return false
+}
+
 func modifierFlags(_ names: [String]) -> CGEventFlags {
     var flags = CGEventFlags()
     for name in names {
@@ -343,6 +361,15 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastPresentationSeconds: Double = 0
     private var idleTimer: DispatchSourceTimer?
     private var idleRefreshDone = false
+    // Content fingerprint of the last frame. "No frames" is NOT a usable idle
+    // signal in practice: a connected-plugin badge or any 1px blink keeps
+    // SCStream delivering at full rate, so the low-bitrate encoder re-grinds
+    // an unchanged screen forever — the viewer sees quantization noise
+    // shimmering instead of a stable sharp image (operator-reported). Idle is
+    // therefore judged on the pixels themselves, and unchanged frames are not
+    // encoded at all: one boosted IDR, then silence until something changes.
+    private var lastFingerprint: [UInt64] = []
+    private var stillStreak = 0
     // Window geometry poll: the capture resolution is fixed at start, so a
     // resized window would otherwise stream stretched or letterboxed forever.
     private var resizeTimer: DispatchSourceTimer?
@@ -467,6 +494,8 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func performIdleRefresh() {
         guard !idleRefreshDone, let session, let pixelBuffer = lastPixelBuffer else { return }
         idleRefreshDone = true
+        idleTimer?.cancel()
+        idleTimer = nil
         // Boost, re-encode the held frame once as an IDR, restore. RealTime
         // encoders honor bitrate changes mid-session.
         let boostedBitrate = min(20_000_000, config.bitrate * 6)
@@ -536,7 +565,39 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             sentParameterSets = false
             forceKeyframe = true
             ptsOrigin = nil
+            lastFingerprint = []
+            stillStreak = 0
         }
+    }
+
+    // Coarse content fingerprint: 64 sampled rows summed in 8 column bands.
+    // Catches any visible change (a moved cursor included) while costing a few
+    // hundred microseconds; exactness does not matter, only change detection.
+    private static func fingerprint(of pixelBuffer: CVPixelBuffer) -> [UInt64] {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return [] }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        var bands = [UInt64](repeating: 0, count: 8)
+        let rowStep = max(1, height / 64)
+        let colStep = max(1, width / 128)
+        var row = 0
+        while row < height {
+            let rowBase = row * stride
+            var col = 0
+            while col < width {
+                let px = rowBase + col * 4
+                // Sum B+G+R of the sampled pixel into its column band.
+                let value = UInt64(bytes[px]) + UInt64(bytes[px + 1]) + UInt64(bytes[px + 2])
+                bands[min(7, col * 8 / width)] &+= value
+                col += colStep
+            }
+            row += rowStep
+        }
+        return bands
     }
 
     private func makeEncoder(width: Int, height: Int) throws {
@@ -579,7 +640,27 @@ final class WindowStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         lastPixelBuffer = pixelBuffer
         lastPresentationSeconds = CMTimeGetSeconds(presentationTime)
-        armIdleRefresh()
+
+        // Content-based idle: compare a coarse fingerprint against the last
+        // frame. Unchanged content is not re-encoded — after a short still
+        // streak one boosted IDR goes out and then nothing, which is both the
+        // sharp static picture and zero bandwidth. Any real change resumes
+        // normal encoding on the very next frame.
+        let fingerprint = Self.fingerprint(of: pixelBuffer)
+        let changed = fingerprint != lastFingerprint || lastFingerprint.isEmpty
+        lastFingerprint = fingerprint
+        if changed {
+            stillStreak = 0
+            idleRefreshDone = false
+            armIdleRefresh()
+        } else {
+            stillStreak += 1
+            // ~1.2s of identical frames at the configured rate → refresh once.
+            if !idleRefreshDone && stillStreak >= max(2, Int(Double(config.fps) * 1.2)) {
+                performIdleRefresh()
+            }
+            return   // identical content: nothing worth paying to encode
+        }
         var properties: CFDictionary?
         if forceKeyframe {
             properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
@@ -721,7 +802,7 @@ func handle(_ line: String) async {
             // Posting events without the Accessibility grant fails SILENTLY —
             // post() returns as if it worked and nothing happens on screen.
             // Name the cause instead of letting the click vanish.
-            guard AXIsProcessTrusted() else {
+            guard axTrustedOrRegister() else {
                 emitEvent(["event": "click", "ok": false,
                            "reason": "손쉬운 사용(Accessibility) 권한이 없어 입력을 보낼 수 없습니다 — 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 릴레이 런타임을 허용하세요"])
                 return
@@ -737,7 +818,7 @@ func handle(_ line: String) async {
                 emitEvent(["event": "key", "ok": false, "reason": "no target window"])
                 return
             }
-            guard AXIsProcessTrusted() else {
+            guard axTrustedOrRegister() else {
                 emitEvent(["event": "key", "ok": false, "key": key,
                            "reason": "손쉬운 사용(Accessibility) 권한이 없어 입력을 보낼 수 없습니다 — 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 릴레이 런타임을 허용하세요"])
                 return
