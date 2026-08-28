@@ -216,8 +216,36 @@ func launchFigmaIfNeeded(timeout: TimeInterval) throws -> NSRunningApplication {
     return app
 }
 
+// ---------------------------------------------------------------------------
+// Electron renderer accessibility.
+//
+// Figma is Electron, and Chromium leaves its renderer accessibility tree empty
+// until an assistive client asks for it. Unasked, the Figma app element exposes
+// only the native shell — the window plus a dozen AXGroups — with no tab strip
+// and no web area, so projectTab() finds no tab for any project and every
+// project is reported "separation_failed". Chromium resets this per process, so
+// a plain Figma restart is enough to silently break an otherwise healthy
+// launcher. AXManualAccessibility is Chromium's documented opt-in switch:
+// setting it is idempotent and it stays on for the life of the Figma process.
+// The tree then populates asynchronously, so wait for a web area before
+// walking anything that depends on it.
+// ---------------------------------------------------------------------------
 func appAX(_ app: NSRunningApplication) -> AXUIElement {
-    AXUIElementCreateApplication(app.processIdentifier)
+    let element = AXUIElementCreateApplication(app.processIdentifier)
+    _ = AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    return element
+}
+
+func rendererAccessibilityReady(_ appElement: AXUIElement) -> Bool {
+    windows(appElement).contains { window in
+        descendants(window).contains { role($0) == "AXWebArea" }
+    }
+}
+
+func enableRendererAccessibility(_ appElement: AXUIElement, timeout: TimeInterval) -> Bool {
+    if rendererAccessibilityReady(appElement) { return true }
+    _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    return waitUntil(timeout: timeout) { rendererAccessibilityReady(appElement) }
 }
 
 func windows(_ appElement: AXUIElement) -> [AXUIElement] {
@@ -308,6 +336,23 @@ func menuItem(_ appElement: AXUIElement, where matches: (AXUIElement) -> Bool) -
     }
 }
 
+// Look inside ONE menu item's own submenu instead of the whole app.
+//
+// Menu item titles are not unique across Figma's menu tree, so an app-wide
+// lookup silently resolves to the wrong item. "New Window" is the case that
+// bites: the tab context menu's "Move to Another Window >" submenu has one,
+// and so does the menu bar's File menu. The app-wide search finds the File
+// one first — it exists whether or not any menu is open — so the launcher
+// pressed File > New Window, which opens an empty window and leaves the tab
+// exactly where it was. That reads downstream as "separation_failed" and
+// litters a stray "Recents" window on every attempt.
+func submenuItem(_ parent: AXUIElement, named title: String) -> AXUIElement? {
+    axChildren(parent)
+        .filter { role($0) == (kAXMenuRole as String) }
+        .flatMap { axChildren($0) }
+        .first { role($0) == (kAXMenuItemRole as String) && axText($0) == title }
+}
+
 func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
     guard let (originalWindow, tab) = projectTab(appElement, project: project) else { return false }
     let productTabs = descendants(originalWindow).filter { tabElement in
@@ -320,11 +365,14 @@ func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredP
         menuItem(appElement, named: "Move to New Window") != nil || menuItem(appElement, named: "Move to Another Window") != nil
     }
     if let direct = menuItem(appElement, named: "Move to New Window") {
-        guard press(direct) else { return false }
+        guard press(direct) else { dismissOpenMenus(); return false }
     } else if let submenu = menuItem(appElement, named: "Move to Another Window") {
-        guard press(submenu), waitUntil(timeout: 2, { menuItem(appElement, named: "New Window") != nil }),
-              let newWindow = menuItem(appElement, named: "New Window"), press(newWindow) else { return false }
+        guard press(submenu),
+              waitUntil(timeout: 2, { submenuItem(submenu, named: "New Window") != nil }),
+              let newWindow = submenuItem(submenu, named: "New Window"),
+              press(newWindow) else { dismissOpenMenus(); return false }
     } else {
+        dismissOpenMenus()
         return false
     }
     return waitUntil(timeout: timeout) {
@@ -647,7 +695,17 @@ do {
             results[index].detail = "Figma file did not appear before timeout"
         }
     }
+    // Tabs live in the renderer tree, so it must be up before separation is
+    // attempted; otherwise every project fails as "separation_failed" for a
+    // reason that has nothing to do with the tab or the window.
+    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
     for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
+        if !accessibilityReady {
+            results[index].status = "separation_failed"
+            results[index].step = "renderer_accessibility"
+            results[index].detail = "Figma's renderer accessibility tree never populated, so no tab is visible to the launcher"
+            continue
+        }
         if splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
             results[index].status = options.openOnly ? "opened" : "separated"
             results[index].detail = "Project is in a distinct Figma window"

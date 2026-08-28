@@ -31,6 +31,7 @@ Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and
 
 | `step` | What it means |
 |---|---|
+| `renderer_accessibility` | Figma's renderer accessibility tree never populated, so no tab is visible. Figma is Electron and Chromium exposes only the native window shell until an assistive client opts in; the launcher sets `AXManualAccessibility` itself, so this should now only appear if that opt-in is refused. Before the fix this surfaced as every project failing `separation_failed` at once — a blanket failure right after a Figma restart is this, not a tab problem. |
 | `focus_window` | The project window never became Figma's key window. |
 | `plugins_menu_missing` | Figma's menu bar had no **Plugins** menu. Figma rewrites the menu bar per key window and a **file-browser (Recents) window has no Plugins menu at all** — the report's `menuBar` field shows what was there instead. |
 | `plugins_menu_press` / `plugin_menu_item_press` | The menu item was found but would not activate. |
