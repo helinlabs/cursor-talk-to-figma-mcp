@@ -36,7 +36,7 @@ import {
 } from "./shared/errors-store";
 
 import { PROTOCOL_VERSION } from "./shared/version";
-import { PreviewStreamManager } from "./webrtc/preview-stream";
+import { PreviewStreamManager, warmAgentBinary } from "./webrtc/preview-stream";
 const BINARY_MAGIC = new Uint8Array([0x54, 0x54, 0x46, 0x42]); // "TTFB"
 
 function encodeBinaryFrame(envelope: any, payload: Uint8Array): Uint8Array {
@@ -155,6 +155,7 @@ const previewSubscriptions = new Map<ServerWebSocket<any>, PreviewSubscription>(
 const previewStreams = new PreviewStreamManager(
   (channel) => channelDocs.get(channel)?.documentName
 );
+warmAgentBinary();
 let localPreviewTimer: ReturnType<typeof setInterval> | null = null;
 let localPreviewBusy = false;
 

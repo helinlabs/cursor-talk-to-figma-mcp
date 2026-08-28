@@ -57,9 +57,17 @@ async function agentBinary(): Promise<string> {
     const buildDir = await mkdtemp(join(tmpdir(), "figma-window-agent-build-"));
     try {
       const sourcePath = join(buildDir, "main.swift");
-      const outputPath = join(buildDir, "agent");
+      // The output FILENAME becomes the ad-hoc code-signing Identifier, and
+      // TCC keys its screen-capture verdicts on that identifier. Compiling to
+      // a generic name ("agent") inherited whatever verdict any past binary
+      // named "agent" ever earned on the machine — on this fleet, a denial —
+      // and every capture died with "connection interrupted" while the same
+      // bytes re-signed under a distinct identifier streamed fine (measured).
+      // A stable, unique name also means one grant that sticks across builds.
+      const outputPath = join(buildDir, "figma-window-agent");
       await writeFile(sourcePath, source, "utf8");
       await execFileAsync("/usr/bin/swiftc", [sourcePath, "-O", "-o", outputPath], { maxBuffer: 4 * 1024 * 1024 });
+      await execFileAsync("/usr/bin/codesign", ["-f", "-s", "-", "--identifier", "com.helinlabs.figma-window-agent", outputPath], { maxBuffer: 1024 * 1024 });
       await chmod(outputPath, 0o755);
       await rename(outputPath, binaryPath);
       return binaryPath;
@@ -69,6 +77,16 @@ async function agentBinary(): Promise<string> {
   })();
   agentBinaryPromise.catch(() => { agentBinaryPromise = null; });
   return agentBinaryPromise;
+}
+
+// Compile at relay boot instead of on the first viewer: swiftc took 98s of
+// wall clock on a busy machine (6.7s of CPU — the rest was waiting), which
+// blew straight through the console's 10s negotiation budget. Warming it up
+// front-loads that cost to a moment nobody is watching.
+export function warmAgentBinary(): void {
+  agentBinary().catch((error) => {
+    console.error(`[preview-stream] agent warm-up compile failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +176,11 @@ class WindowAgent {
     setTimeout(() => {
       try { child.kill(); } catch {}
     }, 1500).unref?.();
+    // An agent stuck inside a hung capture ignores the polite path; a stuck
+    // agent left alive holds the window and kills every successor's capture.
+    setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+    }, 4000).unref?.();
     // `exited` stays pending until the process is actually gone; the child's
     // exit handler resolves it even though this.child is cleared here.
     this.child = null;
@@ -280,6 +303,9 @@ interface ChannelStream {
   quality: Required<StreamQuality>;
   started: boolean;
   lingerTimer: ReturnType<typeof setTimeout> | null;
+  // The agent reports its TCC verdicts once at spawn — before any viewer has
+  // registered — so keep the last one and replay it to each joiner.
+  lastTcc: Record<string, any> | null;
 }
 
 // How long a viewer-less agent keeps running before it is stopped. Reloads and
@@ -303,11 +329,25 @@ export class PreviewStreamManager {
     if (stream) return stream;
     const match = this.windowMatchForChannel(channel) ?? "";
     const agent = new WindowAgent(match);
-    stream = { agent, peers: new Set(), signals: new Map(), quality: { ...DEFAULT_QUALITY }, started: false, lingerTimer: null };
+    stream = { agent, peers: new Set(), signals: new Map(), quality: { ...DEFAULT_QUALITY }, started: false, lingerTimer: null, lastTcc: null };
     agent.onAccessUnit = (pts90k, keyframe, annexB) => {
       for (const peer of stream!.peers) peer.writeAccessUnit(pts90k, keyframe, annexB);
     };
     agent.onEvent = (event) => {
+      // Input results and TCC verdicts go to the viewers: a click that failed
+      // for a permission the machine lacks must say so in the console, not
+      // vanish (posting without the Accessibility grant fails silently).
+      if (event.event === "click" || event.event === "key") {
+        for (const [, signal] of stream!.signals) {
+          signal({ type: "preview_input_result", input: event.event, ok: !!event.ok, key: event.key, reason: event.reason || undefined });
+        }
+        return;
+      }
+      if (event.event === "tcc") {
+        stream!.lastTcc = { type: "agent_tcc", screenCapture: event.screenCapture, accessibility: !!event.accessibility };
+        for (const [, signal] of stream!.signals) signal(stream!.lastTcc);
+        return;
+      }
       if (event.event === "error") {
         console.error(`[preview-stream:${channel}] agent error: ${event.message}`);
         // A capture that cannot start (window gone, permission missing) would
@@ -370,6 +410,7 @@ export class PreviewStreamManager {
     stream.peers.add(peer);
     stream.signals.set(peer, signal);
     this.peersBySocket.set(socket, { channel, peer });
+    if (stream.lastTcc) signal(stream.lastTcc);
 
     await stream.agent.start();
     if (!stream.started) {
