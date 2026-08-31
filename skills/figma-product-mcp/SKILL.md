@@ -27,17 +27,27 @@ Without this, a connected-but-stale window looks healthy and is skipped — whic
 
 ## Reading a failed run
 
-Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and prints it to stdout, plus stderr when the run failed). Each project carries a `status`, a human `detail`, and — when the plugin handshake gave up — the `step` that gave up:
+Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and prints it to stdout, plus stderr when the run failed). Each project carries a `status`, a human `detail`, and — when a step gave up — the `step` that did:
 
 | `step` | What it means |
 |---|---|
 | `renderer_accessibility` | Figma's renderer accessibility tree never populated, so no tab is visible. Figma is Electron and Chromium exposes only the native window shell until an assistive client opts in; the launcher sets `AXManualAccessibility` itself, so this should now only appear if that opt-in is refused. Before the fix this surfaced as every project failing `separation_failed` at once — a blanket failure right after a Figma restart is this, not a tab problem. |
 | `focus_window` | The project window never became Figma's key window. |
+| `tab_missing` | No tab for the project was visible in any window when separation ran. The window can already match by *title* while its renderer has not published the tab strip yet, so this is a timing report, not a missing file — check whether the project is connected anyway before touching the UI. |
+| `tab_context_menu` | Right-clicking the design tab did not open its context menu. |
+| `move_menu_item_missing` | The tab context menu offered neither `Move to New Window` nor `Move to Another Window`. |
+| `move_menu_item_press` | The move item was found but would not activate. |
+| `move_not_observed` | The move was issued but the tab never landed in a window distinct from the original. |
 | `plugins_menu_missing` | Figma's menu bar had no **Plugins** menu. Figma rewrites the menu bar per key window and a **file-browser (Recents) window has no Plugins menu at all** — the report's `menuBar` field shows what was there instead. |
 | `plugins_menu_press` / `plugin_menu_item_press` | The menu item was found but would not activate. |
 | `plugin_menu_item_missing` | `Cursor MCP Plugin` is not under `Plugins > Development` in that window. |
 | `renderer_crashed` | The window's Figma renderer had crashed (title and shell intact, but the document replaced by a "Something went wrong" page) and the launcher's Reload click did not bring it back. The launcher repairs this automatically before touching the plugin, so seeing it means the reload itself failed. |
 | `connect_timeout` | The plugin ran, but the relay never reported it connected — or it reconnected still speaking the old version, meaning Figma reloaded stale `code.js`. |
+
+A project that fails to separate but is **already connected at the relay's own protocol version** is
+reported `connected`, not `separation_failed`: separating a window only exists so the plugin can be run
+in it, and a run has nothing left to do for a window whose plugin is already current. The `detail` says
+which separation step was skipped over.
 
 Exit codes: `0` everything connected · `1` one or more projects failed (read the report) · `2` usage / config / Accessibility problem · `70` unexpected error.
 
