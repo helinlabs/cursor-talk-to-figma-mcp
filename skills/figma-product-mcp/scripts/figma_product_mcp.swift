@@ -433,13 +433,38 @@ func submenuItem(_ parent: AXUIElement, named title: String) -> AXUIElement? {
         .first { role($0) == (kAXMenuItemRole as String) && axText($0) == title }
 }
 
-func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
+// Raising the window is not enough to right-click its tab.
+//
+// Figma opens the tab context menu only on its KEY window. On a window that is
+// merely raised, the right-click is swallowed as an activation click and no
+// menu appears at all — so the wait below times out, the lookup finds neither
+// "Move to New Window" nor "Move to Another Window", and the project is
+// reported `separation_failed` on a tab that is perfectly splittable.
+//
+// Measured on macmini-1 2026-09-01, Figma 126.8.16: three projects sharing one
+// window failed every run this way. AXRaise alone put the window frontmost at
+// the tab's own screen point (verified against CGWindowList) and the
+// right-click still produced zero context-menu items. Adding AXMain +
+// AXFocusedWindow + activate, exactly the way focusWindow() does it, made the
+// same right-click at the same coordinates return the full tab menu including
+// "Move to Another Window". A synthetic mouseMoved before the click was tested
+// separately and changed nothing — being key is the whole difference.
+func splitIntoNewWindow(_ app: NSRunningApplication, _ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
     guard let (originalWindow, tab) = projectTab(appElement, project: project) else { return false }
     let productTabs = descendants(originalWindow).filter { tabElement in
         isTab(tabElement) && configuredProjects.contains { projectMatch(tabElement, project: $0) }
     }
     if productTabs.count <= 1 { return true }
     _ = AXUIElementPerformAction(originalWindow, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(originalWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, originalWindow)
+    app.activate(options: [.activateAllWindows])
+    // The Plugins menu is the same proof focusWindow() uses: Figma republishes
+    // its menu bar per key window, so a Plugins menu means this design window
+    // really is key — not just that AX says it is focused.
+    _ = waitUntil(timeout: 3) {
+        ((axValue(originalWindow, kAXMainAttribute as CFString) as? Bool) ?? false) && pluginsMenuIsUp(appElement)
+    }
     guard rightClick(tab) else { return false }
     _ = waitUntil(timeout: 2) {
         menuItem(appElement, named: "Move to New Window") != nil || menuItem(appElement, named: "Move to Another Window") != nil
@@ -660,6 +685,25 @@ func reloadCrashedRenderer(
     window: AXUIElement,
     timeout: TimeInterval
 ) -> Bool {
+    if rendererIsUp(window) { return true }
+    // A renderer that is merely still LOADING is indistinguishable from a
+    // crashed one at this instant: neither has a "<file> – Figma" web area yet.
+    // The tell is the error page's Reload button, and a loading window has no
+    // such button — so the guard below fell straight through to `return false`
+    // and the run reported `renderer_crashed` for a window that was about to
+    // come up on its own. A window freshly split out of another is ALWAYS in
+    // that state, which is why this only surfaced once separation started
+    // working: measured on macmini-1 2026-09-01, CA_Product and CO_Product were
+    // split successfully and then failed `renderer_crashed`, while an
+    // inspection seconds later showed both windows healthy, document loaded,
+    // and no Reload button anywhere.
+    //
+    // So wait for the window to resolve one way or the other before judging it.
+    _ = waitUntil(timeout: timeout) {
+        rendererIsUp(window) || descendants(window).contains {
+            role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
+        }
+    }
     if rendererIsUp(window) { return true }
     guard let reload = descendants(window).first(where: {
         role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
@@ -941,7 +985,7 @@ do {
             results[index].detail = "Figma's renderer accessibility tree never populated, so no tab is visible to the launcher"
             continue
         }
-        if splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
+        if splitIntoNewWindow(app, root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
             results[index].status = options.openOnly ? "opened" : "separated"
             results[index].detail = "Project is in a distinct Figma window"
         } else {
