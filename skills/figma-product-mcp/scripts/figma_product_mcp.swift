@@ -443,6 +443,60 @@ func relayConnection(_ snapshot: RelaySnapshot, for project: Project) -> RelayCo
     return nil
 }
 
+// ---------------------------------------------------------------------------
+// The announced document name goes stale, so ask the plugin where it is now.
+//
+// The relay records the document a plugin announced when it connected, and
+// never revisits it. That is fine while one window holds one file, but when two
+// configured files share a window the tab switch swaps the document under a
+// running plugin without a fresh announce. The relay then reports a channel as
+// "GW_Product" while the plugin answering on it is in GW_Apple Watch, and the
+// launcher reports the project connected. Measured 2026-08-31: the channel the
+// relay labelled GW_Product answered `figma.root.name` as GW_Apple Watch.
+//
+// Reporting that as connected is worse than reporting nothing. Callers write to
+// whatever answers, so a wrong document is a wrong-file write waiting to
+// happen. One round trip through the relay's own script endpoint settles it.
+func liveDocumentName(baseURL: String, project: Project, timeout: TimeInterval = 8) -> String? {
+    var components = URLComponents(string: baseURL.hasSuffix("/") ? baseURL + "script/run" : baseURL + "/script/run")
+    components?.queryItems = [URLQueryItem(name: "project", value: project.displayTitle)]
+    guard let url = components?.url else { return nil }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = timeout
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["code": "return figma.root.name"])
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    guard semaphore.wait(timeout: .now() + timeout + 1) == .success,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          root["ok"] as? Bool == true,
+          // `result` is the script's return value re-encoded as JSON, so a
+          // string arrives quoted.
+          let encoded = root["result"] as? String,
+          let name = try? JSONSerialization.jsonObject(
+              with: Data(encoded.utf8), options: [.fragmentsAllowed]
+          ) as? String
+    else { return nil }
+    return name
+}
+
+// A relay that cannot answer is not evidence of a wrong document: an
+// unreachable relay, a busy plugin, or a timeout all return nil, and treating
+// those as failures would make the launcher flap. Only a name that came back
+// and disagrees counts.
+func documentMismatch(baseURL: String, project: Project) -> String? {
+    guard let live = liveDocumentName(baseURL: baseURL, project: project) else { return nil }
+    if live == project.displayTitle { return nil }
+    if live.localizedCaseInsensitiveContains(project.title) { return nil }
+    return live
+}
+
 enum PluginState {
     case missing
     case stale(String?)              // connected, but running other code than the relay
@@ -706,9 +760,14 @@ do {
                 results[index].detail = "stale plugin (v\(version ?? "?") vs relay v\(probe?.protocolVersion ?? "?")) — needs a re-run"
                 results[index].pluginVersion = version
             case .current(let version, let channelName):
-                results[index].detail = "connected"
                 results[index].pluginVersion = version
                 results[index].channel = channelName
+                if let live = documentMismatch(baseURL: options.relayURL, project: project) {
+                    results[index].detail = "channel answers from \(live) — not this file"
+                    results[index].step = "wrong_document"
+                } else {
+                    results[index].detail = "connected"
+                }
             }
         }
         emitReport(Report(
@@ -782,7 +841,12 @@ do {
             // Already connected AND running the relay's own version: leave it
             // alone (re-running would drop a healthy channel). A stale plugin is
             // re-run without asking — that is the whole point of a deploy.
-            if case .current(let version, let channelName) = pluginState(snapshot, project: project, window: window), !options.forceReconnect {
+            // Leaving a healthy channel alone is only right when the channel is
+            // in THIS file. A stale announce points at another document, and
+            // skipping the re-run there would preserve exactly the wrong state.
+            if case .current(let version, let channelName) = pluginState(snapshot, project: project, window: window),
+               !options.forceReconnect,
+               documentMismatch(baseURL: options.relayURL, project: project) == nil {
                 results[index].status = "connected"
                 results[index].detail = "Talk To Figma MCP is connected"
                 results[index].pluginVersion = version
@@ -801,10 +865,20 @@ do {
             )
             switch outcome {
             case .connected(let version, let channelName):
-                results[index].status = "connected"
-                results[index].detail = "Talk To Figma MCP is connected"
                 results[index].pluginVersion = version
                 results[index].channel = channelName ?? channel(in: window)
+                // The panel says connected and the relay agrees, but both are
+                // reading an announce. Ask the plugin itself before calling it
+                // a success — a run that ends "connected" on the wrong file is
+                // the one failure nobody notices until data lands in it.
+                if let live = documentMismatch(baseURL: options.relayURL, project: project) {
+                    results[index].status = "plugin_failed"
+                    results[index].step = "wrong_document"
+                    results[index].detail = "Plugin connected but answers from \(live) — this file shares a window with it"
+                } else {
+                    results[index].status = "connected"
+                    results[index].detail = "Talk To Figma MCP is connected"
+                }
             case .failed(let step, let detail, let menuBar):
                 results[index].status = "plugin_failed"
                 results[index].detail = detail
