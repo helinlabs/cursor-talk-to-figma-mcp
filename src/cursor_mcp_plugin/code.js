@@ -108,12 +108,19 @@ figma.ui.onmessage = async (msg) => {
           type: "command-result",
           id: msg.id,
           result,
+          // Ride along with the answer so the relay's channel -> document map
+          // stays true. `currentpagechange` is not enough: when two files share
+          // a Figma window, the tab switch swaps the document under a running
+          // plugin without firing it, and the relay keeps serving the name this
+          // plugin announced on connect. Every command is a chance to correct.
+          docMeta: getDocMeta(),
         });
       } catch (error) {
         figma.ui.postMessage({
           type: "command-error",
           id: msg.id,
           error: error.message || "Error executing command",
+          docMeta: getDocMeta(),
         });
       }
       break;

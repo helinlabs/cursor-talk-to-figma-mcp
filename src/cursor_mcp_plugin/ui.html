@@ -1552,6 +1552,7 @@
             break;
           case "command-result":
             // Forward the result from plugin code back to WebSocket
+            noteDocMeta(message.docMeta);
             sendSuccessResponse(message.id, message.result);
             trackCommandResult(message.id, true);
             reqLog.finish(message.id, "success", message.result?.imageBytes
@@ -1577,6 +1578,7 @@
             break;
           case "command-error":
             // Forward the error from plugin code back to WebSocket
+            noteDocMeta(message.docMeta);
             sendErrorResponse(message.id, message.error);
             trackCommandResult(message.id, false, message.error);
             reqLog.finish(message.id, "error", message.error);
@@ -1616,6 +1618,27 @@
             break;
         }
       };
+
+      // Take the document identity that rode along with a command answer.
+      //
+      // Re-announcing on every command would be noise, so only a change is
+      // worth a message: that is exactly the case the connect-time announce
+      // gets wrong when two files share a Figma window.
+      function noteDocMeta(meta) {
+        if (!meta || !meta.documentName) return;
+        const before = state.docMeta;
+        if (
+          before &&
+          before.documentName === meta.documentName &&
+          before.fileKey === meta.fileKey &&
+          before.pageId === meta.pageId
+        ) {
+          state.docMeta = meta; // counts can move; identity did not
+          return;
+        }
+        state.docMeta = meta;
+        announceDocMeta();
+      }
 
       // Send the document identity to the relay so the console/controllers can
       // tell which document this channel belongs to.

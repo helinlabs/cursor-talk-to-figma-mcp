@@ -643,6 +643,40 @@ function resolveProjectChannel(projectKey: string): string | null {
   return project?.recommendedChannel ?? null;
 }
 
+// Ask a channel's plugin which document it is in, and correct the record.
+//
+// The document a channel is filed under comes from one announce at connect
+// time. That is right until two files share a Figma window: switching tabs
+// swaps the document under a running plugin without firing `currentpagechange`,
+// so the plugin never re-announces and the channel keeps the old name. Measured
+// 2026-08-31: a channel filed as GW_Product answered `figma.root.name` as
+// GW_Apple Watch, and every controller that picked the channel by name reached
+// the wrong file.
+//
+// A controller joining is the moment the answer starts to matter, so refresh
+// then. One round trip, and only when the name actually moved is anything
+// written or pushed. Failures are silent on purpose: a busy or vanished plugin
+// is not evidence about which document it holds, and downgrading a good record
+// on a timeout would be worse than the staleness this fixes.
+function refreshChannelDocument(channelName: string): void {
+  sendInternalCommand(channelName, "run_script", { code: "return figma.root.name" }, 5_000)
+    .then((result) => {
+      const live = typeof result?.result === "string" ? JSON.parse(result.result) : null;
+      if (typeof live !== "string" || !live) return;
+      const known = channelDocs.get(channelName);
+      if (known?.documentName === live) return;
+      console.log(
+        `\n📄 Channel "${channelName}" was filed as ${JSON.stringify(known?.documentName ?? null)}` +
+          ` but answers from ${JSON.stringify(live)} — correcting`
+      );
+      channelDocs.set(channelName, { ...(known ?? {}), documentName: live });
+      channelAnnouncedAt.set(channelName, Date.now());
+      pushEvent({ kind: "document", channel: channelName, document: channelDocs.get(channelName) });
+      pushChannels();
+    })
+    .catch(() => {});
+}
+
 // Loose project resolution for the console Navigator: exact projectKey first,
 // then case-insensitive name substring (same convenience as /index/rebuild).
 function resolveNavigatorChannel(project: string): string | null {
@@ -2078,6 +2112,7 @@ const server = Bun.serve({
               }));
             }
           });
+          if (meta?.role === "controller") refreshChannelDocument(channelName);
           return;
         }
 
