@@ -36,7 +36,7 @@ Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and
 | `step` | What it means |
 |---|---|
 | `open_failed` | The file could not be matched to any window. With `renderer_accessibility` as the step this is **not** about the file — see the row below. Without it, the file genuinely did not open before the timeout. |
-| `renderer_accessibility` | Figma's renderer accessibility tree never populated, so no tab is visible **and no window can be told apart from another** — unasked, every Figma window answers `AXTitle` `"Figma"`. Figma is Electron and Chromium exposes only the native window shell until an assistive client opts in. The launcher sets `AXManualAccessibility` itself, but on Figma 126.8.16 (Electron/Chrome 148, macOS 26.6.1) that set call **returns `.success` and is then ignored** — measured: 90s of polling, 0 web areas, descendant count frozen at 532/window. `AXEnhancedUserInterface` is rejected outright (`kAXErrorNotImplemented`). So a blanket failure across every project is this, not a tab or file problem, and waiting longer does not fix it. |
+| `renderer_accessibility` | Figma's renderer accessibility tree never populated, so no tab is visible **and no window can be told apart from another** — unasked, every Figma window answers `AXTitle` `"Figma"`. Figma is Electron and Chromium exposes only the native window shell until an assistive client opts in. The launcher sets `AXManualAccessibility` itself, but on Figma 126.8.16 (Electron/Chrome 148, macOS 26.6.1) that set call **returns `.success` and is then ignored** — measured: 90s of polling, 0 web areas, descendant count frozen at 532/window. `AXEnhancedUserInterface` is rejected outright (`kAXErrorNotImplemented`). So a blanket failure across every project is this, not a tab or file problem, and waiting longer does not fix it. The launcher no longer stops there: it falls back to the **window server**, whose `kCGWindowName` still carries the file name the AX title would have had. That fallback needs Screen Recording granted to the relay runtime, so if this step appears anyway, check that first. |
 | `focus_window` | The project window never became Figma's key window. |
 | `plugins_menu_missing` | Figma's menu bar had no **Plugins** menu. Figma rewrites the menu bar per key window and a **file-browser (Recents) window has no Plugins menu at all** — the report's `menuBar` field shows what was there instead. |
 | `plugins_menu_press` / `plugin_menu_item_press` | The menu item was found but would not activate. |
@@ -64,3 +64,15 @@ The launcher that runs lives at `~/.codex/skills/figma-product-mcp`, **not** in 
 ```
 
 `install.sh` prints a diff when the two `projects.json` files disagree rather than picking a side silently.
+
+## 기기에서 고쳤다면 되돌릴 것
+
+`~/.codex/skills/figma-product-mcp` 는 산출물이면서 **실제로 돌아가는 사본**이라, 실행이 실패하면 수정이 거기서 일어난다. 그대로 두면 다음 `install.sh` 가 `git pull` 과 함께 조용히 덮어쓴다. 오류도 안 나고, 고친 사람은 이미 세션을 끝낸 뒤다.
+
+```bash
+./scripts/skill-pr.sh    # 산출물 -> 레포 -> 브랜치 -> PR
+```
+
+브로커에서는 `figma-skill-pr` 액션이 같은 일을 한다. 레포가 main 이 아니거나 커밋 안 된 변경이 있으면 중단하고, 차이가 없으면 아무것도 하지 않는다. 리뷰와 머지는 사람이 하고, 머지한 뒤 `figma-skill-install` 을 돌리면 기기와 레포가 다시 맞는다.
+
+**PR 본문은 무엇을 왜 고쳤는지 모른다고 적는다.** 기기는 그걸 알 수 없고 그 맥락은 수정을 한 세션에 있다. 리뷰에서 채울 것.

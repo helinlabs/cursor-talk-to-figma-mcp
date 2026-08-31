@@ -292,10 +292,62 @@ func projectMatch(_ element: AXUIElement, project: Project) -> Bool {
 // Recents window has neither — its tabs are Home, Recently viewed, Shared
 // files and Shared folders, and the file names are only card labels.
 func projectWindow(_ appElement: AXUIElement, project: Project) -> AXUIElement? {
-    windows(appElement).first { window in
+    if let viaAX = windows(appElement).first(where: { window in
         projectMatch(window, project: project)
             || descendants(window).contains { isTab($0) && projectMatch($0, project: project) }
+    }) {
+        return viaAX
     }
+    return windowServerWindow(appElement, project: project)
+}
+
+// ---------------------------------------------------------------------------
+// Identify a window through the window server when accessibility cannot.
+//
+// Both AX signals above come from the renderer, and on Figma 126.8.16 the
+// renderer tree never populates: `AXManualAccessibility` is accepted and
+// ignored, every window answers `AXTitle` "Figma", and no tabs exist to walk.
+// Then `projectWindow` finds nothing for any file, every project is reported
+// `open_failed` on a file that is open, and a run re-opens all seven URLs.
+//
+// The window server knows the titles anyway. `CGWindowListCopyWindowInfo`
+// carries `kCGWindowName` per window, which for Figma is the active tab's file
+// name — the same string the AX title would have been. It is empty for
+// background processes until Screen Recording is granted; measured 2026-08-31,
+// granting it to the relay turned every Figma window name from nil into the
+// real file name, which is what makes this path worth having.
+//
+// Going from a window-server id back to an AXUIElement needs
+// `_AXUIElementGetWindow`. It is private, and this is the one place worth
+// spending that on: it is the only bridge between the two, it has been stable
+// across macOS releases for a decade, and a failure here is a nil, not a crash.
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func axWindowID(_ window: AXUIElement) -> CGWindowID? {
+    var identifier: CGWindowID = 0
+    guard _AXUIElementGetWindow(window, &identifier) == .success, identifier != 0 else { return nil }
+    return identifier
+}
+
+func windowServerWindow(_ appElement: AXUIElement, project: Project) -> AXUIElement? {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let rows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
+    let named = rows.filter { row in
+        (row[kCGWindowOwnerName as String] as? String) == "Figma"
+            && (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+            && !((row[kCGWindowName as String] as? String) ?? "").isEmpty
+    }
+    // Same rule as the AX path: a window that merely mentions the file is not
+    // the window showing it. Match against the title only, never card labels.
+    let wanted = named.filter { row in
+        let name = (row[kCGWindowName as String] as? String) ?? ""
+        return name.localizedCaseInsensitiveContains(project.title)
+            || name.localizedCaseInsensitiveContains(project.displayTitle)
+    }
+    guard wanted.count == 1,
+          let identifier = (wanted[0][kCGWindowNumber as String] as? NSNumber)?.uint32Value else { return nil }
+    return windows(appElement).first { axWindowID($0) == identifier }
 }
 
 func isTab(_ element: AXUIElement) -> Bool {
