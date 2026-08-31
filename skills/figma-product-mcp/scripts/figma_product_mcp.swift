@@ -778,19 +778,37 @@ do {
     let app = try launchFigmaIfNeeded(timeout: options.timeout)
     let root = appAX(app)
 
+    // The renderer tree has to be up before ANYTHING that reads it, and that
+    // includes opening: openProject decides "is this file already open?" with
+    // projectWindow(), which matches on the window title or a tab, and an
+    // Electron window with no accessibility tree reports neither — every
+    // window's AXTitle is the bare app name "Figma".
+    //
+    // Waiting here used to happen after the open loop, so a dropped
+    // AXManualAccessibility opt-in surfaced as all seven projects
+    // "open_failed" — "Figma file did not appear before timeout" — for files
+    // that were open the whole time. That reads as a broken Figma or a broken
+    // login and sends the next reader looking for missing files, when the one
+    // real symptom is an empty accessibility tree. Observed on macmini-1
+    // 2026-08-31T04:44Z: 7/7 open_failed while all 7 documents were open and
+    // answering get_document_info over the relay.
+    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
+
     for (index, project) in config.projects.enumerated() {
         if openProject(project, app: app, appElement: root, timeout: options.timeout) {
             results[index].status = "opened"
             results[index].detail = "Figma file is open"
         } else {
             results[index].status = "open_failed"
-            results[index].detail = "Figma file did not appear before timeout"
+            // Name the cause the launcher already knows about instead of
+            // blaming the file: with no accessibility tree the launcher cannot
+            // see a window it may well have.
+            results[index].step = accessibilityReady ? nil : "renderer_accessibility"
+            results[index].detail = accessibilityReady
+                ? "Figma file did not appear before timeout"
+                : "Figma's renderer accessibility tree never populated, so no window is visible to the launcher — the file may already be open"
         }
     }
-    // Tabs live in the renderer tree, so it must be up before separation is
-    // attempted; otherwise every project fails as "separation_failed" for a
-    // reason that has nothing to do with the tab or the window.
-    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
     for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
         if !accessibilityReady {
             results[index].status = "separation_failed"
