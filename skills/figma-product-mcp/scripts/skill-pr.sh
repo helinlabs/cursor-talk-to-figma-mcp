@@ -103,3 +103,12 @@ gh pr create --base main --head "$pr_branch" \
 
 echo
 echo "머지 후 figma-skill-install 을 돌려 기기와 레포를 맞출 것"
+
+# Leave the checkout on main.
+#
+# The branch is pushed and the PR is open, so nothing here needs the working
+# tree any more — but every other action that touches this repo starts with a
+# plain `git pull`, and that fails on a branch whose upstream was deleted when
+# the PR merged. Measured: `figma-skill-install` broke exactly this way one
+# minute after the first successful PR.
+git checkout --quiet main
