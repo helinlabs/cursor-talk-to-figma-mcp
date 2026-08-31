@@ -381,32 +381,55 @@ func submenuItem(_ parent: AXUIElement, named title: String) -> AXUIElement? {
         .first { role($0) == (kAXMenuItemRole as String) && axText($0) == title }
 }
 
-func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
-    guard let (originalWindow, tab) = projectTab(appElement, project: project) else { return false }
+// Which part of the separation gave up. A bare `false` reached the report as
+// one sentence — "Could not move the design tab to a distinct window" — for
+// four unrelated causes: a tab the renderer had not published yet, a context
+// menu that never opened, a menu item that would not press, and a move that
+// never landed. The 2026-08-31 run failed here for d-product and the report
+// could not say which, so the step has to be named the way the plugin
+// handshake already names its own.
+enum SeparationOutcome {
+    case separated
+    case failed(String, String)   // step, detail
+}
+
+func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> SeparationOutcome {
+    guard let (originalWindow, tab) = projectTab(appElement, project: project) else {
+        return .failed("tab_missing", "No tab for this project is visible in any Figma window")
+    }
     let productTabs = descendants(originalWindow).filter { tabElement in
         isTab(tabElement) && configuredProjects.contains { projectMatch(tabElement, project: $0) }
     }
-    if productTabs.count <= 1 { return true }
+    if productTabs.count <= 1 { return .separated }
     _ = AXUIElementPerformAction(originalWindow, kAXRaiseAction as CFString)
-    guard rightClick(tab) else { return false }
+    guard rightClick(tab) else {
+        return .failed("tab_context_menu", "Right-clicking the design tab did not open its context menu")
+    }
     _ = waitUntil(timeout: 2) {
         menuItem(appElement, named: "Move to New Window") != nil || menuItem(appElement, named: "Move to Another Window") != nil
     }
     if let direct = menuItem(appElement, named: "Move to New Window") {
-        guard press(direct) else { dismissOpenMenus(); return false }
+        guard press(direct) else {
+            dismissOpenMenus()
+            return .failed("move_menu_item_press", "Move to New Window was found but would not activate")
+        }
     } else if let submenu = menuItem(appElement, named: "Move to Another Window") {
         guard press(submenu),
               waitUntil(timeout: 2, { submenuItem(submenu, named: "New Window") != nil }),
               let newWindow = submenuItem(submenu, named: "New Window"),
-              press(newWindow) else { dismissOpenMenus(); return false }
+              press(newWindow) else {
+            dismissOpenMenus()
+            return .failed("move_menu_item_press", "Move to Another Window > New Window would not activate")
+        }
     } else {
         dismissOpenMenus()
-        return false
+        return .failed("move_menu_item_missing", "The tab context menu offered no Move to New Window item")
     }
-    return waitUntil(timeout: timeout) {
+    let landed = waitUntil(timeout: timeout) {
         guard let newProjectWindow = projectWindow(appElement, project: project) else { return false }
         return !CFEqual(newProjectWindow, originalWindow)
     }
+    return landed ? .separated : .failed("move_not_observed", "The design tab never landed in a distinct window")
 }
 
 // ---------------------------------------------------------------------------
@@ -755,19 +778,37 @@ do {
     let app = try launchFigmaIfNeeded(timeout: options.timeout)
     let root = appAX(app)
 
+    // The renderer tree has to be up before ANYTHING that reads it, and that
+    // includes opening: openProject decides "is this file already open?" with
+    // projectWindow(), which matches on the window title or a tab, and an
+    // Electron window with no accessibility tree reports neither — every
+    // window's AXTitle is the bare app name "Figma".
+    //
+    // Waiting here used to happen after the open loop, so a dropped
+    // AXManualAccessibility opt-in surfaced as all seven projects
+    // "open_failed" — "Figma file did not appear before timeout" — for files
+    // that were open the whole time. That reads as a broken Figma or a broken
+    // login and sends the next reader looking for missing files, when the one
+    // real symptom is an empty accessibility tree. Observed on macmini-1
+    // 2026-08-31T04:44Z: 7/7 open_failed while all 7 documents were open and
+    // answering get_document_info over the relay.
+    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
+
     for (index, project) in config.projects.enumerated() {
         if openProject(project, app: app, appElement: root, timeout: options.timeout) {
             results[index].status = "opened"
             results[index].detail = "Figma file is open"
         } else {
             results[index].status = "open_failed"
-            results[index].detail = "Figma file did not appear before timeout"
+            // Name the cause the launcher already knows about instead of
+            // blaming the file: with no accessibility tree the launcher cannot
+            // see a window it may well have.
+            results[index].step = accessibilityReady ? nil : "renderer_accessibility"
+            results[index].detail = accessibilityReady
+                ? "Figma file did not appear before timeout"
+                : "Figma's renderer accessibility tree never populated, so no window is visible to the launcher — the file may already be open"
         }
     }
-    // Tabs live in the renderer tree, so it must be up before separation is
-    // attempted; otherwise every project fails as "separation_failed" for a
-    // reason that has nothing to do with the tab or the window.
-    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
     for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
         if !accessibilityReady {
             results[index].status = "separation_failed"
@@ -775,12 +816,44 @@ do {
             results[index].detail = "Figma's renderer accessibility tree never populated, so no tab is visible to the launcher"
             continue
         }
-        if splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
+        switch splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
+        case .separated:
             results[index].status = options.openOnly ? "opened" : "separated"
             results[index].detail = "Project is in a distinct Figma window"
-        } else {
-            results[index].status = "separation_failed"
-            results[index].detail = "Could not move the design tab to a distinct window"
+        case .failed(let step, let detail):
+            // Separating a window is a means, not the goal: a tab is moved out
+            // so the plugin can be run in a window that has a Plugins menu. If
+            // the relay already reports this project connected at its OWN
+            // protocol version, there is nothing left for the run to do — and
+            // failing here throws that connection away silently, because the
+            // plugin loop below only visits projects marked "separated" and so
+            // never asks the relay about this one at all.
+            //
+            // On 2026-08-31 `--all --force-reconnect` exited 1 for exactly
+            // this: d-product failed separation while its plugin sat connected
+            // at v2.6.0 — the relay's own version — on channel b61qj86u before,
+            // during and after the run, answering real get_document_info calls
+            // the whole time. Six healthy projects were re-run and one healthy
+            // project failed the build. Same principle as #34, one stage
+            // earlier; unlike #34 this branch never reaches the relay at all.
+            //
+            // The rescue demands a live relay answer. `pluginState` falls back
+            // to the plugin panel's banner when the relay is unreachable, and
+            // that banner survives a dropped socket — it is not evidence, so a
+            // missing snapshot must still fail the run.
+            let afterFailure = fetchRelaySnapshot(baseURL: options.relayURL)
+            let projectWindowAfterFailure = projectWindow(root, project: project)
+            if !options.openOnly, afterFailure != nil,
+               case .current(let version, let channelName) = pluginState(afterFailure, project: project, window: projectWindowAfterFailure) {
+                results[index].status = "connected"
+                results[index].detail = "Kept the existing connection — separation did not land (\(step)), but the plugin is already current"
+                results[index].pluginVersion = version
+                results[index].channel = channelName ?? projectWindowAfterFailure.flatMap { channel(in: $0) }
+            } else {
+                results[index].status = "separation_failed"
+                results[index].step = step
+                results[index].detail = detail
+            }
         }
     }
     var snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
