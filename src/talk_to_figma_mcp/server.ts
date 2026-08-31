@@ -4902,6 +4902,13 @@ function serveExport(req: IncomingMessage, res: ServerResponse, pathname: string
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff",
     });
+    // HEAD probes (TTL checks, existence checks) get the same headers a GET
+    // would, without the body — previously they fell through to the /mcp 404
+    // regardless of whether the file existed.
+    if (req.method === "HEAD") {
+      res.end();
+      return true;
+    }
     fs.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
@@ -4937,7 +4944,7 @@ async function startHTTPServer() {
   const httpServer = createHttpServer(async (req, res) => {
     try {
       const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
-      if (req.method === "GET" && serveExport(req, res, pathname)) return;
+      if ((req.method === "GET" || req.method === "HEAD") && serveExport(req, res, pathname)) return;
       if (pathname === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
         return;
