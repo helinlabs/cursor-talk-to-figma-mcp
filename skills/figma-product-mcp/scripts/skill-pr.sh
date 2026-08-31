@@ -32,9 +32,21 @@ SKILL_IN_REPO="$REPO/skills/figma-product-mcp"
 
 cd "$REPO"
 
+# A device-fix/* branch is this script's own leftover: an earlier run that got
+# as far as committing and then failed (a push that could not authenticate is
+# how it happened the first time). Everything on it is regenerable from the
+# device in the next few lines, so clear it rather than making a person do it.
+branch=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$branch" == device-fix/* ]]; then
+  echo "이전 실행이 남긴 $branch 를 정리하고 다시 만든다"
+  git reset --hard --quiet
+  git checkout --quiet main
+  git branch -D --quiet "$branch"
+  branch=main
+fi
+
 # Refuse to touch a checkout someone else is mid-thought in. Committing on top
 # of unrelated work would put it in a PR nobody meant to open.
-branch=$(git rev-parse --abbrev-ref HEAD)
 if [ "$branch" != main ]; then
   echo "ABORT: 레포가 main 이 아니라 $branch 다. 사람이 정리해야 한다"
   exit 1
@@ -72,7 +84,11 @@ git commit --quiet -m "기기에서 고친 런처 수정을 레포로 되돌린�
 
 무엇을 왜 고쳤는지는 그 수정을 한 세션에 있다. 리뷰에서 확인할 것."
 
-git push --quiet -u origin "$pr_branch"
+# The remote is HTTPS and the device has no git credential helper, so a plain
+# push fails with "Password authentication is not supported". `gh` is logged in
+# though, so borrow its credentials for this one command. Passing the token in
+# the URL would work too, but that puts it in the process list.
+git -c credential.helper='!gh auth git-credential' push --quiet -u origin "$pr_branch"
 
 gh pr create --base main --head "$pr_branch" \
   --title "기기에서 고친 런처 수정을 레포로 되돌린다" \
