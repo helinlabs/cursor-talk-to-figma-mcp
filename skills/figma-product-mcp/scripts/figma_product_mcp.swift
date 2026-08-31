@@ -814,19 +814,74 @@ do {
     let app = try launchFigmaIfNeeded(timeout: options.timeout)
     let root = appAX(app)
 
+    // Renderer accessibility has to be up BEFORE anything reads the tree.
+    //
+    // A window's title and its tabs BOTH come from the renderer — unasked, every
+    // Figma window answers AXTitle "Figma" and carries no tab — and
+    // projectWindow() is built out of exactly those two signals. Running the open
+    // loop before this call therefore made every project fail "open_failed" on a
+    // file that was open, connected, and serving plugin commands the whole time,
+    // and pointed repair at the file instead of at the accessibility tree.
+    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
+
+    // Relay ground truth, before any UI is touched.
+    //
+    // A project the relay reports connected, speaking the relay's own protocol
+    // version, and answering from THIS file has already reached everything a run
+    // is for: the file is open, it is in a window of its own, and its plugin is
+    // live on current code. That is proven end-to-end by the plugin itself, which
+    // is strictly better evidence than the accessibility tree — the tree only
+    // ever showed where the window was, never that the channel worked.
+    //
+    // Re-deriving it from AX adds no proof and, when the tree is unavailable,
+    // destroys the state it was checking: projectWindow() can never find the
+    // window, so openProject() re-opens the file's URL on every run and Figma
+    // accumulates a window per project per attempt.
+    var snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+    var healthy: [String: (version: String?, channel: String?)] = [:]
+    if !options.openOnly {
+        for project in config.projects {
+            guard case .current(let version, let channelName) = pluginState(snapshot, project: project, window: nil),
+                  documentMismatch(baseURL: options.relayURL, project: project) == nil else { continue }
+            healthy[project.id] = (version, channelName)
+        }
+    }
+
+    // --force-reconnect exists to re-run the plugin so Figma re-reads a deployed
+    // code.js, and it still does whenever the menu can actually be driven. With
+    // the renderer tree down there is no menu path to the plugin at all, so the
+    // honest move is to keep the verified-current connection and say the forced
+    // re-run was skipped — not to tear down seven working channels chasing a
+    // re-run that cannot happen, and not to fail a run whose goal is already met.
+    func alreadySatisfied(_ project: Project) -> Bool {
+        healthy[project.id] != nil && (!options.forceReconnect || !accessibilityReady)
+    }
+
     for (index, project) in config.projects.enumerated() {
+        if alreadySatisfied(project), let live = healthy[project.id] {
+            results[index].status = "connected"
+            results[index].pluginVersion = live.version
+            results[index].channel = live.channel
+            results[index].detail = options.forceReconnect
+                ? "Talk To Figma MCP is connected on relay v\(snapshot?.protocolVersion ?? "?") — forced re-run skipped, no renderer accessibility tree to reach Plugins > Development through"
+                : "Talk To Figma MCP is connected"
+            continue
+        }
         if openProject(project, app: app, appElement: root, timeout: options.timeout) {
             results[index].status = "opened"
             results[index].detail = "Figma file is open"
         } else {
             results[index].status = "open_failed"
-            results[index].detail = "Figma file did not appear before timeout"
+            // Not knowing which window holds the file is a different failure from
+            // the file not opening, and only one of them is about the file.
+            if accessibilityReady {
+                results[index].detail = "Figma file did not appear before timeout"
+            } else {
+                results[index].step = "renderer_accessibility"
+                results[index].detail = "Figma's renderer accessibility tree never populated, so no window can be matched to a file — AXManualAccessibility was accepted but ignored"
+            }
         }
     }
-    // Tabs live in the renderer tree, so it must be up before separation is
-    // attempted; otherwise every project fails as "separation_failed" for a
-    // reason that has nothing to do with the tab or the window.
-    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
     for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
         if !accessibilityReady {
             results[index].status = "separation_failed"
@@ -842,7 +897,6 @@ do {
             results[index].detail = "Could not move the design tab to a distinct window"
         }
     }
-    var snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
     var menuBarSeen: [String]?
     if !options.openOnly {
         for (index, project) in config.projects.enumerated() where results[index].status == "separated" {
