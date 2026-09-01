@@ -424,6 +424,7 @@ function persistSelectedProject(project) {
     logger.warn(`Could not persist selected project: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
+var SERVER_NAME = "TalkToFigmaMCP";
 function createMcpServer(options = {}) {
   let ws = null;
   let disposed = false;
@@ -437,7 +438,7 @@ function createMcpServer(options = {}) {
   const requesterId = process.env.TALK_TO_FIGMA_REQUESTER_ID || process.env.CODEX_THREAD_ID || process.env.CURSOR_SESSION_ID || `mcp-${process.pid}`;
   const bulkJobs = /* @__PURE__ */ new Map();
   const server = new import_mcp.McpServer({
-    name: "TalkToFigmaMCP",
+    name: SERVER_NAME,
     version: PROTOCOL_VERSION
   });
   const args = process.argv.slice(2);
@@ -3255,18 +3256,46 @@ This detailed process ensures you correctly interpret the reaction data, prepare
   async function relayProjects() {
     return (await relayProjectsPayload()).projects || [];
   }
+  const REPAIR_DEVICE = process.env.FIGMA_REPAIR_DEVICE || "macmini-1";
+  const REPAIR_ACTION = "figma-open-projects";
+  function repairHint(subject) {
+    return `${subject}
+
+RECOVERY \u2014 this means the Figma plugin is not running on ${REPAIR_DEVICE}. Run the nexus broker action \`${REPAIR_ACTION}\` on device \`${REPAIR_DEVICE}\` (nexus MCP: broker_action_run with key="${REPAIR_ACTION}", target_device="${REPAIR_DEVICE}"), wait for it to report ok, then retry this call. The action is idempotent \u2014 it reopens whatever is missing and leaves already-connected projects untouched.
+If it reports "repair_in_progress" (exit 75), another machine is already repairing: that is NOT a failure \u2014 wait ~30s and retry this call rather than reporting an error.`;
+  }
+  async function knownOfflineProjects(live) {
+    try {
+      const response = await fetch(relayHttpUrl("index/status"));
+      if (!response.ok) return [];
+      const data = await response.json();
+      const liveKeys = new Set(live.map((project) => project.projectKey));
+      return (data.diskIndexes || []).filter((entry) => !liveKeys.has(entry.projectKey)).map((entry) => ({ name: entry.projectName || entry.projectKey, projectKey: entry.projectKey }));
+    } catch {
+      return [];
+    }
+  }
   async function selectProject(query) {
     const projects = await relayProjects();
     const live = projects.filter((project2) => project2.connectionCount > 0 && project2.recommendedChannel);
-    if (!live.length) throw new Error("No live Figma projects are connected");
-    let matches = live;
-    if (query) {
-      const normalized = query.toLowerCase();
-      matches = live.filter(
-        (project2) => [project2.name, project2.fileKey, project2.projectKey].some((value) => String(value || "").toLowerCase().includes(normalized))
-      );
+    if (!live.length) {
+      throw new Error(repairHint("No live Figma projects are connected \u2014 the relay is up but no plugin is talking to it."));
     }
+    const matchesQuery = (candidate) => {
+      const normalized = String(query).toLowerCase();
+      return [candidate.name, candidate.fileKey, candidate.projectKey].some((value) => String(value || "").toLowerCase().includes(normalized));
+    };
+    let matches = live;
+    if (query) matches = live.filter(matchesQuery);
     if (matches.length !== 1) {
+      if (query && matches.length === 0) {
+        const offline = (await knownOfflineProjects(live)).filter(matchesQuery);
+        if (offline.length) {
+          throw new Error(repairHint(
+            `"${query}" matches a known project (${offline.map((project2) => project2.name).join(", ")}) but it has no live plugin, so it cannot be driven right now. Live projects: ${live.map((project2) => project2.name).join(", ")}.`
+          ));
+        }
+      }
       throw new Error(query ? `Project query matched ${matches.length} projects: ${matches.map((project2) => project2.name).join(", ") || "none"}` : `Choose a project first \u2014 call use_figma_project with one of: ${live.map((project2) => project2.name).join(", ")}`);
     }
     const project = matches[0];
@@ -3325,6 +3354,15 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     }
     await selectProject();
   }
+  async function selectedProjectStillLive() {
+    try {
+      const projects = await relayProjects();
+      const key = currentProjectKey();
+      return projects.some((project) => project.connectionCount > 0 && [project.projectKey, project.fileKey, project.name].some((value) => String(value || "") === key));
+    } catch {
+      return true;
+    }
+  }
   async function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
     if (command !== "join") await ensureProjectSelected();
     return new Promise((resolve2, reject) => {
@@ -3365,7 +3403,9 @@ This detailed process ensures you correctly interpret the reaction data, prepare
             ws.send(JSON.stringify({ type: "request_timeout", id, channel: currentChannel, requesterId }));
           }
           logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1e3} seconds`);
-          reject(new Error("Request to Figma timed out"));
+          void selectedProjectStillLive().then((live) => {
+            reject(new Error(live ? "Request to Figma timed out" : repairHint(`Request to Figma timed out, and "${selectedProject?.name || currentProjectKey()}" no longer has a live plugin \u2014 the connection died mid-session rather than the operation being slow.`)));
+          });
         }
       }, timeoutMs);
       pendingRequests.set(id, {
@@ -4311,6 +4351,10 @@ function serveExport(req, res, pathname) {
       "Cache-Control": "private, max-age=300",
       "X-Content-Type-Options": "nosniff"
     });
+    if (req.method === "HEAD") {
+      res.end();
+      return true;
+    }
     fs5.createReadStream(file).pipe(res);
   } catch {
     res.writeHead(404).end("not found");
@@ -4328,6 +4372,37 @@ async function readJSON(req) {
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
+function sendNoSessionResponse(req, res, { sessionId, body }) {
+  const wantsHTML = (req.headers.accept || "").includes("text/html");
+  const endpoint = `${SERVER_NAME} ${PROTOCOL_VERSION}`;
+  if (sessionId) {
+    respond(404, "Unknown MCP session \u2014 it expired or the server restarted. Send a new `initialize` request to start one.");
+    return;
+  }
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    respond(405, `This is an MCP Streamable HTTP endpoint (${endpoint}), not a web page \u2014 a plain ${req.method || "GET"} has no session and is expected to fail. The server is fine: it answers POST \`initialize\` and returns an \`mcp-session-id\` header to use on later requests. Point an MCP client at this URL, or check /health for liveness.`);
+    return;
+  }
+  const method = typeof body?.method === "string" ? body.method : void 0;
+  respond(400, method ? `Missing \`mcp-session-id\` header for method \`${method}\`. Send \`initialize\` first and reuse the \`mcp-session-id\` it returns.` : "Missing MCP session. The first request must be a JSON-RPC `initialize` POST; its response carries the `mcp-session-id` to send on every later request.");
+  function respond(status, message) {
+    if (wantsHTML) {
+      res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" }).end(
+        `<!doctype html><meta charset="utf-8"><title>${escapeHTML(endpoint)}</title><body style="font:14px/1.6 system-ui;margin:3rem auto;max-width:44rem;padding:0 1rem"><h1 style="font-size:1.1rem">${escapeHTML(endpoint)}</h1><p>${escapeHTML(message)}</p></body>`
+      );
+      return;
+    }
+    res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: -32e3, message, data: { server: SERVER_NAME, version: PROTOCOL_VERSION } },
+      id: null
+    }));
+  }
+}
+function escapeHTML(value) {
+  return value.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+}
 async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
@@ -4342,7 +4417,7 @@ async function startHTTPServer() {
   const httpServer = (0, import_http.createServer)(async (req, res) => {
     try {
       const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
-      if (req.method === "GET" && serveExport(req, res, pathname)) return;
+      if ((req.method === "GET" || req.method === "HEAD") && serveExport(req, res, pathname)) return;
       if (pathname === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
         return;
@@ -4370,11 +4445,7 @@ async function startHTTPServer() {
         entry = { transport, server: mcpServer, dispose };
       }
       if (!entry) {
-        res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32e3, message: "Invalid or missing MCP session" },
-          id: null
-        }));
+        sendNoSessionResponse(req, res, { sessionId, body });
         return;
       }
       await entry.transport.handleRequest(req, res, body);

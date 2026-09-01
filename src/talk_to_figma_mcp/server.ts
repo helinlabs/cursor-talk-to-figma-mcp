@@ -150,6 +150,8 @@ function persistSelectedProject(project: SelectedProject | null): void {
   }
 }
 
+const SERVER_NAME = "TalkToFigmaMCP";
+
 function createMcpServer(options: McpServerOptions = {}) {
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
@@ -198,7 +200,7 @@ const bulkJobs = new Map<string, BulkJob>();
 
 // Create MCP server
 const server = new McpServer({
-  name: "TalkToFigmaMCP",
+  name: SERVER_NAME,
   version: PROTOCOL_VERSION,
 });
 
@@ -5005,6 +5007,64 @@ async function readJSON(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+// /mcp is a Streamable HTTP endpoint, not a page: a request that arrives without
+// a live session is usually one of three very different situations, and they used
+// to collapse into one opaque "Invalid or missing MCP session". Tell them apart so
+// a browser visit reads as "working as intended" instead of "the server is down",
+// and so a client whose session died is told to re-initialize.
+function sendNoSessionResponse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  { sessionId, body }: { sessionId?: string; body: unknown }
+): void {
+  const wantsHTML = (req.headers.accept || "").includes("text/html");
+  const endpoint = `${SERVER_NAME} ${PROTOCOL_VERSION}`;
+
+  // A session id we no longer hold: the server restarted, or the session was
+  // closed/expired. The spec says 404 here, which tells clients to re-initialize.
+  if (sessionId) {
+    respond(404, "Unknown MCP session — it expired or the server restarted. Send a new `initialize` request to start one.");
+    return;
+  }
+
+  // No session id and not a POST: almost always a human opening the URL in a
+  // browser, or a curl/health probe. This endpoint has nothing to show them.
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    respond(405, `This is an MCP Streamable HTTP endpoint (${endpoint}), not a web page — a plain ${req.method || "GET"} has no session and is expected to fail. The server is fine: it answers POST \`initialize\` and returns an \`mcp-session-id\` header to use on later requests. Point an MCP client at this URL, or check /health for liveness.`);
+    return;
+  }
+
+  // A POST without a session that is not an initialize request.
+  const method = typeof (body as { method?: unknown } | null)?.method === "string"
+    ? (body as { method: string }).method
+    : undefined;
+  respond(400, method
+    ? `Missing \`mcp-session-id\` header for method \`${method}\`. Send \`initialize\` first and reuse the \`mcp-session-id\` it returns.`
+    : "Missing MCP session. The first request must be a JSON-RPC `initialize` POST; its response carries the `mcp-session-id` to send on every later request.");
+
+  function respond(status: number, message: string): void {
+    if (wantsHTML) {
+      res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" }).end(
+        `<!doctype html><meta charset="utf-8"><title>${escapeHTML(endpoint)}</title>` +
+        `<body style="font:14px/1.6 system-ui;margin:3rem auto;max-width:44rem;padding:0 1rem">` +
+        `<h1 style="font-size:1.1rem">${escapeHTML(endpoint)}</h1>` +
+        `<p>${escapeHTML(message)}</p></body>`
+      );
+      return;
+    }
+    res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: -32000, message, data: { server: SERVER_NAME, version: PROTOCOL_VERSION } },
+      id: null,
+    }));
+  }
+}
+
+function escapeHTML(value: string): string {
+  return value.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
+}
+
 async function startHTTPServer() {
   if (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535) {
     throw new Error(`Invalid --port: ${httpPort}`);
@@ -5052,11 +5112,7 @@ async function startHTTPServer() {
       }
 
       if (!entry) {
-        res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Invalid or missing MCP session" },
-          id: null,
-        }));
+        sendNoSessionResponse(req, res, { sessionId, body });
         return;
       }
       await entry.transport.handleRequest(req, res, body);
