@@ -44,7 +44,9 @@ Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and
 | `renderer_crashed` | The window's Figma renderer had crashed (title and shell intact, but the document replaced by a "Something went wrong" page) and the launcher's Reload click did not bring it back. The launcher repairs this automatically before touching the plugin, so seeing it means the reload itself failed. |
 | `connect_timeout` | The plugin ran, but the relay never reported it connected — or it reconnected still speaking the old version, meaning Figma reloaded stale `code.js`. |
 
-Exit codes: `0` everything connected · `1` one or more projects failed (read the report) · `2` usage / config / Accessibility problem · `70` unexpected error.
+Exit codes: `0` everything connected · `1` one or more projects failed (read the report) · `2` usage / config / Accessibility problem · `75` a repair was already running so this run did nothing (**not** a failure — poll `--dry-run` until it reports connected) · `70` unexpected error.
+
+Repair runs are serialised: the mutating path holds an exclusive `flock` on `~/.talk-to-figma/launcher.lock`, because two runs clicking Figma's menus at once fight over which window is frontmost. `--dry-run` never takes the lock, so status checks are always free. The lock is held by the kernel and released when the process exits, so a killed run cannot strand it.
 
 `--dry-run` touches no UI and doubles as a status report: it lists each configured project with its live plugin version, channel, and whether it is connected, stale, or missing.
 

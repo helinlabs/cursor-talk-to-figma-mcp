@@ -3746,7 +3746,9 @@ function repairHint(subject: string): string {
     + `Run the nexus broker action \`${REPAIR_ACTION}\` on device \`${REPAIR_DEVICE}\` `
     + `(nexus MCP: broker_action_run with key="${REPAIR_ACTION}", target_device="${REPAIR_DEVICE}"), `
     + `wait for it to report ok, then retry this call. The action is idempotent — `
-    + `it reopens whatever is missing and leaves already-connected projects untouched.`;
+    + `it reopens whatever is missing and leaves already-connected projects untouched.\n`
+    + `If it reports "repair_in_progress" (exit 75), another machine is already repairing: `
+    + `that is NOT a failure — wait ~30s and retry this call rather than reporting an error.`;
 }
 
 // Everything the relay has an index for, live or not. Failure here is not

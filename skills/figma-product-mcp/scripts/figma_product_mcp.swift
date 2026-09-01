@@ -806,6 +806,40 @@ let reportPath = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".talk-to-figma")
     .appendingPathComponent("launcher-report.json")
 
+// Repair is UI automation — raising windows, opening menus, clicking items —
+// and two runs doing that at once fight: focus flips between them, and one
+// run's dismissOpenMenus() closes the menu the other just opened. That used to
+// be a rare hand-run collision. It is now the expected case, because a failing
+// MCP call tells every agent to run this action, so several machines hitting a
+// dead Figma within the same minute all reach for the launcher at once.
+//
+// flock is the right primitive here: the kernel drops it when the process
+// exits, so a crashed or killed run cannot strand the lock the way a lockfile
+// or lock directory would. --dry-run never takes it — it reads the relay and
+// touches no UI, so status checks must never queue behind a repair.
+enum RunLock {
+    case acquired(Int32)
+    case busy            // someone else is repairing right now
+    case unavailable     // could not even make the lock file
+}
+
+func acquireRunLock(waitFor timeout: TimeInterval) -> RunLock {
+    let directory = (("~/.talk-to-figma") as NSString).expandingTildeInPath
+    try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    let path = (directory as NSString).appendingPathComponent("launcher.lock")
+    let descriptor = open(path, O_CREAT | O_RDWR, 0o644)
+    // Never let a lock problem block an actual repair: degrade to running
+    // unguarded rather than refusing to fix anything.
+    guard descriptor >= 0 else { return .unavailable }
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return .acquired(descriptor) }
+        Thread.sleep(forTimeInterval: 0.5)
+    } while Date() < deadline
+    close(descriptor)
+    return .busy
+}
+
 func emitReport(_ report: Report) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -858,6 +892,39 @@ do {
         ))
         exit(0)
     }
+
+    // Everything past here mutates the UI, so serialise it.
+    //
+    // The grace period is deliberately short. Most collisions are several
+    // agents reacting to the same blip, where the run in front finds nothing
+    // wrong and exits in a few seconds — worth waiting for, because then this
+    // run answers the caller's real question ("is Figma usable now") itself.
+    // A genuine repair takes far longer than any wait worth holding a caller
+    // for, and --dry-run is free and unlocked, so past the grace period the
+    // honest move is to say a repair is running and let the caller poll that.
+    var lockDescriptor: Int32? = nil
+    switch acquireRunLock(waitFor: 20) {
+    case .acquired(let descriptor):
+        lockDescriptor = descriptor
+    case .unavailable:
+        break   // proceed unguarded rather than refuse to repair
+    case .busy:
+        FileHandle.standardError.write(Data("another launcher run is still repairing; not starting a second one\n".utf8))
+        let busySnapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+        emitReport(Report(
+            ok: false, dryRun: false,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results.map { entry in
+                var copy = entry
+                copy.status = "repair_in_progress"
+                copy.detail = "A repair is already running. Nothing is wrong — poll `run.sh --dry-run` (read-only, never blocked) until it reports connected."
+                return copy
+            },
+            relayReachable: busySnapshot != nil, relayProtocolVersion: busySnapshot?.protocolVersion, menuBar: nil
+        ))
+        exit(75)   // EX_TEMPFAIL — retry later, nothing is wrong
+    }
+    defer { if let lockDescriptor { close(lockDescriptor) } }
 
     let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
     guard AXIsProcessTrustedWithOptions([promptKey: options.promptAccessibility] as CFDictionary) else {
