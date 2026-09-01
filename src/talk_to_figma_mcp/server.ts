@@ -242,6 +242,70 @@ async function saveToRelayGallery(bytes: Uint8Array | string, suggestedName: str
   return result;
 }
 
+// 어느 문서에 말하는지는 **호출이 스스로 말한다.**
+//
+// 채널·프로젝트 선택은 여기(createMcpServer 인스턴스) 안의 상태다. 세션을 붙들고 있는
+// 호출자는 join_channel 한 번이면 되지만, **세션 없는 호출자는 그럴 수가 없다** —
+// 넥서스가 터널 MCP 를 도구로 투영할 때 호출마다 새 세션이 뜨고, 그때마다 이 상태가
+// 새로 만들어진다. 그러면 ensureProjectSelected() 가 디스크에 남은 마지막 선택으로
+// 대신 채우는데, 그건 **다른 사람이 마지막으로 고른 문서**다.
+//
+// 조용히 틀리는 게 이 버그의 성질이다(2026-09-01 실측: GW_Product 를 조인하고 두 번째
+// 호출부터 T_Product 를 읽었고, 에러는 나지 않았다). ASO 문구를 읽어 DB 에 미러하는
+// 작업이라면 튜터앱 문구가 짐워크 것으로 적재된다.
+//
+// 그래서 문서를 만지는 모든 도구가 `project` 를 선택 인자로 받는다. 주면 그 호출에서만
+// 그 프로젝트로 붙고, **디스크 기본값은 건드리지 않는다** — 한 호출자의 지정이 남의
+// 기본값을 바꾸면 같은 문제를 방향만 바꿔 되풀이한다. 안 주면 종전대로 동작한다.
+const PROJECT_ARG_EXEMPT = new Set([
+  // 프로젝트를 고르거나 릴레이 자체를 보는 도구들 — 여기에 project 를 받으면 순환이다.
+  "join_channel",
+  "list_figma_channels",
+  "list_figma_projects",
+  "use_figma_project",
+  "get_figma_workload",
+  "list_relay_errors",
+  "get_bulk_operation",
+  "cancel_bulk_operation",
+]);
+
+const PROJECT_ARG_DESCRIPTION =
+  "Which Figma project/document this call targets (name, fileKey, or projectKey; see list_figma_projects). "
+  + "Pass this when you are not holding an MCP session across calls — without it the call falls back to the "
+  + "last selection, which another caller may have changed. Does not change the persisted default.";
+
+// 한 세션 안에서 서로 다른 프로젝트를 동시에 부르면 붙는 순서와 명령 보내는 순서가
+// 엇갈린다. 지정이 있는 호출만 줄을 세운다(지정 없는 호출은 종전 경로 그대로다).
+let projectPinQueue: Promise<unknown> = Promise.resolve();
+function withPinnedProject<T>(project: string, run: () => Promise<T>): Promise<T> {
+  const next = projectPinQueue.then(async () => {
+    await selectProject(project, { persist: false });
+    return run();
+  });
+  // 실패가 뒤를 막지 않게 큐 자체는 항상 이어 간다.
+  projectPinQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+const registerTool = server.tool.bind(server);
+server.tool = ((name: string, description: string, shape: any, handler: any, ...rest: any[]) => {
+  if (typeof shape !== "object" || shape === null || typeof handler !== "function" || PROJECT_ARG_EXEMPT.has(name)) {
+    return (registerTool as any)(name, description, shape, handler, ...rest);
+  }
+  const shaped = { ...shape, project: z.string().optional().describe(PROJECT_ARG_DESCRIPTION) };
+  return (registerTool as any)(
+    name,
+    description,
+    shaped,
+    async (args: any, extra: any) => {
+      const { project, ...forwarded } = args ?? {};
+      if (!project) return handler(args, extra);
+      return withPinnedProject(String(project), () => handler(forwarded, extra));
+    },
+    ...rest,
+  );
+}) as typeof server.tool;
+
 // Document Info Tool
 server.tool(
   "get_document_info",
@@ -3769,7 +3833,12 @@ async function knownOfflineProjects(live: any[]): Promise<{ name: string; projec
   }
 }
 
-async function selectProject(query?: string): Promise<any> {
+async function selectProject(
+  query?: string,
+  // persist:false 는 **이 호출만** 그 프로젝트로 붙인다. 호출 단위 지정이 디스크
+  // 기본값을 바꾸면, 다음에 지정 없이 들어온 남의 호출이 그 문서를 읽는다.
+  options: { persist?: boolean } = {},
+): Promise<any> {
   const projects = await relayProjects();
   const live = projects.filter((project: any) => project.connectionCount > 0 && project.recommendedChannel);
   if (!live.length) {
@@ -3802,7 +3871,7 @@ async function selectProject(query?: string): Promise<any> {
   const project = matches[0];
   await joinChannel(project.recommendedChannel);
   selectedProject = { projectKey: project.projectKey, name: project.name, fileKey: project.fileKey };
-  persistSelectedProject(selectedProject);
+  if (options.persist !== false) persistSelectedProject(selectedProject);
   return project;
 }
 

@@ -20,9 +20,18 @@ bun socket               # (dev only) run relay in foreground — prefer the
                          # launchd service via scripts/relayctl.sh (see below)
 bun run start            # Run built MCP server
 bun setup                # Full setup (install + write .cursor/mcp.json + .mcp.json)
+
+npm test                 # console policy + HTTP contract checks (CI runs both)
+npm run test:http        # builds, then drives a real /mcp session
 ```
 
-There is no test suite or linter configured.
+No linter is configured.
+
+**`test:http` is where the tool-surface contract lives.** It asserts the shape
+of `tools/list` — notably that every document-touching tool exposes the optional
+`project` argument, and that the seven relay/selection tools do not. A tool
+registered in a shape the wrapper cannot see would otherwise read whichever
+document the last caller selected, silently.
 
 ## Running the Relay (launchd service)
 
