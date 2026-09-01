@@ -1,8 +1,6 @@
 # The repo had no CI, so nothing was checking the checked-in browser sources —
 # console.html has no build step and is only ever parsed by Babel in the
 # browser, which means a syntax slip or a regressed retry policy ships silently.
-# This runs the checks that need nothing but node; test:http needs bun and a
-# build, so it stays a local/manual step until that toolchain is wired here.
 name: ci
 
 on:
@@ -19,3 +17,21 @@ jobs:
         with:
           node-version: '22'
       - run: npm run test:console
+
+  # The MCP server's contract checks (tools/list shape, session handling, export
+  # path guards) only run against a real build, so this job needs bun for tsup.
+  # It was a manual step before, which meant the assertions existed but nothing
+  # enforced them — a tool registered in a shape the project-argument wrapper
+  # cannot see would have reached main green.
+  http:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: npm run test:http
