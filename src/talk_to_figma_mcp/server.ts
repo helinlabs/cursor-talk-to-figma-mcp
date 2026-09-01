@@ -3725,18 +3725,72 @@ async function relayProjects(): Promise<any[]> {
   return (await relayProjectsPayload()).projects || [];
 }
 
+
+// --- Diagnosing an unusable project ---------------------------------------
+//
+// A project whose plugin is not running simply drops out of /projects, so the
+// old message ("matched 0 projects") read exactly like a typo and left the
+// caller with nowhere to go. That is the whole reason a broken Figma MCP used
+// to need a human who happened to know about the launcher. The relay does know
+// the difference: /projects is what is live, and the disk index is everything
+// it has ever seen. Comparing the two turns a dead end into a repair.
+const REPAIR_DEVICE = process.env.FIGMA_REPAIR_DEVICE || "macmini-1";
+const REPAIR_ACTION = "figma-open-projects";
+
+// Named so an agent can act on it without knowing any of the above: the run is
+// idempotent and leaves healthy connections alone, so it is always safe to
+// suggest, and it repairs every configured project rather than needing the
+// caller to map a display name onto a launcher project id.
+function repairHint(subject: string): string {
+  return `${subject}\n\nRECOVERY — this means the Figma plugin is not running on ${REPAIR_DEVICE}. `
+    + `Run the nexus broker action \`${REPAIR_ACTION}\` on device \`${REPAIR_DEVICE}\` `
+    + `(nexus MCP: broker_action_run with key="${REPAIR_ACTION}", target_device="${REPAIR_DEVICE}"), `
+    + `wait for it to report ok, then retry this call. The action is idempotent — `
+    + `it reopens whatever is missing and leaves already-connected projects untouched.`;
+}
+
+// Everything the relay has an index for, live or not. Failure here is not
+// fatal: it only costs a less specific message.
+async function knownOfflineProjects(live: any[]): Promise<{ name: string; projectKey: string }[]> {
+  try {
+    const response = await fetch(relayHttpUrl("index/status"));
+    if (!response.ok) return [];
+    const data = (await response.json()) as any;
+    const liveKeys = new Set(live.map((project: any) => project.projectKey));
+    return (data.diskIndexes || [])
+      .filter((entry: any) => !liveKeys.has(entry.projectKey))
+      .map((entry: any) => ({ name: entry.projectName || entry.projectKey, projectKey: entry.projectKey }));
+  } catch {
+    return [];
+  }
+}
+
 async function selectProject(query?: string): Promise<any> {
   const projects = await relayProjects();
   const live = projects.filter((project: any) => project.connectionCount > 0 && project.recommendedChannel);
-  if (!live.length) throw new Error("No live Figma projects are connected");
-  let matches = live;
-  if (query) {
-    const normalized = query.toLowerCase();
-    matches = live.filter((project: any) =>
-      [project.name, project.fileKey, project.projectKey].some((value) => String(value || "").toLowerCase().includes(normalized))
-    );
+  if (!live.length) {
+    throw new Error(repairHint("No live Figma projects are connected — the relay is up but no plugin is talking to it."));
   }
+  const matchesQuery = (candidate: any) => {
+    const normalized = String(query).toLowerCase();
+    return [candidate.name, candidate.fileKey, candidate.projectKey]
+      .some((value) => String(value || "").toLowerCase().includes(normalized));
+  };
+  let matches = live;
+  if (query) matches = live.filter(matchesQuery);
   if (matches.length !== 1) {
+    // Zero live matches is ambiguous on its face — a typo and a dead plugin
+    // look identical. Check the index before blaming the caller's spelling.
+    if (query && matches.length === 0) {
+      const offline = (await knownOfflineProjects(live)).filter(matchesQuery);
+      if (offline.length) {
+        throw new Error(repairHint(
+          `"${query}" matches a known project (${offline.map((project) => project.name).join(", ")}) `
+          + `but it has no live plugin, so it cannot be driven right now. `
+          + `Live projects: ${live.map((project: any) => project.name).join(", ")}.`,
+        ));
+      }
+    }
     throw new Error(query
       ? `Project query matched ${matches.length} projects: ${matches.map((project: any) => project.name).join(", ") || "none"}`
       : `Choose a project first — call use_figma_project with one of: ${live.map((project: any) => project.name).join(", ")}`);
@@ -3810,6 +3864,22 @@ async function ensureProjectSelected(): Promise<void> {
   await selectProject();
 }
 
+
+// A timed-out request is ambiguous: a heavy scan and a plugin that died look
+// the same from here. The relay can tell them apart, so ask before blaming the
+// operation — a dead plugin is repairable and a slow one is not.
+async function selectedProjectStillLive(): Promise<boolean> {
+  try {
+    const projects = await relayProjects();
+    const key = currentProjectKey();
+    return projects.some((project: any) =>
+      project.connectionCount > 0
+      && [project.projectKey, project.fileKey, project.name].some((value) => String(value || "") === key));
+  } catch {
+    return true;   // relay unreachable is a different failure; do not mislabel
+  }
+}
+
 async function sendCommandToFigma(
   command: FigmaCommand,
   params: unknown = {},
@@ -3861,7 +3931,12 @@ async function sendCommandToFigma(
           ws.send(JSON.stringify({ type: "request_timeout", id, channel: currentChannel, requesterId }));
         }
         logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1000} seconds`);
-        reject(new Error('Request to Figma timed out'));
+        void selectedProjectStillLive().then((live) => {
+          reject(new Error(live
+            ? 'Request to Figma timed out'
+            : repairHint(`Request to Figma timed out, and "${selectedProject?.name || currentProjectKey()}" `
+                + `no longer has a live plugin — the connection died mid-session rather than the operation being slow.`)));
+        });
       }
     }, timeoutMs);
 
