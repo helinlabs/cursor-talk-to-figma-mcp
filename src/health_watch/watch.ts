@@ -682,6 +682,14 @@ async function report(state: State, health: Health): Promise<void> {
     state.status = status;
     state.since = Date.now();
     state.checks = 1;
+    // Persist the transition BEFORE announcing it. This process is restarted
+    // often — launchd brings it back on any exit — and saving afterwards meant
+    // a restart between the post and the save left "healthy" on disk, so the
+    // next process decided the very same outage was new and paged again. That
+    // is the duplicate alert. messageTs stays null until the post succeeds, so
+    // a post that fails is retried by the throttled path rather than lost.
+    state.messageTs = null;
+    saveState(state);
     const posted = await slack("chat.postMessage", {
       text: status === "healthy" ? healthyText(state, health) : degradedText(state, health),
     });
@@ -757,7 +765,23 @@ let last: Health = { ok: false, relayUp: false, expected: [], live: [], missing:
 let lastDeepAt = 0;
 const deepEvery = () => (last.deep && !last.deep.ok ? DEEP_RETRY_MS : DEEP_MS);
 
-async function tick(): Promise<void> {
+// Three things call tick(): the interval, startup, and /check. Overlapping
+// runs would each read the status before either wrote it, and both would treat
+// the same change as new.
+let ticking = false;
+
+async function tick(): Promise<boolean> {
+  if (ticking) return false;
+  ticking = true;
+  try {
+    await runTick();
+    return true;
+  } finally {
+    ticking = false;
+  }
+}
+
+async function runTick(): Promise<void> {
   const health = await shallowCheck();
   state.checks += 1;
   state.shallowHistory.push(health.shallowMs);
@@ -833,7 +857,7 @@ Bun.serve({
     if (url.pathname === "/check") {
       lastDeepAt = 0;
       return tick()
-        .then(() => new Response(JSON.stringify({ ran: true, status: state.status, last }, null, 2),
+        .then((ran) => new Response(JSON.stringify({ ran, status: state.status, last }, null, 2),
           { headers: { "Content-Type": "application/json" } }))
         .catch((error) => new Response(JSON.stringify({ ran: false, error: String(error) }),
           { status: 500, headers: { "Content-Type": "application/json" } }));
