@@ -508,12 +508,53 @@ function speedText(state: State): string | null {
   return lines.join("\n");
 }
 
+
+// --- traffic ---------------------------------------------------------------
+// The relay now keeps per-project, per-command and per-caller aggregates. This
+// pulls the useful slice into the same thread as the speed record, because the
+// two answer the same kind of question — how is this holding up — and neither
+// belongs in the status card.
+const TRAFFIC_DAYS = Number(process.env.HEALTH_TRAFFIC_DAYS || 1);
+
+async function trafficText(): Promise<string | null> {
+  let stats: any;
+  try {
+    stats = await getJson(`/stats?days=${TRAFFIC_DAYS}&limit=6`, 8000);
+  } catch {
+    return null;   // an older relay without /stats simply omits this section
+  }
+  const slow: any[] = stats?.slowestCommands || [];
+  const callers: any[] = stats?.requesters || [];
+  if (!slow.length && !callers.length) return null;
+
+  const lines = [`:bar_chart: *요청 통계* · 최근 ${TRAFFIC_DAYS}일`];
+  if (slow.length) {
+    lines.push("• 느린 명령 (평균 기준)");
+    for (const row of slow.slice(0, 5)) {
+      const failed = row.failed ? ` · 실패 ${row.failed}` : "";
+      lines.push(`   ${displayName(row.project)} · \`${row.subject}\` — ${row.n}회 · 평균 ${secs(row.meanMs)} `
+        + `· p95 ${row.p95} · 최대 ${secs(row.maxMs)}${failed}`);
+    }
+  }
+  if (callers.length) {
+    lines.push("• 요청자별");
+    for (const row of callers.slice(0, 5)) {
+      const failed = row.failed ? ` · 실패 ${row.failed}` : "";
+      const wait = row.meanWaitMs > 200 ? ` · 평균 대기 ${secs(row.meanWaitMs)}` : "";
+      lines.push(`   ${displayName(row.project)} · ${row.subject} — ${row.n}회 · 평균 ${secs(row.meanMs)}${wait}${failed}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 // The thread hangs off whichever status card is current, so a new card starts
 // a new thread rather than stranding the record under an old one.
 async function reportSpeed(state: State): Promise<void> {
   const parent = state.messageTs;
   if (!parent) return;
-  const text = speedText(state);
+  const speed = speedText(state);
+  const traffic = await trafficText();
+  const text = [speed, traffic].filter(Boolean).join("\n\n");
   if (!text) return;
   if (state.speedParentTs !== parent) {
     state.speedParentTs = parent;
