@@ -49,7 +49,11 @@ const ALERT_USER = process.env.HEALTH_ALERT_USER || "U0A91CC94TZ";   // Garen
 const PORT = Number(process.env.HEALTH_PORT || 3057);
 
 const SHALLOW_MS = Number(process.env.HEALTH_SHALLOW_MS || 60_000);
-const DEEP_MS = Number(process.env.HEALTH_DEEP_MS || 15 * 60_000);
+// One project per turn, so the interval that matters is this times the number
+// of managed projects: at 5 minutes and six projects each file is exercised
+// about every half hour, which is close enough to catch a wedged plugin before
+// someone runs into it without turning the probe into steady load.
+const DEEP_MS = Number(process.env.HEALTH_DEEP_MS || 5 * 60_000);
 // After a deep failure the picture is stale in the direction that matters, so
 // re-ask sooner than the normal cadence.
 const DEEP_RETRY_MS = Number(process.env.HEALTH_DEEP_RETRY_MS || 2 * 60_000);
