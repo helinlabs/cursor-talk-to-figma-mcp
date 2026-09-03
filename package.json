@@ -18,7 +18,7 @@
     "setup": "./scripts/setup.sh",
     "build": "tsup",
     "test:http": "bun run build && node scripts/http-smoke.mjs",
-    "test:console": "node scripts/viewport-poll-policy.test.mjs",
+    "test:console": "node scripts/viewport-poll-policy.test.mjs && node scripts/health-speed-policy.test.mjs",
     "test": "npm run test:console && npm run test:http",
     "build:watch": "tsup --watch",
     "dev": "bun run build:watch",

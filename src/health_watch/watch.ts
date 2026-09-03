@@ -116,8 +116,15 @@ function loadState(): State {
     const loaded = JSON.parse(readFileSync(STATE_PATH, "utf8"));
     return {
       ...blankState(), ...loaded,
-      shallowHistory: Array.isArray(loaded.shallowHistory) ? loaded.shallowHistory : [],
-      deepHistory: Array.isArray(loaded.deepHistory) ? loaded.deepHistory : [],
+      shallowHistory: Array.isArray(loaded.shallowHistory)
+        ? loaded.shallowHistory.filter(usableMs)
+        : [],
+      // Scrub on load. The bad samples are already on disk, and history
+      // outlives a deploy — without this the fix would not show up on the card
+      // until twenty more checks had pushed them out of the window.
+      deepHistory: Array.isArray(loaded.deepHistory)
+        ? loaded.deepHistory.filter((entry: { ok?: boolean; ms?: number }) => !entry?.ok || usableMs(entry?.ms))
+        : [],
     };
   } catch {
     return blankState();
@@ -320,9 +327,16 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
 
   const ok = first.ok || second.ok;
   const passes = [first, second].filter((attempt) => attempt.ok);
-  const measured = passes.length
-    ? Math.min(...passes.map((attempt) => attempt.ms ?? Number.MAX_SAFE_INTEGER))
-    : undefined;
+  // Take the lower of the two, but only among attempts that actually carry a
+  // timing. The old form substituted MAX_SAFE_INTEGER for a missing ms so that
+  // Math.min would ignore it — except when *every* pass was missing one, and
+  // then the sentinel came back out as the measurement. It went into the
+  // history and the twenty-sample average, which is how the card came to claim
+  // a 9007199254741s deep check. A missing number has to stay missing.
+  const timings = passes
+    .map((attempt) => attempt.ms)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const measured = timings.length ? Math.min(...timings) : undefined;
 
   let detail: string;
   if (first.ok && second.ok) {
@@ -462,9 +476,27 @@ function coverage(health: Health): string {
 // which is the question worth putting on the card.
 const SPEED_WINDOW = Number(process.env.HEALTH_SPEED_WINDOW || 20);
 
-function mean(values: number[]): number | null {
-  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+// The rule for what counts as a measurement, kept in one evaluable block so the
+// test asserts on the same source the watcher runs (same trick as the console's
+// viewport-poll policy). Plain JS on purpose — no annotations to strip.
+//
+// >>> speed-sample-policy
+// A duration we are willing to believe. Anything past this is not a slow
+// plugin, it is a bug in our own bookkeeping — a deep check times out long
+// before an hour, so an hour is a ceiling, not a tuning knob.
+const MAX_PLAUSIBLE_MS = 60 * 60_000;
+
+function usableMs(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_PLAUSIBLE_MS;
 }
+
+// Averaging is where one bad sample does its damage: it survives twenty
+// readings and drags the trend arrow with it. Only believable numbers count.
+function mean(values) {
+  const usable = values.filter(usableMs);
+  return usable.length ? usable.reduce((sum, value) => sum + value, 0) / usable.length : null;
+}
+// <<< speed-sample-policy
 
 function trend(series: number[]): { recent: number | null; delta: number | null } {
   const recent = mean(series.slice(-SPEED_WINDOW));
@@ -503,11 +535,20 @@ function speedText(state: State): string | null {
     `:stopwatch: *속도 기록* · 최근 ${SPEED_WINDOW}회 평균 (화살표는 그 이전 ${SPEED_WINDOW}회 대비)`,
     ...parts.map((part) => `• ${part}`),
   ];
-  const recent = state.deepHistory.slice(-6).reverse();
-  if (recent.length) {
-    lines.push("• 최근 심층: " + recent
-      .map((entry) => `${displayName(entry.project)} ${entry.ok ? secs(entry.ms) : "실패"}`)
-      .join(" · "));
+  // One line per product. Six of these joined by "·" ran past the width of the
+  // card and had to be read sideways; the question being asked here is "which
+  // product is slow", and that is a column, not a sentence.
+  const latest = new Map<string, { ok: boolean; ms: number }>();
+  for (const entry of state.deepHistory.slice(-SPEED_WINDOW)) {
+    latest.set(entry.project, { ok: entry.ok, ms: entry.ms });
+  }
+  if (latest.size) {
+    lines.push("• 최근 심층");
+    const rows = [...latest].map(([project, entry]) => ({ name: displayName(project), entry }));
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    for (const row of rows) {
+      lines.push(`    ${row.name} — ${row.entry.ok ? secs(row.entry.ms) : "실패"}`);
+    }
   }
   lines.push(`• 갱신: ${clock()}`);
   return lines.join("\n");
@@ -739,7 +780,17 @@ async function tick(): Promise<void> {
     damped.deep = await deepCheck(state);
     if (damped.deep) {
       if (damped.deep.ms == null) damped.deep.ms = Date.now() - deepStarted;
-      state.deepHistory.push({ at: Date.now(), project: damped.deep.project, ok: damped.deep.ok, ms: damped.deep.ms });
+      // Guard the boundary, not just the producer. One bad sample poisons the
+      // next twenty readings and can page someone as an "outlier", so a value
+      // that is not a plausible duration never enters the record.
+      if (usableMs(damped.deep.ms) || !damped.deep.ok) {
+        state.deepHistory.push({
+          at: Date.now(),
+          project: damped.deep.project,
+          ok: damped.deep.ok && usableMs(damped.deep.ms),
+          ms: damped.deep.ms ?? 0,
+        });
+      }
       if (state.deepHistory.length > SPEED_WINDOW * 3) state.deepHistory.splice(0, state.deepHistory.length - SPEED_WINDOW * 3);
     }
   } else {
