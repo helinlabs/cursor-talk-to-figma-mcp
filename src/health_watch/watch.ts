@@ -399,7 +399,10 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     const pages: any = await timed("pages", () =>
       runCommand(channel, "list_pages", { withChildCounts: false }, DEEP_COMMAND_MS));
     const list: any[] = Array.isArray(pages) ? pages : (pages?.pages || []);
-    if (!list.length) return { project: name, ok: false, detail: "plugin answered but reported no pages" };
+    if (!list.length) {
+      return { project: name, ok: false, ms: Date.now() - probeStarted,
+        detail: "plugin answered but reported no pages" };
+    }
     const currentId: string | null = pages?.currentPageId ?? null;
 
     // Page selection, for real — but put the document back where it was. These
@@ -416,16 +419,34 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // Reading the page back: get_document_info loads only the current page,
     // where get_node_info on a page serialises its whole subtree.
     const info: any = await timed("read", () => runCommand(channel, "get_document_info", {}, DEEP_COMMAND_MS));
-    const children: any[] = info?.children || info?.node?.children || [];
-    const target = children.find((child: any) => child?.id) ?? null;
+    const childrenOf = (payload: any): any[] => payload?.children || payload?.node?.children || [];
+    let target = childrenOf(info).find((child: any) => child?.id) ?? null;
+
+    // GW_Product's current page is empty, so the probe kept reporting "no
+    // image target" and its export path was never actually exercised — the
+    // heaviest thing the plugin does went untested on the file most likely to
+    // break. get_document_info takes a pageId, so look at a couple of other
+    // pages without moving anyone's current page.
     if (!target) {
-      return { project: name, ok: true, detail: `${list.length} pages, selection ok, empty page (no image probe) · ${timings.join(" · ")}` };
+      for (const page of list.filter((entry: any) => entry?.id && entry.id !== pageId).slice(0, 2)) {
+        const other: any = await timed("read2", () =>
+          runCommand(channel, "get_document_info", { pageId: page.id }, DEEP_COMMAND_MS));
+        target = childrenOf(other).find((child: any) => child?.id) ?? null;
+        if (target) break;
+      }
+    }
+    if (!target) {
+      return { project: name, ok: true, ms: Date.now() - probeStarted,
+        detail: `${loadNote} · ${list.length} pages, selection ok, 내용 있는 페이지 없음 · ${timings.join(" · ")}` };
     }
 
     const image = await timed("image", () => runCommand(channel, "export_node_as_image",
       { nodeId: target.id, format: "PNG", scale: 0.05 }, DEEP_COMMAND_MS));
     const bytes = imageBytes(image);
-    if (!bytes) return { project: name, ok: false, detail: `image export returned nothing · ${timings.join(" · ")}` };
+    if (!bytes) {
+      return { project: name, ok: false, ms: Date.now() - probeStarted,
+        detail: `image export returned nothing · ${timings.join(" · ")}` };
+    }
     return { project: name, ok: true, ms: Date.now() - probeStarted,
       detail: `${loadNote} · ${list.length} pages, selection ok, node read, image ${sizeOf(bytes)} · ${timings.join(" · ")}` };
   } catch (error) {
