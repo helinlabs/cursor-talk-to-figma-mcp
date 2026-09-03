@@ -46,9 +46,29 @@ case "${1:-status}" in
 </dict>
 </plist>
 PLIST
-    launchctl bootout "$domain/$label" 2>/dev/null
-    launchctl bootstrap "$domain" "$plist" && launchctl kickstart -k "$domain/$label"
-    echo "installed $label"
+    # bootout returns before the job is actually gone, and bootstrapping into
+    # that window fails with "Input/output error" — which the old chaining then
+    # reported as a successful install while nothing was running.
+    if launchctl print "$domain/$label" >/dev/null 2>&1; then
+      launchctl bootout "$domain/$label" 2>/dev/null
+      for _ in $(seq 1 20); do
+        launchctl print "$domain/$label" >/dev/null 2>&1 || break
+        sleep 0.5
+      done
+    fi
+    if ! launchctl bootstrap "$domain" "$plist"; then
+      echo "bootstrap FAILED for $label"; exit 1
+    fi
+    launchctl kickstart -k "$domain/$label" >/dev/null 2>&1
+    for _ in $(seq 1 20); do
+      curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:3057/health" && break
+      sleep 0.5
+    done
+    if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:3057/health"; then
+      echo "installed $label (answering on :3057)"
+    else
+      echo "installed $label BUT it is not answering on :3057 — check $log_dir/health.log"; exit 1
+    fi
     [[ -s "$token_file" ]] || echo "⚠️  no Slack token at $token_file — checks will run but nothing will be reported"
     ;;
   restart) launchctl kickstart -k "$domain/$label" && echo restarted ;;
