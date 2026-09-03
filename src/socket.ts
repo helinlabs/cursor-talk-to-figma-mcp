@@ -296,14 +296,46 @@ async function captureLocalAppPreviews(): Promise<void> {
   }
 }
 
+// The display sleeps after ten minutes idle and the caffeinate running on this
+// box is `-s`, which blocks system sleep and not display sleep. Once the
+// display sleeps WindowServer stops compositing, so `screencapture` keeps
+// returning the same stale frame and the console shows a picture that no longer
+// moves. The WebRTC path holds an IOKit assertion from inside its capture
+// agent; this path has no long-lived process of its own, so it borrows one.
+//
+// `-u -t 1` declares user activity, which is what actually WAKES a display that
+// is already asleep — holding off sleep does nothing for one that already is.
+// `-d` then keeps it awake, and dies with the loop, so the display is free to
+// sleep again once nobody is watching.
+let displayWake: ReturnType<typeof Bun.spawn> | null = null;
+
+function holdDisplayAwake(): void {
+  if (displayWake) return;
+  try {
+    Bun.spawn(["/usr/bin/caffeinate", "-u", "-t", "1"]);           // wake it now
+    displayWake = Bun.spawn(["/usr/bin/caffeinate", "-d"]);        // keep it awake
+    console.log("\n☀️  holding off display sleep while the JPEG preview is watched");
+  } catch (error) {
+    console.error("could not hold off display sleep:", error);
+  }
+}
+
+function releaseDisplay(): void {
+  if (!displayWake) return;
+  try { displayWake.kill(); } catch {}
+  displayWake = null;
+}
+
 function refreshLocalPreviewLoop(): void {
   const needed = [...previewSubscriptions.values()].some((subscription) => subscription.mode === "app-window");
   if (needed && !localPreviewTimer) {
+    holdDisplayAwake();
     void captureLocalAppPreviews();
     localPreviewTimer = setInterval(() => void captureLocalAppPreviews(), 2000);
   } else if (!needed && localPreviewTimer) {
     clearInterval(localPreviewTimer);
     localPreviewTimer = null;
+    releaseDisplay();
   }
 }
 
