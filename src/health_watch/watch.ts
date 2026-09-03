@@ -81,7 +81,8 @@ type Health = {
   expected: string[];
   live: string[];
   missing: string[];
-  deep: { project: string; ok: boolean; detail: string } | null;
+  shallowMs: number;
+  deep: { project: string; ok: boolean; detail: string; ms?: number } | null;
 };
 
 type State = {
@@ -92,17 +93,27 @@ type State = {
   lastPostedAt: number;
   streak: Record<string, number>;
   deepCursor: number;
+  // Recent timings, newest last, kept separately because the two probes sample
+  // at very different rates. A probe that is merely getting slower is the
+  // interesting signal — it shows up here long before anything fails outright.
+  shallowHistory: number[];
+  deepHistory: Array<{ at: number; project: string; ok: boolean; ms: number }>;
 };
 
 function loadState(): State {
   try {
-    return { ...blankState(), ...JSON.parse(readFileSync(STATE_PATH, "utf8")) };
+    const loaded = JSON.parse(readFileSync(STATE_PATH, "utf8"));
+    return {
+      ...blankState(), ...loaded,
+      shallowHistory: Array.isArray(loaded.shallowHistory) ? loaded.shallowHistory : [],
+      deepHistory: Array.isArray(loaded.deepHistory) ? loaded.deepHistory : [],
+    };
   } catch {
     return blankState();
   }
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, streak: {}, deepCursor: 0 };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, streak: {}, deepCursor: 0, shallowHistory: [], deepHistory: [] };
 }
 function saveState(state: State): void {
   try {
@@ -185,11 +196,12 @@ async function getJson(path: string, timeoutMs = 5000): Promise<any> {
 }
 
 async function shallowCheck(): Promise<Health> {
+  const started = Date.now();
   const expected = expectedProjects();
   try {
     await getJson("/health");
   } catch (error) {
-    return { ok: false, relayUp: false, expected, live: [], missing: expected, deep: null };
+    return { ok: false, relayUp: false, expected, live: [], missing: expected, shallowMs: Date.now() - started, deep: null };
   }
   let live: string[] = [];
   try {
@@ -198,10 +210,10 @@ async function shallowCheck(): Promise<Health> {
       .filter((project: any) => project.connectionCount > 0)
       .map((project: any) => String(project.name));
   } catch {
-    return { ok: false, relayUp: true, expected, live: [], missing: expected, deep: null };
+    return { ok: false, relayUp: true, expected, live: [], missing: expected, shallowMs: Date.now() - started, deep: null };
   }
   const missing = expected.filter((name) => !isPresent(name, live));
-  return { ok: missing.length === 0, relayUp: true, expected, live, missing, deep: null };
+  return { ok: missing.length === 0, relayUp: true, expected, live, missing, shallowMs: Date.now() - started, deep: null };
 }
 
 // --- deep check ------------------------------------------------------------
@@ -372,11 +384,54 @@ function coverage(health: Health): string {
   return `필수 ${covered}/${health.expected.length}` + (extra ? ` · 그 외 ${extra}` : "");
 }
 
+
+// --- speed trend -----------------------------------------------------------
+// One number says nothing. Averaging a recent window and comparing it against
+// the window before it turns the same samples into "is this getting worse",
+// which is the question worth putting on the card.
+const SPEED_WINDOW = Number(process.env.HEALTH_SPEED_WINDOW || 20);
+
+function mean(values: number[]): number | null {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+}
+
+function trend(series: number[]): { recent: number | null; delta: number | null } {
+  const recent = mean(series.slice(-SPEED_WINDOW));
+  const prior = mean(series.slice(-SPEED_WINDOW * 2, -SPEED_WINDOW));
+  return { recent, delta: recent != null && prior != null ? recent - prior : null };
+}
+
+// Only call a change a change when it is big enough to mean something; a couple
+// of milliseconds of noise dressed up with an arrow is worse than no arrow.
+function withTrend(label: string, series: number[], format: (ms: number) => string): string | null {
+  const { recent, delta } = trend(series);
+  if (recent == null) return null;
+  let suffix = "";
+  if (delta != null && Math.abs(delta) >= Math.max(5, recent * 0.1)) {
+    suffix = ` ${delta > 0 ? "▲" : "▼"}${format(Math.abs(delta))}`;
+  }
+  return `${label} ${format(recent)}${suffix}`;
+}
+
+const ms = (value: number) => `${Math.round(value)}ms`;
+const secs = (value: number) => `${(value / 1000).toFixed(1)}s`;
+
+function speedLine(state: State): string | null {
+  const parts = [
+    withTrend("릴레이", state.shallowHistory, ms),
+    withTrend("심층", state.deepHistory.filter((entry) => entry.ok).map((entry) => entry.ms), secs),
+  ].filter(Boolean);
+  if (!parts.length) return null;
+  const samples = Math.min(SPEED_WINDOW, Math.max(state.shallowHistory.length, state.deepHistory.length));
+  return `• 속도(최근 ${samples}회): ${parts.join(" · ")}`;
+}
+
 function healthyText(state: State, health: Health): string {
   const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
     + `• 연결: ${coverage(health)}\n`
-    + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}`;
+    + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}`
+    + (speedLine(state) ? `\n${speedLine(state)}` : "");
 }
 
 function degradedText(state: State, health: Health): string {
@@ -437,13 +492,17 @@ async function report(state: State, health: Health): Promise<void> {
 
 // --- loop ------------------------------------------------------------------
 let state = loadState();
-let last: Health = { ok: false, relayUp: false, expected: [], live: [], missing: [], deep: null };
+let last: Health = { ok: false, relayUp: false, expected: [], live: [], missing: [], shallowMs: 0, deep: null };
 let lastDeepAt = 0;
 const deepEvery = () => (last.deep && !last.deep.ok ? DEEP_RETRY_MS : DEEP_MS);
 
 async function tick(): Promise<void> {
   const health = await shallowCheck();
   state.checks += 1;
+  state.shallowHistory.push(health.shallowMs);
+  if (state.shallowHistory.length > SPEED_WINDOW * 3) {
+    state.shallowHistory.splice(0, state.shallowHistory.length - SPEED_WINDOW * 3);
+  }
 
   // Streak damping: a project that blinks out for one poll is usually a plugin
   // reconnecting on its own, and paging a human for that trains them to ignore
@@ -456,7 +515,13 @@ async function tick(): Promise<void> {
 
   if (damped.ok && Date.now() - lastDeepAt >= deepEvery()) {
     lastDeepAt = Date.now();
+    const deepStarted = Date.now();
     damped.deep = await deepCheck(state);
+    if (damped.deep) {
+      damped.deep.ms = Date.now() - deepStarted;
+      state.deepHistory.push({ at: Date.now(), project: damped.deep.project, ok: damped.deep.ok, ms: damped.deep.ms });
+      if (state.deepHistory.length > SPEED_WINDOW * 3) state.deepHistory.splice(0, state.deepHistory.length - SPEED_WINDOW * 3);
+    }
   } else {
     damped.deep = last.deep;   // keep the last deep result visible on the card
   }
@@ -504,6 +569,12 @@ Bun.serve({
       status: state.status, since: state.since, checks: state.checks,
       slackConfigured: Boolean(SLACK_TOKEN && SLACK_CHANNEL),
       intervals: { shallowMs: SHALLOW_MS, deepMs: DEEP_MS, healthyUpdateMs: HEALTHY_UPDATE_MS },
+      speed: {
+        window: SPEED_WINDOW,
+        shallow: trend(state.shallowHistory),
+        deep: trend(state.deepHistory.filter((entry) => entry.ok).map((entry) => entry.ms)),
+        recentDeep: state.deepHistory.slice(-10),
+      },
       last,
     }, null, 2), { headers: { "Content-Type": "application/json" } });
   },
