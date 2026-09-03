@@ -285,32 +285,61 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
   const project = projects_[state.deepCursor % projects_.length];
   state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects_.length);
   const name = String(project.name);
+  const channel = project.recommendedChannel;
+  const timings: string[] = [];
+  const timed = async <T,>(label: string, run: () => Promise<T>): Promise<T> => {
+    const started = Date.now();
+    const value = await run();
+    timings.push(`${label} ${Date.now() - started}ms`);
+    return value;
+  };
+  let restorePageId: string | null = null;
   try {
-    // Page enumeration is the cheapest thing that proves the plugin is running
-    // real document code rather than just holding a socket open.
-    const pages = await runCommand(project.recommendedChannel, "list_pages", {}, DEEP_COMMAND_MS);
+    // withChildCounts defaults true, which makes the plugin call
+    // loadAllPagesAsync() and load every page in the document — that was most
+    // of the 22s this probe used to take, not the image payload. The cheap form
+    // still returns the page list and which one is current, which is all this
+    // needs.
+    const pages: any = await timed("pages", () =>
+      runCommand(channel, "list_pages", { withChildCounts: false }, DEEP_COMMAND_MS));
     const list: any[] = Array.isArray(pages) ? pages : (pages?.pages || []);
     if (!list.length) return { project: name, ok: false, detail: "plugin answered but reported no pages" };
-    // Then read one node back, which is the path every real caller uses.
-    const pageId = list[0]?.id ?? list[0]?.nodeId;
-    if (!pageId) return { project: name, ok: true, detail: `${list.length} pages (no id to re-read)` };
-    const node = await runCommand(project.recommendedChannel, "get_node_info", { nodeId: pageId }, DEEP_COMMAND_MS);
+    const currentId: string | null = pages?.currentPageId ?? null;
 
-    // Rendering is the heaviest path the plugin has and the one that fails on
-    // its own — a plugin can answer metadata all day and still not produce an
-    // image. Export something small: the first child of the page rather than
-    // the page itself, at a fraction of scale, so this stays a probe and not a
-    // render job on a file someone is working in.
-    const children: any[] = (node && (node.children || node.node?.children)) || [];
+    // Page selection, for real — but put the document back where it was. These
+    // files are being worked in, so leaving one on a different page would be a
+    // worse bug than the one this probe is looking for.
+    const other = list.find((page: any) => page?.id && page.id !== currentId) ?? null;
+    if (currentId && other) {
+      restorePageId = currentId;
+      await timed("select", () => runCommand(channel, "set_current_page", { pageId: other.id }, DEEP_COMMAND_MS));
+      await timed("restore", () => runCommand(channel, "set_current_page", { pageId: currentId }, DEEP_COMMAND_MS));
+      restorePageId = null;
+    }
+
+    // Reading the page back: get_document_info loads only the current page,
+    // where get_node_info on a page serialises its whole subtree.
+    const info: any = await timed("read", () => runCommand(channel, "get_document_info", {}, DEEP_COMMAND_MS));
+    const children: any[] = info?.children || info?.node?.children || [];
     const target = children.find((child: any) => child?.id) ?? null;
-    if (!target) return { project: name, ok: true, detail: `${list.length} pages, node read back (empty page, no image probe)` };
-    const image = await runCommand(project.recommendedChannel, "export_node_as_image",
-      { nodeId: target.id, format: "PNG", scale: 0.05 }, DEEP_COMMAND_MS);
+    if (!target) {
+      return { project: name, ok: true, detail: `${list.length} pages, selection ok, empty page (no image probe) · ${timings.join(" · ")}` };
+    }
+
+    const image = await timed("image", () => runCommand(channel, "export_node_as_image",
+      { nodeId: target.id, format: "PNG", scale: 0.05 }, DEEP_COMMAND_MS));
     const bytes = imageBytes(image);
-    if (!bytes) return { project: name, ok: false, detail: `image export returned nothing for ${target.name || target.id}` };
-    return { project: name, ok: true, detail: `${list.length} pages, node read, image ${Math.round(bytes / 1024)}KB` };
+    if (!bytes) return { project: name, ok: false, detail: `image export returned nothing · ${timings.join(" · ")}` };
+    return { project: name, ok: true,
+      detail: `${list.length} pages, selection ok, node read, image ${Math.round(bytes / 1024)}KB · ${timings.join(" · ")}` };
   } catch (error) {
-    return { project: name, ok: false, detail: error instanceof Error ? error.message : String(error) };
+    // A probe that fails after switching pages must not leave the document
+    // parked somewhere the person working in it did not put it.
+    if (restorePageId) {
+      try { await runCommand(channel, "set_current_page", { pageId: restorePageId }, DEEP_COMMAND_MS); } catch {}
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    return { project: name, ok: false, detail: timings.length ? `${detail} · ${timings.join(" · ")}` : detail };
   }
 }
 
