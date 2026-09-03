@@ -110,7 +110,18 @@ function saveState(state: State): void {
 // The launcher's config is the only place that says which files this machine is
 // supposed to keep connected. Without it we would have to treat "no plugin" and
 // "nobody ever wanted one" as the same thing.
+// Re-read periodically rather than once: the launcher config is edited when a
+// project is added, and a monitor that needs restarting to notice would be a
+// quiet way to stop watching something.
+let expectedCache: { at: number; value: string[] } | null = null;
 function expectedProjects(): string[] {
+  if (expectedCache && Date.now() - expectedCache.at < 60_000) return expectedCache.value;
+  const value = readExpectedProjects();
+  expectedCache = { at: Date.now(), value };
+  return value;
+}
+
+function readExpectedProjects(): string[] {
   try {
     const config = JSON.parse(readFileSync(PROJECTS_JSON, "utf8"));
     const wanted = new Set<string>(config.defaultProjectIDs || []);
@@ -131,6 +142,20 @@ function expectedProjects(): string[] {
 // and punctuation the names differ by.
 const nameKey = (value: string) =>
   value.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// The relay reports the document's real name, which is prefixed with the emoji
+// the Figma file is named with — and those collide with the status emoji this
+// card uses (a project called "🔴 CA_Product" reads as a red alert sitting
+// inside a green all-clear). The launcher config already carries a clean title
+// per project, so display that and fall back to stripping the prefix.
+function displayName(name: string): string {
+  const key = nameKey(name);
+  for (const title of expectedProjects()) {
+    const candidate = nameKey(title);
+    if (candidate === key || key.includes(candidate) || candidate.includes(key)) return title;
+  }
+  return name.replace(/^[^\p{L}\p{N}]+/u, "").trim() || name;
+}
 
 function isPresent(expected: string, live: string[]): boolean {
   const key = nameKey(expected);
@@ -272,10 +297,19 @@ function humanSince(from: number): string {
   return `${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
 }
 
+// "7/6" reads like a fault. The extra is F_Product, which is connected but not
+// in the launcher's default set, so count coverage against what is required and
+// mention anything beyond it separately.
+function coverage(health: Health): string {
+  const covered = health.expected.length - health.missing.length;
+  const extra = Math.max(0, health.live.length - covered);
+  return `필수 ${covered}/${health.expected.length}` + (extra ? ` · 그 외 ${extra}` : "");
+}
+
 function healthyText(state: State, health: Health): string {
-  const deep = health.deep ? ` · 심층 ${health.deep.project} ${health.deep.ok ? "정상" : "실패"}` : "";
+  const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
-    + `• 연결: ${health.live.length}/${health.expected.length} 프로젝트\n`
+    + `• 연결: ${coverage(health)}\n`
     + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}`;
 }
 
@@ -283,8 +317,8 @@ function degradedText(state: State, health: Health): string {
   const mention = ALERT_USER ? `<@${ALERT_USER}> ` : "";
   const lines = [`:red_circle: ${mention}*Figma 헬스체크 · 이상 감지*`];
   if (!health.relayUp) lines.push("• 릴레이에 접속할 수 없습니다 (macmini-1:3055)");
-  if (health.missing.length) lines.push(`• 플러그인 없음: ${health.missing.join(", ")}`);
-  if (health.deep && !health.deep.ok) lines.push(`• 응답 없음: ${health.deep.project} — ${health.deep.detail}`);
+  if (health.missing.length) lines.push(`• 플러그인 없음: ${health.missing.map(displayName).join(", ")}`);
+  if (health.deep && !health.deep.ok) lines.push(`• 응답 없음: ${displayName(health.deep.project)} — ${health.deep.detail}`);
   lines.push(`• 시작: ${clock(state.since)} · 지속 ${humanSince(state.since)} · 확인 ${state.checks}회`);
   lines.push(`• 복구: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
   return lines.join("\n");
@@ -292,7 +326,7 @@ function degradedText(state: State, health: Health): string {
 
 function recoveredText(state: State, health: Health): string {
   return `:white_check_mark: *Figma 헬스체크 · 복구됨*\n`
-    + `• ${humanSince(state.since)} 만에 정상 — 연결 ${health.live.length}/${health.expected.length}\n`
+    + `• ${humanSince(state.since)} 만에 정상 — 연결 ${coverage(health)}\n`
     + `• 확인: ${clock()}`;
 }
 
