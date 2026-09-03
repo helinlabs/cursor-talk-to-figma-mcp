@@ -96,6 +96,10 @@ type State = {
   // Recent timings, newest last, kept separately because the two probes sample
   // at very different rates. A probe that is merely getting slower is the
   // interesting signal — it shows up here long before anything fails outright.
+  slowActive: boolean;           // an outlier has been reported and not yet cleared
+  speedTs: string | null;        // the speed record living in the card's thread
+  speedParentTs: string | null;
+  speedPostedAt: number;
   shallowHistory: number[];
   deepHistory: Array<{ at: number; project: string; ok: boolean; ms: number }>;
 };
@@ -113,7 +117,7 @@ function loadState(): State {
   }
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, streak: {}, deepCursor: 0, shallowHistory: [], deepHistory: [] };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, deepCursor: 0, shallowHistory: [], deepHistory: [] };
 }
 function saveState(state: State): void {
   try {
@@ -416,22 +420,61 @@ function withTrend(label: string, series: number[], format: (ms: number) => stri
 const ms = (value: number) => `${Math.round(value)}ms`;
 const secs = (value: number) => `${(value / 1000).toFixed(1)}s`;
 
-function speedLine(state: State): string | null {
+// Speed belongs on a slower clock than status. Putting it in a thread under
+// the status card keeps the channel readable — the card answers "is it up",
+// the thread answers "is it getting slower" for anyone who opens it.
+const SPEED_UPDATE_MS = Number(process.env.HEALTH_SPEED_UPDATE_MS || 30 * 60_000);
+
+function speedText(state: State): string | null {
+  const ok = state.deepHistory.filter((entry) => entry.ok);
   const parts = [
-    withTrend("릴레이", state.shallowHistory, ms),
-    withTrend("심층", state.deepHistory.filter((entry) => entry.ok).map((entry) => entry.ms), secs),
+    withTrend("릴레이 응답", state.shallowHistory, ms),
+    withTrend("심층 점검", ok.map((entry) => entry.ms), secs),
   ].filter(Boolean);
   if (!parts.length) return null;
-  const samples = Math.min(SPEED_WINDOW, Math.max(state.shallowHistory.length, state.deepHistory.length));
-  return `• 속도(최근 ${samples}회): ${parts.join(" · ")}`;
+  const lines = [
+    `:stopwatch: *속도 기록* · 최근 ${SPEED_WINDOW}회 평균 (화살표는 그 이전 ${SPEED_WINDOW}회 대비)`,
+    ...parts.map((part) => `• ${part}`),
+  ];
+  const recent = state.deepHistory.slice(-6).reverse();
+  if (recent.length) {
+    lines.push("• 최근 심층: " + recent
+      .map((entry) => `${displayName(entry.project)} ${entry.ok ? secs(entry.ms) : "실패"}`)
+      .join(" · "));
+  }
+  lines.push(`• 갱신: ${clock()}`);
+  return lines.join("\n");
+}
+
+// The thread hangs off whichever status card is current, so a new card starts
+// a new thread rather than stranding the record under an old one.
+async function reportSpeed(state: State): Promise<void> {
+  const parent = state.messageTs;
+  if (!parent) return;
+  const text = speedText(state);
+  if (!text) return;
+  if (state.speedParentTs !== parent) {
+    state.speedParentTs = parent;
+    state.speedTs = null;
+  }
+  const due = Date.now() - state.speedPostedAt >= SPEED_UPDATE_MS;
+  if (state.speedTs && !due) return;
+  if (state.speedTs) {
+    const updated = await slack("chat.update", { ts: state.speedTs, text });
+    if (!updated?.ok) state.speedTs = null;
+  }
+  if (!state.speedTs) {
+    const posted = await slack("chat.postMessage", { text, thread_ts: parent });
+    state.speedTs = posted?.ts ?? null;
+  }
+  state.speedPostedAt = Date.now();
 }
 
 function healthyText(state: State, health: Health): string {
   const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
     + `• 연결: ${coverage(health)}\n`
-    + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}`
-    + (speedLine(state) ? `\n${speedLine(state)}` : "");
+    + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}`;
 }
 
 function degradedText(state: State, health: Health): string {
@@ -490,6 +533,48 @@ async function report(state: State, health: Health): Promise<void> {
   state.lastPostedAt = Date.now();
 }
 
+
+// --- outliers --------------------------------------------------------------
+// The thread record is for reading on purpose; an outlier has to come and find
+// someone, which means a new message rather than an edit. Alert once per
+// episode: a probe that stays slow should not keep ringing, so this re-arms
+// only after a run comes back inside the normal range.
+const SLOW_FACTOR = Number(process.env.HEALTH_SLOW_FACTOR || 3);
+const SLOW_FLOOR_MS = Number(process.env.HEALTH_SLOW_FLOOR_MS || 5_000);
+const SLOW_MIN_SAMPLES = Number(process.env.HEALTH_SLOW_MIN_SAMPLES || 5);
+
+function baselineFor(series: number[]): number | null {
+  // Exclude the sample being judged, and require enough history that a couple
+  // of early runs cannot define "normal".
+  const prior = series.slice(0, -1).slice(-SPEED_WINDOW);
+  return prior.length >= SLOW_MIN_SAMPLES ? mean(prior) : null;
+}
+
+async function reportOutlier(state: State, health: Health): Promise<void> {
+  const durations = state.deepHistory.filter((entry) => entry.ok).map((entry) => entry.ms);
+  const latest = durations[durations.length - 1];
+  const base = baselineFor(durations);
+  if (latest == null || base == null) return;
+
+  const isOutlier = latest > base * SLOW_FACTOR && latest > SLOW_FLOOR_MS;
+  if (!isOutlier) {
+    state.slowActive = false;   // back in range: re-arm for the next episode
+    return;
+  }
+  if (state.slowActive) return;
+  state.slowActive = true;
+
+  const entry = state.deepHistory[state.deepHistory.length - 1];
+  const mention = ALERT_USER ? `<@${ALERT_USER}> ` : "";
+  await slack("chat.postMessage", {
+    text: `:warning: ${mention}*Figma 헬스체크 · 응답이 느려졌습니다*\n`
+      + `• ${displayName(entry.project)} 심층 점검 ${secs(latest)} — 최근 평균 ${secs(base)}의 `
+      + `${(latest / base).toFixed(1)}배\n`
+      + `• 아직 실패는 아닙니다. 계속 느려지면 플러그인이 먹통이 되기 전 단계일 수 있습니다.\n`
+      + `• 확인: ${clock()} · 상세는 상태 카드의 스레드에 있습니다.`,
+  });
+}
+
 // --- loop ------------------------------------------------------------------
 let state = loadState();
 let last: Health = { ok: false, relayUp: false, expected: [], live: [], missing: [], shallowMs: 0, deep: null };
@@ -535,6 +620,8 @@ async function tick(): Promise<void> {
 
   last = damped;
   await report(state, damped);
+  await reportSpeed(state);
+  await reportOutlier(state, damped);
   saveState(state);
 }
 
