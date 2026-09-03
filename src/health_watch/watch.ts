@@ -437,6 +437,10 @@ void tick().catch((error) => console.error("[health] first tick failed:", error)
 // own state is inspectable without reading the Slack channel.
 Bun.serve({
   port: PORT,
+  // /check runs the deep probe inline and a page enumeration plus an image
+  // export takes longer than Bun's 10s default, which closed the connection
+  // mid-probe and reported an empty reply for a check that had actually passed.
+  idleTimeout: 120,
   fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
