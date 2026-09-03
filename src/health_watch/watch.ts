@@ -47,6 +47,11 @@ const SLACK_CHANNEL = process.env.HEALTH_SLACK_CHANNEL || "C0BUHAXP22F";   // #d
 // Who to pull in when something is broken. Slack member id, not a display name.
 const ALERT_USER = process.env.HEALTH_ALERT_USER || "U0A91CC94TZ";   // Garen
 const PORT = Number(process.env.HEALTH_PORT || 3057);
+// Somewhere to go from the message. On an alert this is the difference between
+// "something is wrong" and being one click from looking at it.
+const CONSOLE_URL = process.env.HEALTH_CONSOLE_URL
+  || "https://nexus.helinlabs.com/tunnel/svc/macmini-1/figma-relay/";
+const consoleLink = `<${CONSOLE_URL}|웹 릴레이 콘솔 열기>`;
 
 const SHALLOW_MS = Number(process.env.HEALTH_SHALLOW_MS || 60_000);
 // One project per turn, so the interval that matters is this times the number
@@ -600,7 +605,8 @@ function healthyText(state: State, health: Health): string {
     // rewrite is due makes that silence legible instead of ambiguous: a card
     // whose promised time has passed is itself the alert.
     + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)\n`
-    + `• 프로젝트별 부하:\n${projectLines(health)}`;
+    + `• 프로젝트별 부하:\n${projectLines(health)}\n`
+    + `:link: ${consoleLink}`;
 }
 
 function degradedText(state: State, health: Health): string {
@@ -611,13 +617,15 @@ function degradedText(state: State, health: Health): string {
   if (health.deep && !health.deep.ok) lines.push(`• 응답 없음: ${displayName(health.deep.project)} — ${health.deep.detail}`);
   lines.push(`• 시작: ${clock(state.since)} · 지속 ${humanSince(state.since)} · 확인 ${state.checks}회`);
   lines.push(`• 복구: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
+  lines.push(`:link: ${consoleLink}`);
   return lines.join("\n");
 }
 
 function recoveredText(state: State, health: Health): string {
   return `:white_check_mark: *Figma 헬스체크 · 복구됨*\n`
     + `• ${humanSince(state.since)} 만에 정상 — 연결 ${coverage(health)}\n`
-    + `• 확인: ${clock()}`;
+    + `• 확인: ${clock()}\n`
+    + `:link: ${consoleLink}`;
 }
 
 // A new message notifies; an edit does not. So transitions post, and steady
@@ -697,7 +705,8 @@ async function reportOutlier(state: State, health: Health): Promise<void> {
       + `• ${displayName(entry.project)} 심층 점검 ${secs(latest)} — 최근 평균 ${secs(base)}의 `
       + `${(latest / base).toFixed(1)}배\n`
       + `• 아직 실패는 아닙니다. 계속 느려지면 플러그인이 먹통이 되기 전 단계일 수 있습니다.\n`
-      + `• 확인: ${clock()} · 상세는 상태 카드의 스레드에 있습니다.`,
+      + `• 확인: ${clock()} · 상세는 상태 카드의 스레드에 있습니다.\n`
+      + `:link: ${consoleLink}`,
   });
 }
 
