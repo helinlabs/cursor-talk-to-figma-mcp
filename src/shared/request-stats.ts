@@ -48,7 +48,10 @@ type Day = {
 
 type Store = { version: number; days: Record<string, Day> };
 
-const SEP = " ";
+// Project names contain spaces — the relay reports a document's real name,
+// emoji prefix and all ("🟠 F_Product") — so a space split the key in the wrong
+// place and filed the emoji as the project. NUL cannot appear in either half.
+const SEP = "\u0000";
 
 function blank(): Bucketed {
   return {
@@ -61,9 +64,9 @@ function blank(): Bucketed {
 function load(): Store {
   try {
     const parsed = JSON.parse(readFileSync(STATS_PATH, "utf8"));
-    if (parsed && parsed.version === 1 && parsed.days) return parsed;
+    if (parsed && parsed.version === 2 && parsed.days) return parsed;
   } catch {}
-  return { version: 1, days: {} };
+  return { version: 2, days: {} };
 }
 
 let store = load();
