@@ -283,26 +283,42 @@ function imageBytes(result: any): number {
   return 0;
 }
 
-// A single slow moment should not be reported as a broken plugin. F_Product
-// timed out at 45s and then answered in under three seconds on the very next
-// call, which would have paged someone for nothing. Only a failure is retried:
-// running every healthy probe twice would double the load on files people are
-// working in, to sharpen a number the rolling average already smooths — and the
-// second run would be warm, so it would under-report what a real caller sees.
+// Gap between the two measurements, long enough that a momentary stall is not
+// simply repeated and short enough that both describe the same conditions.
 const DEEP_RETRY_PAUSE_MS = Number(process.env.HEALTH_DEEP_RETRY_PAUSE_MS || 3_000);
 
 async function deepCheck(state: State): Promise<Health["deep"]> {
   const first = await deepProbe(state);
-  if (!first || first.ok) return first;
+  if (!first) return null;
+
+  // Measure twice, always. One sample cannot tell a slow moment from a slow
+  // plugin: F_Product timed out at 45s and answered in under three seconds on
+  // the very next call, which had already paged someone for nothing. Keeping
+  // both is better than keeping one — the first carries whatever cold cost a
+  // real caller would hit, the second shows the warm floor — and the trend uses
+  // the lower of the two so a single hiccup cannot drag the baseline around.
   await new Promise((resolve) => setTimeout(resolve, DEEP_RETRY_PAUSE_MS));
-  // Re-probe the same project rather than letting the cursor move on, or the
-  // retry would be answering a different question.
   state.deepCursor = (state.deepCursor + state.deepPoolSize - 1) % Math.max(1, state.deepPoolSize);
   const second = await deepProbe(state);
-  if (second && second.ok) {
-    return { ...second, detail: `재시도 후 정상 (1차: ${first.detail}) · ${second.detail}` };
+  if (!second) return first;
+
+  const ok = first.ok || second.ok;
+  const passes = [first, second].filter((attempt) => attempt.ok);
+  const measured = passes.length
+    ? Math.min(...passes.map((attempt) => attempt.ms ?? Number.MAX_SAFE_INTEGER))
+    : undefined;
+
+  let detail: string;
+  if (first.ok && second.ok) {
+    detail = `${second.detail} · 1차 ${secs(first.ms ?? 0)} / 2차 ${secs(second.ms ?? 0)}`;
+  } else if (ok) {
+    const good = first.ok ? first : second;
+    const bad = first.ok ? second : first;
+    detail = `2회 중 1회만 정상 — ${good.detail} · 실패한 쪽: ${bad.detail}`;
+  } else {
+    detail = `2회 연속 실패 — 1차: ${first.detail} · 2차: ${second.detail}`;
   }
-  return second ?? first;
+  return { project: second.project, ok, detail, ms: measured };
 }
 
 async function deepProbe(state: State): Promise<Health["deep"]> {
@@ -326,6 +342,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
   state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects_.length);
   const name = String(project.name);
   const channel = project.recommendedChannel;
+  const probeStarted = Date.now();
   const timings: string[] = [];
   const timed = async <T,>(label: string, run: () => Promise<T>): Promise<T> => {
     const started = Date.now();
@@ -370,7 +387,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
       { nodeId: target.id, format: "PNG", scale: 0.05 }, DEEP_COMMAND_MS));
     const bytes = imageBytes(image);
     if (!bytes) return { project: name, ok: false, detail: `image export returned nothing · ${timings.join(" · ")}` };
-    return { project: name, ok: true,
+    return { project: name, ok: true, ms: Date.now() - probeStarted,
       detail: `${list.length} pages, selection ok, node read, image ${Math.round(bytes / 1024)}KB · ${timings.join(" · ")}` };
   } catch (error) {
     // A probe that fails after switching pages must not leave the document
@@ -379,7 +396,8 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
       try { await runCommand(channel, "set_current_page", { pageId: restorePageId }, DEEP_COMMAND_MS); } catch {}
     }
     const detail = error instanceof Error ? error.message : String(error);
-    return { project: name, ok: false, detail: timings.length ? `${detail} · ${timings.join(" · ")}` : detail };
+    return { project: name, ok: false, ms: Date.now() - probeStarted,
+      detail: timings.length ? `${detail} · ${timings.join(" · ")}` : detail };
   }
 }
 
@@ -627,7 +645,7 @@ async function tick(): Promise<void> {
     const deepStarted = Date.now();
     damped.deep = await deepCheck(state);
     if (damped.deep) {
-      damped.deep.ms = Date.now() - deepStarted;
+      if (damped.deep.ms == null) damped.deep.ms = Date.now() - deepStarted;
       state.deepHistory.push({ at: Date.now(), project: damped.deep.project, ok: damped.deep.ok, ms: damped.deep.ms });
       if (state.deepHistory.length > SPEED_WINDOW * 3) state.deepHistory.splice(0, state.deepHistory.length - SPEED_WINDOW * 3);
     }
