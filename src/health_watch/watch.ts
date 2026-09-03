@@ -516,7 +516,12 @@ function healthyText(state: State, health: Health): string {
   const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
     + `• 연결: ${coverage(health)}\n`
-    + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}`;
+    + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}\n`
+    // This watcher runs on the machine it watches, so it cannot report that
+    // machine dying — the card simply stops changing. Saying when the next
+    // rewrite is due makes that silence legible instead of ambiguous: a card
+    // whose promised time has passed is itself the alert.
+    + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)`;
 }
 
 function degradedText(state: State, health: Health): string {
