@@ -428,10 +428,10 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // break. get_document_info takes a pageId, so look at a couple of other
     // pages without moving anyone's current page.
     if (!target) {
-      for (const page of list.filter((entry: any) => entry?.id && entry.id !== pageId).slice(0, 2)) {
-        const other: any = await timed("read2", () =>
+      for (const page of list.filter((entry: any) => entry?.id && entry.id !== currentId).slice(0, 2)) {
+        const elsewhere: any = await timed("read2", () =>
           runCommand(channel, "get_document_info", { pageId: page.id }, DEEP_COMMAND_MS));
-        target = childrenOf(other).find((child: any) => child?.id) ?? null;
+        target = childrenOf(elsewhere).find((child: any) => child?.id) ?? null;
         if (target) break;
       }
     }
