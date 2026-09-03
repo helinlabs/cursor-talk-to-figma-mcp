@@ -275,6 +275,10 @@ function runCommand(channel: string, command: string, params: any, timeoutMs = 2
 
 // The plugin has returned image payloads under a few shapes over time; measure
 // whatever it gives rather than asserting one.
+// A sub-kilobyte export rounded to "0KB", which reads like a failure rather
+// than a very small image.
+const sizeOf = (bytes: number) => (bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`);
+
 function imageBytes(result: any): number {
   if (!result) return 0;
   const data = result.imageData ?? result.data ?? result.svg ?? result.bytes;
@@ -388,7 +392,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     const bytes = imageBytes(image);
     if (!bytes) return { project: name, ok: false, detail: `image export returned nothing · ${timings.join(" · ")}` };
     return { project: name, ok: true, ms: Date.now() - probeStarted,
-      detail: `${list.length} pages, selection ok, node read, image ${Math.round(bytes / 1024)}KB · ${timings.join(" · ")}` };
+      detail: `${list.length} pages, selection ok, node read, image ${sizeOf(bytes)} · ${timings.join(" · ")}` };
   } catch (error) {
     // A probe that fails after switching pages must not leave the document
     // parked somewhere the person working in it did not put it.
