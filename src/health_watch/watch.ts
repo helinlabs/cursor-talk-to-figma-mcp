@@ -29,10 +29,23 @@ import { PROTOCOL_VERSION } from "../shared/version";
 
 const RELAY_HTTP = process.env.HEALTH_RELAY_HTTP || "http://127.0.0.1:3055";
 const RELAY_WS = process.env.HEALTH_RELAY_WS || "ws://127.0.0.1:3055";
-const SLACK_TOKEN = process.env.HEALTH_SLACK_TOKEN || "";
-const SLACK_CHANNEL = process.env.HEALTH_SLACK_CHANNEL || "";
+// Prefer a 0600 file over an env var. A launchd plist is world-readable and
+// gets dumped by any routine diagnostic — the recon that went looking for this
+// very token read every plist's environment on the box.
+const TOKEN_PATH = process.env.HEALTH_SLACK_TOKEN_PATH
+  || `${homedir()}/.talk-to-figma/slack-bot-token`;
+function readToken(): string {
+  if (process.env.HEALTH_SLACK_TOKEN) return process.env.HEALTH_SLACK_TOKEN.trim();
+  try {
+    return readFileSync(TOKEN_PATH, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+const SLACK_TOKEN = readToken();
+const SLACK_CHANNEL = process.env.HEALTH_SLACK_CHANNEL || "C0BUHAXP22F";   // #dev_noti_figma
 // Who to pull in when something is broken. Slack member id, not a display name.
-const ALERT_USER = process.env.HEALTH_ALERT_USER || "";
+const ALERT_USER = process.env.HEALTH_ALERT_USER || "U0A91CC94TZ";   // Garen
 const PORT = Number(process.env.HEALTH_PORT || 3057);
 
 const SHALLOW_MS = Number(process.env.HEALTH_SHALLOW_MS || 60_000);
