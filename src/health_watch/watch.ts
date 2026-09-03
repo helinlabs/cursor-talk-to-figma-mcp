@@ -53,6 +53,22 @@ const CONSOLE_URL = process.env.HEALTH_CONSOLE_URL
   || "https://nexus.helinlabs.com/tunnel/svc/macmini-1/figma-relay/";
 const consoleLink = `<${CONSOLE_URL}|웹 릴레이 콘솔 열기>`;
 
+// Which build is talking. This gets redeployed often, and without it the only
+// way to tell whether a fix is actually live is to go and look at the box —
+// which is exactly the trip the card exists to save.
+const STARTED_AT = Date.now();
+const BUILD = (() => {
+  try {
+    const result = Bun.spawnSync(["git", "rev-parse", "--short", "HEAD"], {
+      cwd: new URL("../..", import.meta.url).pathname,
+    });
+    const sha = new TextDecoder().decode(result.stdout).trim();
+    return sha || "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
 const SHALLOW_MS = Number(process.env.HEALTH_SHALLOW_MS || 60_000);
 // One project per turn, so the interval that matters is this times the number
 // of managed projects: at 5 minutes and six projects each file is exercised
@@ -668,7 +684,7 @@ function healthyText(state: State, health: Health): string {
     // whose promised time has passed is itself the alert.
     + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)\n`
     + `• 프로젝트별 부하:\n${projectLines(health)}\n`
-    + `:link: ${consoleLink}`;
+    + `:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`;
 }
 
 function degradedText(state: State, health: Health): string {
