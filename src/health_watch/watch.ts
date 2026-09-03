@@ -249,6 +249,16 @@ function runCommand(channel: string, command: string, params: any, timeoutMs = 2
   });
 }
 
+// The plugin has returned image payloads under a few shapes over time; measure
+// whatever it gives rather than asserting one.
+function imageBytes(result: any): number {
+  if (!result) return 0;
+  const data = result.imageData ?? result.data ?? result.svg ?? result.bytes;
+  if (typeof data === "string") return data.length;
+  if (data && typeof data.length === "number") return data.length;
+  return 0;
+}
+
 async function deepCheck(state: State): Promise<Health["deep"]> {
   let projects: any[] = [];
   try {
@@ -270,8 +280,21 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
     // Then read one node back, which is the path every real caller uses.
     const pageId = list[0]?.id ?? list[0]?.nodeId;
     if (!pageId) return { project: name, ok: true, detail: `${list.length} pages (no id to re-read)` };
-    await runCommand(project.recommendedChannel, "get_node_info", { nodeId: pageId });
-    return { project: name, ok: true, detail: `${list.length} pages, node read back` };
+    const node = await runCommand(project.recommendedChannel, "get_node_info", { nodeId: pageId });
+
+    // Rendering is the heaviest path the plugin has and the one that fails on
+    // its own — a plugin can answer metadata all day and still not produce an
+    // image. Export something small: the first child of the page rather than
+    // the page itself, at a fraction of scale, so this stays a probe and not a
+    // render job on a file someone is working in.
+    const children: any[] = (node && (node.children || node.node?.children)) || [];
+    const target = children.find((child: any) => child?.id) ?? null;
+    if (!target) return { project: name, ok: true, detail: `${list.length} pages, node read back (empty page, no image probe)` };
+    const image = await runCommand(project.recommendedChannel, "export_node_as_image",
+      { nodeId: target.id, format: "PNG", scale: 0.05 }, 30_000);
+    const bytes = imageBytes(image);
+    if (!bytes) return { project: name, ok: false, detail: `image export returned nothing for ${target.name || target.id}` };
+    return { project: name, ok: true, detail: `${list.length} pages, node read, image ${Math.round(bytes / 1024)}KB` };
   } catch (error) {
     return { project: name, ok: false, detail: error instanceof Error ? error.message : String(error) };
   }
@@ -418,6 +441,17 @@ Bun.serve({
     const url = new URL(request.url);
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    }
+    // Forces the deep probe now instead of waiting out the interval — for
+    // verifying a deployment, and for checking a specific project by hand
+    // after a repair without watching the clock.
+    if (url.pathname === "/check") {
+      lastDeepAt = 0;
+      return tick()
+        .then(() => new Response(JSON.stringify({ ran: true, status: state.status, last }, null, 2),
+          { headers: { "Content-Type": "application/json" } }))
+        .catch((error) => new Response(JSON.stringify({ ran: false, error: String(error) }),
+          { status: 500, headers: { "Content-Type": "application/json" } }));
     }
     return new Response(JSON.stringify({
       status: state.status, since: state.since, checks: state.checks,
