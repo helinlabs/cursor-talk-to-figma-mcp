@@ -93,6 +93,7 @@ type State = {
   lastPostedAt: number;
   streak: Record<string, number>;
   deepCursor: number;
+  deepPoolSize: number;
   // Recent timings, newest last, kept separately because the two probes sample
   // at very different rates. A probe that is merely getting slower is the
   // interesting signal — it shows up here long before anything fails outright.
@@ -117,7 +118,7 @@ function loadState(): State {
   }
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, deepCursor: 0, shallowHistory: [], deepHistory: [] };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [] };
 }
 function saveState(state: State): void {
   try {
@@ -282,7 +283,29 @@ function imageBytes(result: any): number {
   return 0;
 }
 
+// A single slow moment should not be reported as a broken plugin. F_Product
+// timed out at 45s and then answered in under three seconds on the very next
+// call, which would have paged someone for nothing. Only a failure is retried:
+// running every healthy probe twice would double the load on files people are
+// working in, to sharpen a number the rolling average already smooths — and the
+// second run would be warm, so it would under-report what a real caller sees.
+const DEEP_RETRY_PAUSE_MS = Number(process.env.HEALTH_DEEP_RETRY_PAUSE_MS || 3_000);
+
 async function deepCheck(state: State): Promise<Health["deep"]> {
+  const first = await deepProbe(state);
+  if (!first || first.ok) return first;
+  await new Promise((resolve) => setTimeout(resolve, DEEP_RETRY_PAUSE_MS));
+  // Re-probe the same project rather than letting the cursor move on, or the
+  // retry would be answering a different question.
+  state.deepCursor = (state.deepCursor + state.deepPoolSize - 1) % Math.max(1, state.deepPoolSize);
+  const second = await deepProbe(state);
+  if (second && second.ok) {
+    return { ...second, detail: `재시도 후 정상 (1차: ${first.detail}) · ${second.detail}` };
+  }
+  return second ?? first;
+}
+
+async function deepProbe(state: State): Promise<Health["deep"]> {
   let projects: any[] = [];
   try {
     projects = ((await getJson("/projects")).projects || [])
@@ -299,6 +322,7 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
   if (!pool.length) return null;
   const projects_ = pool;
   const project = projects_[state.deepCursor % projects_.length];
+  state.deepPoolSize = projects_.length;
   state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects_.length);
   const name = String(project.name);
   const channel = project.recommendedChannel;
