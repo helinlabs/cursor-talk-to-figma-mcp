@@ -81,6 +81,7 @@ type Health = {
   expected: string[];
   live: string[];
   missing: string[];
+  load: Array<{ name: string; running: number; pending: number; oldestQueuedMs: number }>;
   shallowMs: number;
   deep: { project: string; ok: boolean; detail: string; ms?: number } | null;
 };
@@ -203,22 +204,28 @@ async function getJson(path: string, timeoutMs = 5000): Promise<any> {
 async function shallowCheck(): Promise<Health> {
   const started = Date.now();
   const expected = expectedProjects();
+  let load: Health["load"] = [];
   try {
     await getJson("/health");
   } catch (error) {
-    return { ok: false, relayUp: false, expected, live: [], missing: expected, shallowMs: Date.now() - started, deep: null };
+    return { ok: false, relayUp: false, expected, live: [], missing: expected, load, shallowMs: Date.now() - started, deep: null };
   }
   let live: string[] = [];
   try {
     const payload = await getJson("/projects");
-    live = (payload.projects || [])
-      .filter((project: any) => project.connectionCount > 0)
-      .map((project: any) => String(project.name));
+    const liveProjects = (payload.projects || []).filter((project: any) => project.connectionCount > 0);
+    live = liveProjects.map((project: any) => String(project.name));
+    load = liveProjects.map((project: any) => ({
+      name: String(project.name),
+      running: project.runningRequests || 0,
+      pending: project.pendingRequests || 0,
+      oldestQueuedMs: project.oldestQueuedMs || 0,
+    }));
   } catch {
-    return { ok: false, relayUp: true, expected, live: [], missing: expected, shallowMs: Date.now() - started, deep: null };
+    return { ok: false, relayUp: true, expected, live: [], missing: expected, load, shallowMs: Date.now() - started, deep: null };
   }
   const missing = expected.filter((name) => !isPresent(name, live));
-  return { ok: missing.length === 0, relayUp: true, expected, live, missing, shallowMs: Date.now() - started, deep: null };
+  return { ok: missing.length === 0, relayUp: true, expected, live, missing, load, shallowMs: Date.now() - started, deep: null };
 }
 
 // --- deep check ------------------------------------------------------------
@@ -347,6 +354,15 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
   const name = String(project.name);
   const channel = project.recommendedChannel;
   const probeStarted = Date.now();
+  // What the plugin was already doing when this probe arrived. Reported first
+  // because it is the context for everything that follows: the plugin runs one
+  // command at a time, so a probe behind real work is slow for a reason that is
+  // not a fault.
+  const queuedBefore = (project.runningRequests || 0) + (project.pendingRequests || 0);
+  const waitBefore = project.oldestQueuedMs || 0;
+  const loadNote = queuedBefore
+    ? `선행 작업 ${queuedBefore}건(최장 ${secs(waitBefore)}) 뒤에서 측정`
+    : "유휴 상태에서 측정";
   const timings: string[] = [];
   const timed = async <T,>(label: string, run: () => Promise<T>): Promise<T> => {
     const started = Date.now();
@@ -392,7 +408,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     const bytes = imageBytes(image);
     if (!bytes) return { project: name, ok: false, detail: `image export returned nothing · ${timings.join(" · ")}` };
     return { project: name, ok: true, ms: Date.now() - probeStarted,
-      detail: `${list.length} pages, selection ok, node read, image ${sizeOf(bytes)} · ${timings.join(" · ")}` };
+      detail: `${loadNote} · ${list.length} pages, selection ok, node read, image ${sizeOf(bytes)} · ${timings.join(" · ")}` };
   } catch (error) {
     // A probe that fails after switching pages must not leave the document
     // parked somewhere the person working in it did not put it.
@@ -516,6 +532,23 @@ async function reportSpeed(state: State): Promise<void> {
   state.speedPostedAt = Date.now();
 }
 
+// One line per project. The probe shares the plugin with real traffic — the
+// plugin is single-threaded, so anything already running delays it — and a slow
+// probe on a busy project is not the same finding as a slow probe on an idle
+// one. Showing the load next to the timing is what separates them.
+function projectLines(health: Health): string {
+  const byName = new Map(health.load.map((entry) => [nameKey(entry.name), entry]));
+  return health.expected.map((title) => {
+    const entry = [...byName.entries()].find(([key]) => key.includes(nameKey(title)) || nameKey(title).includes(key))?.[1];
+    if (!entry) return `   :red_circle: ${title} — 플러그인 없음`;
+    const busy = entry.running + entry.pending;
+    const detail = busy
+      ? `처리 ${entry.running} · 대기 ${entry.pending} · 최장 ${secs(entry.oldestQueuedMs)}`
+      : "유휴";
+    return `   ${busy ? ":hourglass_flowing_sand:" : ":white_small_square:"} ${title} — ${detail}`;
+  }).join("\n");
+}
+
 function healthyText(state: State, health: Health): string {
   const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
@@ -525,7 +558,8 @@ function healthyText(state: State, health: Health): string {
     // machine dying — the card simply stops changing. Saying when the next
     // rewrite is due makes that silence legible instead of ambiguous: a card
     // whose promised time has passed is itself the alert.
-    + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)`;
+    + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)\n`
+    + `• 프로젝트별 부하:\n${projectLines(health)}`;
 }
 
 function degradedText(state: State, health: Health): string {
@@ -628,7 +662,7 @@ async function reportOutlier(state: State, health: Health): Promise<void> {
 
 // --- loop ------------------------------------------------------------------
 let state = loadState();
-let last: Health = { ok: false, relayUp: false, expected: [], live: [], missing: [], shallowMs: 0, deep: null };
+let last: Health = { ok: false, relayUp: false, expected: [], live: [], missing: [], load: [], shallowMs: 0, deep: null };
 let lastDeepAt = 0;
 const deepEvery = () => (last.deep && !last.deep.ok ? DEEP_RETRY_MS : DEEP_MS);
 

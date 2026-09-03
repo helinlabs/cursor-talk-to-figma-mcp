@@ -402,6 +402,14 @@ function snapshotChannels(): any[] {
     const channelRequests = [...requests.values()].filter((request) => request.channel === name);
     const runningRequests = channelRequests.filter((request) => request.startedAt !== undefined).length;
     const pendingRequests = channelRequests.length - runningRequests;
+    // How long the oldest in-flight request has been waiting. A probe that
+    // takes a while behind real traffic is not the same problem as a probe
+    // that takes a while on an idle plugin, and a count alone cannot tell the
+    // two apart — one long request queues everything behind it just as surely
+    // as ten short ones.
+    const oldestQueuedMs = channelRequests.length
+      ? Date.now() - Math.min(...channelRequests.map((request) => request.queuedAt ?? Date.now()))
+      : 0;
     out.push({
       channel: name,
       count: members.length,
@@ -415,6 +423,7 @@ function snapshotChannels(): any[] {
       pendingRequests,
       inFlightRequests: channelRequests.length,
       queueDepth: pendingRequests,
+      oldestQueuedMs,
       previewSubscribers: previewSubscriberCount(name),
     });
   });
@@ -453,6 +462,7 @@ function snapshotProjects(): any[] {
       runningRequests: live.reduce((sum, connection) => sum + connection.runningRequests, 0),
       pendingRequests: live.reduce((sum, connection) => sum + connection.pendingRequests, 0),
       inFlightRequests: live.reduce((sum, connection) => sum + connection.inFlightRequests, 0),
+      oldestQueuedMs: live.reduce((worst, connection) => Math.max(worst, connection.oldestQueuedMs || 0), 0),
       connections,
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
