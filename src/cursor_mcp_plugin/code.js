@@ -923,7 +923,34 @@ function textMatchSnippet(characters, range) {
 // NOT cache the page, so a stale index can never be served.
 // Memory is bounded: a few hundred KB per page at worst.
 // ---------------------------------------------------------------------------
+// Bounded, least-recently-used. Each entry holds every node on the page
+// including each TEXT node's full `characters`, so "a few hundred KB per page"
+// is optimistic on a text-heavy file — and the cache previously grew to hold
+// every page ever searched, for the life of the plugin. On this machine the
+// two oldest Figma renderers had reached ~1GB each after a day, and a renderer
+// that runs out of memory is the "Something went wrong / Reason: crashed" page.
+const PAGE_INDEX_CACHE_MAX = 4;
 const pageSearchIndexCache = new Map(); // pageId -> { entries: [...] }
+
+// Map preserves insertion order, so the oldest key is the first one. Re-set on
+// read to move an entry to the back and make this a real LRU rather than FIFO.
+function rememberPageIndex(pageId, index) {
+  if (pageSearchIndexCache.has(pageId)) pageSearchIndexCache.delete(pageId);
+  pageSearchIndexCache.set(pageId, index);
+  while (pageSearchIndexCache.size > PAGE_INDEX_CACHE_MAX) {
+    const oldest = pageSearchIndexCache.keys().next().value;
+    if (oldest === undefined) break;
+    pageSearchIndexCache.delete(oldest);
+  }
+}
+
+function recallPageIndex(pageId) {
+  if (!pageSearchIndexCache.has(pageId)) return undefined;
+  const index = pageSearchIndexCache.get(pageId);
+  pageSearchIndexCache.delete(pageId);
+  pageSearchIndexCache.set(pageId, index);
+  return index;
+}
 const pageSearchIndexWatched = new Set(); // pageIds with an active nodechange handler
 
 // Dirty-page notifications: whenever a watched (i.e. previously indexed) page
@@ -934,15 +961,11 @@ const pageSearchIndexWatched = new Set(); // pageIds with an active nodechange h
 // the EXISTING relay WebSocket (the plugin main thread has no socket).
 const PAGE_DIRTY_THROTTLE_MS = 30_000;
 const pageDirtyLastSentAt = new Map(); // pageId -> epoch ms
-function notifyPageDirty(page, pageId) {
+function notifyPageDirty(pageName, pageId) {
   const now = Date.now();
   const last = pageDirtyLastSentAt.get(pageId) || 0;
   if (now - last < PAGE_DIRTY_THROTTLE_MS) return;
   pageDirtyLastSentAt.set(pageId, now);
-  let pageName = "";
-  try {
-    pageName = page.name || "";
-  } catch (e) {}
   try {
     figma.ui.postMessage({ type: "page-dirty", pageId: pageId, pageName: pageName });
   } catch (e) {}
@@ -952,9 +975,14 @@ function watchPageForIndexInvalidation(page) {
   if (pageSearchIndexWatched.has(page.id)) return true;
   try {
     const pageId = page.id;
+    // Capture the NAME, not the page. This handler is never removed, so
+    // capturing `page` kept a live PageNode reference for every page ever
+    // indexed — which is exactly what dynamic-page mode exists to avoid, and
+    // it pins those pages in the renderer for as long as the plugin runs.
+    const pageName = (function () { try { return page.name || ""; } catch (e) { return ""; } })();
     page.on("nodechange", () => {
       pageSearchIndexCache.delete(pageId);
-      notifyPageDirty(page, pageId);
+      notifyPageDirty(pageName, pageId);
     });
     pageSearchIndexWatched.add(pageId);
     return true;
@@ -1087,7 +1115,7 @@ function collectPageEntriesViaCriteria(page, causeError) {
 // Only caches when nodechange-based invalidation could be installed, so a
 // stale index is never served.
 async function getOrBuildPageSearchIndex(page) {
-  const cached = pageSearchIndexCache.get(page.id);
+  const cached = recallPageIndex(page.id);
   if (cached) return { index: cached, fromCache: true };
   await page.loadAsync(); // dynamic-page documentAccess: load before findAll
   const prevSkip = figma.skipInvisibleInstanceChildren;
@@ -1099,7 +1127,7 @@ async function getOrBuildPageSearchIndex(page) {
     figma.skipInvisibleInstanceChildren = prevSkip;
   }
   if (watchPageForIndexInvalidation(page)) {
-    pageSearchIndexCache.set(page.id, index);
+    rememberPageIndex(page.id, index);
   }
   return { index: index, fromCache: false };
 }
