@@ -53,6 +53,9 @@ const DEEP_MS = Number(process.env.HEALTH_DEEP_MS || 15 * 60_000);
 // After a deep failure the picture is stale in the direction that matters, so
 // re-ask sooner than the normal cadence.
 const DEEP_RETRY_MS = Number(process.env.HEALTH_DEEP_RETRY_MS || 2 * 60_000);
+// These are large design files; a first call into one can legitimately take a
+// while, and calling that a failure would be its own false alarm.
+const DEEP_COMMAND_MS = Number(process.env.HEALTH_DEEP_COMMAND_MS || 45_000);
 // A shallow check is cheap enough to run every few seconds, but Slack is not:
 // the rolling "all clear" message is rewritten on its own slower clock, and the
 // check count on it is what shows the real cadence.
@@ -267,20 +270,27 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
   } catch {
     return null;
   }
-  if (!projects.length) return null;
-  const project = projects[state.deepCursor % projects.length];
-  state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects.length);
+  // Only probe what the launcher promises to keep alive. F_Product is connected
+  // but is not in defaultProjectIDs, and paging someone because an unmanaged
+  // file is slow teaches them to ignore the channel.
+  const managed = projects.filter((project: any) => isPresent(String(project.name), expectedProjects())
+    || expectedProjects().some((title) => isPresent(title, [String(project.name)])));
+  const pool = managed.length ? managed : [];
+  if (!pool.length) return null;
+  const projects_ = pool;
+  const project = projects_[state.deepCursor % projects_.length];
+  state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects_.length);
   const name = String(project.name);
   try {
     // Page enumeration is the cheapest thing that proves the plugin is running
     // real document code rather than just holding a socket open.
-    const pages = await runCommand(project.recommendedChannel, "list_pages", {});
+    const pages = await runCommand(project.recommendedChannel, "list_pages", {}, DEEP_COMMAND_MS);
     const list: any[] = Array.isArray(pages) ? pages : (pages?.pages || []);
     if (!list.length) return { project: name, ok: false, detail: "plugin answered but reported no pages" };
     // Then read one node back, which is the path every real caller uses.
     const pageId = list[0]?.id ?? list[0]?.nodeId;
     if (!pageId) return { project: name, ok: true, detail: `${list.length} pages (no id to re-read)` };
-    const node = await runCommand(project.recommendedChannel, "get_node_info", { nodeId: pageId });
+    const node = await runCommand(project.recommendedChannel, "get_node_info", { nodeId: pageId }, DEEP_COMMAND_MS);
 
     // Rendering is the heaviest path the plugin has and the one that fails on
     // its own — a plugin can answer metadata all day and still not produce an
@@ -291,7 +301,7 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
     const target = children.find((child: any) => child?.id) ?? null;
     if (!target) return { project: name, ok: true, detail: `${list.length} pages, node read back (empty page, no image probe)` };
     const image = await runCommand(project.recommendedChannel, "export_node_as_image",
-      { nodeId: target.id, format: "PNG", scale: 0.05 }, 30_000);
+      { nodeId: target.id, format: "PNG", scale: 0.05 }, DEEP_COMMAND_MS);
     const bytes = imageBytes(image);
     if (!bytes) return { project: name, ok: false, detail: `image export returned nothing for ${target.name || target.id}` };
     return { project: name, ok: true, detail: `${list.length} pages, node read, image ${Math.round(bytes / 1024)}KB` };
