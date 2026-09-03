@@ -122,6 +122,24 @@ function expectedProjects(): string[] {
   }
 }
 
+// The two sides spell the same project differently: the launcher config calls
+// it "CA_Product" while the relay reports the document's real name, which
+// carries the emoji the file is actually named with ("🔴 CA_Product"). Comparing
+// them literally marked every project missing — and the only reason the first
+// deployment did not page anyone for it was the failure-streak damping, which
+// would have run out on the next poll. Match on the letters, ignoring the emoji
+// and punctuation the names differ by.
+const nameKey = (value: string) =>
+  value.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function isPresent(expected: string, live: string[]): boolean {
+  const key = nameKey(expected);
+  return key.length > 0 && live.some((name) => {
+    const candidate = nameKey(name);
+    return candidate === key || candidate.includes(key) || key.includes(candidate);
+  });
+}
+
 async function getJson(path: string, timeoutMs = 5000): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -150,7 +168,7 @@ async function shallowCheck(): Promise<Health> {
   } catch {
     return { ok: false, relayUp: true, expected, live: [], missing: expected, deep: null };
   }
-  const missing = expected.filter((name) => !live.includes(name));
+  const missing = expected.filter((name) => !isPresent(name, live));
   return { ok: missing.length === 0, relayUp: true, expected, live, missing, deep: null };
 }
 
