@@ -29,6 +29,7 @@ import AVFoundation
 import AppKit
 import CoreGraphics
 import Foundation
+import IOKit.pwr_mgt
 import ScreenCaptureKit
 import VideoToolbox
 
@@ -940,5 +941,68 @@ Task.detached {
 // fleet, SCShareableContent's verdicts arrive as main-queue callbacks, and
 // with the main thread blocked in semaphore.wait() they can never run — the
 // lookup then hangs forever with the Screen Recording grant in place.
+
+// Waking the display, and keeping it awake for as long as something is watching.
+//
+// The Mac's display sleeps after ten minutes idle, and `caffeinate -s` — which
+// is what runs on the box — only blocks SYSTEM sleep, not display sleep. When
+// the display sleeps WindowServer stops compositing, the window stops
+// rendering, and this capture keeps handing out the last frame it got: the
+// console shows a picture that no longer moves no matter what anyone does to
+// the file. That is the frozen preview.
+//
+// The assertion is held by the agent rather than set as a machine-wide power
+// setting, because the agent exists exactly as long as a viewer is connected.
+// The display stays awake while someone is looking and is free to sleep the
+// rest of the time, which a `pmset displaysleep 0` would not allow.
+final class DisplayWakeAssertion {
+    private var assertionID: IOPMAssertionID = 0
+    private var held = false
+
+    // Two different things are needed and only one of them is the assertion.
+    //
+    // PreventUserIdleDisplaySleep stops the display FALLING asleep; it does
+    // nothing to a display that is already asleep, which is the common case —
+    // someone opens the console after the machine has been idle all afternoon.
+    // DeclareUserActivity is the call that actually wakes it, so the agent does
+    // that first and then holds the assertion to keep it awake.
+    func wakeDisplay() {
+        var activityID: IOPMAssertionID = 0
+        let result = IOPMAssertionDeclareUserActivity(
+            "Figma window capture gained a viewer" as CFString,
+            kIOPMUserActiveLocal,
+            &activityID)
+        FileHandle.standardError.write(Data((result == kIOReturnSuccess
+            ? "declared user activity to wake the display\n"
+            : "could not declare user activity (\(result)); a sleeping display will stay asleep\n").utf8))
+    }
+
+    func acquire() {
+        wakeDisplay()
+        guard !held else { return }
+        let reason = "Figma window capture has a live viewer" as CFString
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason,
+            &assertionID)
+        held = result == kIOReturnSuccess
+        FileHandle.standardError.write(Data((held
+            ? "display sleep held off while capturing\n"
+            : "could not hold off display sleep (\(result)); a frozen preview after ~10 idle minutes is expected\n").utf8))
+    }
+
+    func release() {
+        guard held else { return }
+        IOPMAssertionRelease(assertionID)
+        held = false
+    }
+
+    deinit { release() }
+}
+
+let displayWake = DisplayWakeAssertion()
+
 // dispatchMain() parks the thread while still draining the main queue.
+displayWake.acquire()
 dispatchMain()
