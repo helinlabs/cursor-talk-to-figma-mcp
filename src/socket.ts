@@ -19,6 +19,7 @@ import {
   cacheProjectContext,
   clearCachedProjectContext,
 } from "./shared/project-context";
+import { recordRequest, summarize as summarizeStats, history as commandHistory, flushStats } from "./shared/request-stats";
 import {
   INDEX_DIR,
   loadProjectIndex,
@@ -1219,6 +1220,26 @@ const server = Bun.serve({
     }
 
     // --- Error ledger: recurring errors are improvement candidates ----------
+    // Aggregated request statistics. /stats answers "what is slow right now",
+    // /stats/history answers "was it always" — which is the question an
+    // improvement request needs and the relay previously could not answer.
+    if (url.pathname === "/stats" && req.method === "GET") {
+      const days = Number(url.searchParams.get("days")) || undefined;
+      const project = url.searchParams.get("project") || undefined;
+      const limit = Number(url.searchParams.get("limit")) || undefined;
+      return new Response(JSON.stringify(summarizeStats({ days, project, limit }), null, 2), { headers: JSON_HEADERS });
+    }
+
+    if (url.pathname === "/stats/history" && req.method === "GET") {
+      const command = url.searchParams.get("command") || "";
+      if (!command) {
+        return new Response(JSON.stringify({ error: "command is required" }), { status: 400, headers: JSON_HEADERS });
+      }
+      const days = Number(url.searchParams.get("days")) || undefined;
+      const project = url.searchParams.get("project") || undefined;
+      return new Response(JSON.stringify(commandHistory(command, { days, project }), null, 2), { headers: JSON_HEADERS });
+    }
+
     if (url.pathname === "/errors" && req.method === "GET") {
       const limit = Number(url.searchParams.get("limit")) || undefined;
       const source = url.searchParams.get("source") || undefined;
@@ -1960,6 +1981,14 @@ const server = Bun.serve({
               command: request.command,
               message: "command timed out (controller-reported request_timeout)",
             });
+            recordRequest({
+              project: channelProjectInfo(request.channel).name,
+              command: request.command,
+              requesterId: request.requesterId ?? "unknown",
+              totalMs: Date.now() - request.queuedAt,
+              waitMs: (request.startedAt ?? Date.now()) - request.queuedAt,
+              outcome: "timeout",
+            });
             pushChannels();
           }
           return;
@@ -2214,6 +2243,14 @@ const server = Bun.serve({
             };
             if (meta) meta.activeRequests = Math.max(0, meta.activeRequests - 1);
             recordFigmaOutcome(ws, false);
+            recordRequest({
+              project: channelProjectInfo(channelName).name,
+              command: request.command,
+              requesterId: request.requesterId ?? "unknown",
+              totalMs: timing.totalMs,
+              waitMs: timing.waitMs,
+              outcome: isError ? "error" : "ok",
+            });
             // Ledger: errors on relayed plugin commands. Relay-internal
             // requests (indexer) are excluded — their callers record with
             // richer context (page, project) themselves.
@@ -2321,6 +2358,14 @@ const server = Bun.serve({
             project: channelProjectInfo(request.channel).name,
             command: request.command,
             message: "Figma plugin disconnected while executing the request",
+          });
+          recordRequest({
+            project: channelProjectInfo(request.channel).name,
+            command: request.command,
+            requesterId: request.requesterId ?? "unknown",
+            totalMs: Date.now() - request.queuedAt,
+            waitMs: (request.startedAt ?? Date.now()) - request.queuedAt,
+            outcome: "disconnected",
           });
           if (request.onInternalResult) {
             request.onInternalResult({ id, error: "Figma plugin disconnected while executing the request" });
