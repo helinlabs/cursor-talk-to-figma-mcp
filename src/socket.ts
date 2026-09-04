@@ -575,6 +575,20 @@ function sendInternalCommand(
   });
 }
 
+// Who actually asked. requesterId is opaque — "mcp-72443" is a process id and
+// says nothing about which developer or machine it was — while the MCP already
+// sends its hostname on connect. Prefer that, and keep the id alongside it so
+// two sessions on one machine stay distinguishable.
+function requesterLabel(request: { requester: ServerWebSocket<any> | null; requesterId: string }): string {
+  if (request.requesterId === "relay-internal") return "relay-internal (indexer)";
+  const meta = request.requester ? clientMeta.get(request.requester) : undefined;
+  const device = meta?.deviceName;
+  if (!device) return request.requesterId || "unknown";
+  return request.requesterId && !request.requesterId.startsWith("mcp-")
+    ? `${device} (${request.requesterId})`
+    : device;
+}
+
 // Project identity for a channel (matches snapshotProjects' grouping key so
 // it lines up with resolveProjectChannel and the disk index file names).
 function channelProjectInfo(channelName: string): { key: string; name: string } {
@@ -2016,7 +2030,7 @@ const server = Bun.serve({
             recordRequest({
               project: channelProjectInfo(request.channel).name,
               command: request.command,
-              requesterId: request.requesterId ?? "unknown",
+              requesterId: requesterLabel(request),
               totalMs: Date.now() - request.queuedAt,
               waitMs: (request.startedAt ?? Date.now()) - request.queuedAt,
               outcome: "timeout",
@@ -2278,7 +2292,7 @@ const server = Bun.serve({
             recordRequest({
               project: channelProjectInfo(channelName).name,
               command: request.command,
-              requesterId: request.requesterId ?? "unknown",
+              requesterId: requesterLabel(request),
               totalMs: timing.totalMs,
               waitMs: timing.waitMs,
               outcome: isError ? "error" : "ok",
@@ -2394,7 +2408,7 @@ const server = Bun.serve({
           recordRequest({
             project: channelProjectInfo(request.channel).name,
             command: request.command,
-            requesterId: request.requesterId ?? "unknown",
+            requesterId: requesterLabel(request),
             totalMs: Date.now() - request.queuedAt,
             waitMs: (request.startedAt ?? Date.now()) - request.queuedAt,
             outcome: "disconnected",
