@@ -694,8 +694,15 @@ function degradedText(state: State, health: Health): string {
   if (health.missing.length) lines.push(`• 플러그인 없음: ${health.missing.map(displayName).join(", ")}`);
   if (health.deep && !health.deep.ok) lines.push(`• 응답 없음: ${displayName(health.deep.project)} — ${health.deep.detail}`);
   lines.push(`• 시작: ${clock(state.since)} · 지속 ${humanSince(state.since)} · 확인 ${state.checks}회`);
+  // An alert that names only what broke leaves the reader asking whether the
+  // rest is fine — which is the first thing anyone wants to know when they are
+  // pulled in. The all-clear card already lists every project; the alert needs
+  // it more.
+  if (health.relayUp && health.expected.length) {
+    lines.push(`• 프로젝트별 상태:\n${projectLines(health)}`);
+  }
   lines.push(`• 복구: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
-  lines.push(`:link: ${consoleLink}`);
+  lines.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
   return lines.join("\n");
 }
 
