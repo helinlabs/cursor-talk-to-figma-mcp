@@ -114,12 +114,22 @@ type State = {
   since: number;                 // when the current status began
   lastPostedAt: number;
   streak: Record<string, number>;
+  // When each project was last confirmed missing. The incident has one start
+  // time, but the projects inside it do not: a second one failing hours later
+  // was being shown under the first one's clock, which read as though
+  // everything had been down all along.
+  downSince: Record<string, number>;
   deepCursor: number;
   deepPoolSize: number;
   // Recent timings, newest last, kept separately because the two probes sample
   // at very different rates. A probe that is merely getting slower is the
   // interesting signal — it shows up here long before anything fails outright.
   slowActive: boolean;           // an outlier has been reported and not yet cleared
+  // The alert card for the incident in progress. Changes hang off this rather
+  // than off whatever card happens to be current, so the whole sequence — including
+  // the recoveries that end it — stays in one thread instead of splitting across
+  // the alert and the all-clear that replaces it.
+  incidentTs: string | null;
   speedTs: string | null;        // the speed record living in the card's thread
   speedParentTs: string | null;
   speedPostedAt: number;
@@ -147,7 +157,7 @@ function loadState(): State {
   }
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [] };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [] };
 }
 function saveState(state: State): void {
   try {
@@ -660,11 +670,15 @@ async function reportSpeed(state: State): Promise<void> {
 // plugin is single-threaded, so anything already running delays it — and a slow
 // probe on a busy project is not the same finding as a slow probe on an idle
 // one. Showing the load next to the timing is what separates them.
-function projectLines(health: Health): string {
+function projectLines(health: Health, state?: State): string {
   const byName = new Map(health.load.map((entry) => [nameKey(entry.name), entry]));
   return health.expected.map((title) => {
     const entry = [...byName.entries()].find(([key]) => key.includes(nameKey(title)) || nameKey(title).includes(key))?.[1];
-    if (!entry) return `   :red_circle: ${title} — 플러그인 없음`;
+    if (!entry) {
+      const downAt = state?.downSince?.[title];
+      return `   :red_circle: ${title} — 플러그인 없음`
+        + (downAt ? ` · ${clock(downAt)}부터 (${humanSince(downAt)})` : "");
+    }
     const busy = entry.running + entry.pending;
     const detail = busy
       ? `처리 ${entry.running} · 대기 ${entry.pending} · 최장 ${secs(entry.oldestQueuedMs)}`
@@ -683,7 +697,7 @@ function healthyText(state: State, health: Health): string {
     // rewrite is due makes that silence legible instead of ambiguous: a card
     // whose promised time has passed is itself the alert.
     + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)\n`
-    + `• 프로젝트별 부하:\n${projectLines(health)}\n`
+    + `• 프로젝트별 부하:\n${projectLines(health, state)}\n`
     + `:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`;
 }
 
@@ -693,13 +707,13 @@ function degradedText(state: State, health: Health): string {
   if (!health.relayUp) lines.push("• 릴레이에 접속할 수 없습니다 (macmini-1:3055)");
   if (health.missing.length) lines.push(`• 플러그인 없음: ${health.missing.map(displayName).join(", ")}`);
   if (health.deep && !health.deep.ok) lines.push(`• 응답 없음: ${displayName(health.deep.project)} — ${health.deep.detail}`);
-  lines.push(`• 시작: ${clock(state.since)} · 지속 ${humanSince(state.since)} · 확인 ${state.checks}회`);
+  lines.push(`• 최초 이상 감지: ${clock(state.since)} (${humanSince(state.since)} 경과) · 확인 ${state.checks}회`);
   // An alert that names only what broke leaves the reader asking whether the
   // rest is fine — which is the first thing anyone wants to know when they are
   // pulled in. The all-clear card already lists every project; the alert needs
   // it more.
   if (health.relayUp && health.expected.length) {
-    lines.push(`• 프로젝트별 상태:\n${projectLines(health)}`);
+    lines.push(`• 프로젝트별 상태:\n${projectLines(health, state)}`);
   }
   lines.push(`• 복구: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
   lines.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
@@ -711,6 +725,27 @@ function recoveredText(state: State, health: Health): string {
     + `• ${humanSince(state.since)} 만에 정상 — 연결 ${coverage(health)}\n`
     + `• 확인: ${clock()}\n`
     + `:link: ${consoleLink}`;
+}
+
+
+// Each change goes into the incident card's thread as its own reply. The card
+// is rewritten in place, so it can only ever show the current shape of the
+// outage — the sequence that produced it would otherwise be lost, and that
+// sequence is what says "this one broke overnight, that one broke just now".
+async function reportChanges(state: State): Promise<void> {
+  if (!pendingChanges.length) return;
+  const parent = state.incidentTs;
+  if (!parent) return;   // nothing to hang them off yet; keep them for the next tick
+  const text = pendingChanges.join("\n");
+  const posted = await slack("chat.postMessage", { text, thread_ts: parent });
+  if (!posted?.ok) return;
+  pendingChanges = [];
+  // Once everything is back, the incident is closed and the next one starts a
+  // fresh thread. Released here rather than on the transition, so the final
+  // recovery lines still land under the alert they belong to.
+  if (state.status === "healthy" && Object.keys(state.downSince).length === 0) {
+    state.incidentTs = null;
+  }
 }
 
 // A new message notifies; an edit does not. So transitions post, and steady
@@ -738,6 +773,10 @@ async function report(state: State, health: Health): Promise<void> {
       text: status === "healthy" ? healthyText(state, health) : degradedText(state, health),
     });
     state.messageTs = posted?.ts ?? null;
+    // The alert card becomes the thread every change in this outage is written
+    // into, and stays so until the outage ends — the recoveries that close it
+    // belong under the alert, not under the all-clear that replaces the card.
+    if (status === "degraded") state.incidentTs = state.messageTs;
     state.lastPostedAt = Date.now();
     return;
   }
@@ -812,6 +851,10 @@ const deepEvery = () => (last.deep && !last.deep.ok ? DEEP_RETRY_MS : DEEP_MS);
 // Three things call tick(): the interval, startup, and /check. Overlapping
 // runs would each read the status before either wrote it, and both would treat
 // the same change as new.
+// Changes waiting to be written into the incident thread. The card shows the
+// current shape of the outage; the thread shows how it got there, which is the
+// part that is lost once the card is rewritten.
+let pendingChanges: string[] = [];
 let ticking = false;
 
 async function tick(): Promise<boolean> {
@@ -840,6 +883,23 @@ async function runTick(): Promise<void> {
     state.streak[name] = health.missing.includes(name) ? (state.streak[name] || 0) + 1 : 0;
   }
   const confirmed = health.missing.filter((name) => (state.streak[name] || 0) >= FAIL_STREAK);
+
+  // Per-project transitions, recorded as they happen. Without this the card
+  // could only say when the incident began, so anything that broke later wore
+  // the first failure's timestamp.
+  for (const name of confirmed) {
+    if (!state.downSince[name]) {
+      state.downSince[name] = Date.now();
+      pendingChanges.push(`:red_circle: ${clock()} · ${displayName(name)} 플러그인 끊김`);
+    }
+  }
+  for (const name of Object.keys(state.downSince)) {
+    if (!confirmed.includes(name)) {
+      const downFor = humanSince(state.downSince[name]);
+      delete state.downSince[name];
+      pendingChanges.push(`:white_check_mark: ${clock()} · ${displayName(name)} 복구 (${downFor} 만에)`);
+    }
+  }
   const damped: Health = { ...health, missing: confirmed, ok: health.relayUp && confirmed.length === 0 };
 
   if (damped.ok && Date.now() - lastDeepAt >= deepEvery()) {
@@ -874,6 +934,7 @@ async function runTick(): Promise<void> {
 
   last = damped;
   await report(state, damped);
+  await reportChanges(state);
   await reportSpeed(state);
   await reportOutlier(state, damped);
   saveState(state);
