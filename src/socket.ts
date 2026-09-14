@@ -191,14 +191,31 @@ try { applyManagedExportRetention(); } catch (error) { console.warn("Managed exp
 // console at once (2026-08-31, 2026-09-14). Record it where list_relay_errors
 // and the health watch will see it, and keep serving. The specific causes are
 // fixed where they arise; this is the backstop for the ones not found yet.
-process.on("uncaughtException", (error) => {
-  console.error("[relay] uncaught exception (kept running):", error);
-  recordRelayError({ source: "relay", message: `uncaught exception: ${error instanceof Error ? error.message : String(error)}` });
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[relay] unhandled rejection (kept running):", reason);
-  recordRelayError({ source: "relay", message: `unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}` });
-});
+//
+// But only once the relay is actually serving. Bun.serve runs at top level and
+// throws EADDRINUSE when 3055 is still held; swallowing that left a process
+// with live timers and no listener — alive to launchd, absent from crash.log,
+// unreachable to every plugin, with nothing to restart it (reproduced under
+// Bun). Before `serving`, an escaped error exits so launchd starts it clean.
+// After it, a burst of repeats also exits: a process throwing continuously is
+// broken, and a restart is cheaper than serving from half-updated state.
+let serving = false;
+const escapedErrorTimes: number[] = [];
+function onEscapedError(kind: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`[relay] ${kind}${serving ? " (kept running)" : " before serving — exiting"}:`, error);
+  recordRelayError({ source: "relay", message: `${kind}: ${message}` });
+  if (!serving) process.exit(1);
+  const now = Date.now();
+  escapedErrorTimes.push(now);
+  while (escapedErrorTimes.length && now - escapedErrorTimes[0] > 60_000) escapedErrorTimes.shift();
+  if (escapedErrorTimes.length > 5) {
+    console.error(`[relay] ${escapedErrorTimes.length} escaped errors in 60s — exiting for a clean restart`);
+    process.exit(1);
+  }
+}
+process.on("uncaughtException", (error) => onEscapedError("uncaught exception", error));
+process.on("unhandledRejection", (reason) => onEscapedError("unhandled rejection", reason));
 
 setInterval(() => {
   try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
@@ -2504,6 +2521,7 @@ const server = Bun.serve({
     }
   }
 });
+serving = true;
 
 setInterval(() => {
   const now = Date.now();

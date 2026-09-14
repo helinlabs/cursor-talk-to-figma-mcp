@@ -57,20 +57,34 @@ print(String(data: data, encoding: .utf8)!)
 let helperPromise: Promise<string> | null = null;
 
 async function localWindowHelper(): Promise<string> {
-  // Same trap as the window agent: the memo is a $TMPDIR path and macOS purges
-  // $TMPDIR. A vanished helper used to surface as "No local Figma window
-  // matches project" forever, which sends a reader after the wrong problem.
-  if (helperPromise) {
-    const cached = await helperPromise.catch(() => null);
+  // Compare-and-swap on the memo. The cached value is a $TMPDIR path that macOS
+  // can purge, so it is re-checked on every call — and when it is gone, only the
+  // caller that still sees the dead promise replaces it, synchronously, so any
+  // caller arriving meanwhile joins that one rebuild instead of starting its
+  // own. Two viewers opening together after a purge otherwise ran two swiftc
+  // builds (up to 98s each here) racing to rename onto the same path.
+  for (;;) {
+    const current = helperPromise;
+    if (!current) {
+      helperPromise = buildHelper();
+      continue;
+    }
+    const cached = await current.catch(() => null);
     if (cached) {
       try {
         await access(cached, fsConstants.X_OK);
         return cached;
       } catch {}
     }
-    helperPromise = null;
+    if (helperPromise === current) {
+      if (cached) console.error(`[Helper] cached binary vanished (${cached}) — rebuilding`);
+      helperPromise = null;
+    }
   }
-  helperPromise = (async () => {
+}
+
+function buildHelper(): Promise<string> {
+  const promise = (async () => {
     const hash = createHash("sha256").update(WINDOW_HELPER_SOURCE).digest("hex").slice(0, 12);
     const helperPath = join(tmpdir(), `talk-to-figma-window-${hash}`);
     try {
@@ -92,8 +106,8 @@ async function localWindowHelper(): Promise<string> {
   })();
   // A failed build must not be cached either, or one bad swiftc run disables
   // the JPEG preview until the relay restarts.
-  helperPromise.catch(() => { helperPromise = null; });
-  return helperPromise;
+  promise.catch(() => { if (helperPromise === promise) helperPromise = null; });
+  return promise;
 }
 
 export async function captureLocalFigmaWindow(

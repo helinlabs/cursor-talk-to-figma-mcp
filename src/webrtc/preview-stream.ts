@@ -46,24 +46,34 @@ const AGENT_SOURCE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "w
 let agentBinaryPromise: Promise<string> | null = null;
 
 async function agentBinary(): Promise<string> {
-  // The memo is a path, and the path lives in $TMPDIR, which macOS purges on
-  // its own schedule. Once cached it used to be trusted forever: on 2026-09-14
-  // the relay had been up ten days, the file was gone, and the next viewer
-  // spawned a path that no longer existed. Checking it costs one stat per
-  // viewer; a missing file sends us back through the build.
-  if (agentBinaryPromise) {
-    const cached = await agentBinaryPromise.catch(() => null);
+  // Compare-and-swap on the memo. The cached value is a $TMPDIR path that macOS
+  // can purge, so it is re-checked on every call — and when it is gone, only the
+  // caller that still sees the dead promise replaces it, synchronously, so any
+  // caller arriving meanwhile joins that one rebuild instead of starting its
+  // own. Two viewers opening together after a purge otherwise ran two swiftc
+  // builds (up to 98s each here) racing to rename onto the same path.
+  for (;;) {
+    const current = agentBinaryPromise;
+    if (!current) {
+      agentBinaryPromise = buildAgent();
+      continue;
+    }
+    const cached = await current.catch(() => null);
     if (cached) {
       try {
         await access(cached, fsConstants.X_OK);
         return cached;
-      } catch {
-        console.error(`[window-agent] cached binary vanished (${cached}) — rebuilding`);
-      }
+      } catch {}
     }
-    agentBinaryPromise = null;
+    if (agentBinaryPromise === current) {
+      if (cached) console.error(`[Agent] cached binary vanished (${cached}) — rebuilding`);
+      agentBinaryPromise = null;
+    }
   }
-  agentBinaryPromise = (async () => {
+}
+
+function buildAgent(): Promise<string> {
+  const promise = (async () => {
     const source = await readFile(AGENT_SOURCE_PATH, "utf8");
     const hash = createHash("sha256").update(source).digest("hex").slice(0, 12);
     const binaryPath = join(tmpdir(), `figma-window-agent-${hash}`);
@@ -92,8 +102,8 @@ async function agentBinary(): Promise<string> {
       await rm(buildDir, { recursive: true, force: true });
     }
   })();
-  agentBinaryPromise.catch(() => { agentBinaryPromise = null; });
-  return agentBinaryPromise;
+  promise.catch(() => { if (agentBinaryPromise === promise) agentBinaryPromise = null; });
+  return promise;
 }
 
 // Compile at relay boot instead of on the first viewer: swiftc took 98s of
