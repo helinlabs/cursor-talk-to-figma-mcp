@@ -627,16 +627,49 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
 }
 
 // --- Slack -----------------------------------------------------------------
+// Every network call in the loop has a deadline, and this was the one that did
+// not. getJson aborts after 5s and runCommand after its timeout, but slack()
+// awaited a bare fetch. On 2026-09-12 a Slack post stalled and never settled:
+// report() never returned, so tick() never cleared `ticking`, and every tick
+// after that returned immediately without checking anything. The process stayed
+// up, the port kept answering, the tunnel showed it listening — and it said
+// nothing for 51 hours. A post that cannot finish in time is now a failed post,
+// which report() already handles; the next tick retries.
+const SLACK_TIMEOUT_MS = Number(process.env.HEALTH_SLACK_TIMEOUT_MS || 15_000);
+
+// Only a definitive answer from Slack means the message is gone for good.
+//
+// A timed-out chat.update may well have landed. Treating it like
+// "message_not_found" posted a brand-new card on every round of a slow Slack,
+// which under a sustained slowdown is a new message in #dev_noti_figma every
+// five minutes — trading a silent watcher for a noisy one. On a transient
+// failure keep the ts and try the edit again next round.
+const replaceable = (result: any) => !result?.ok && !result?.transient;
+
 async function slack(method: string, body: any): Promise<any> {
   if (!SLACK_TOKEN || !SLACK_CHANNEL) return { ok: false, error: "slack not configured" };
-  const response = await fetch(`https://slack.com/api/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${SLACK_TOKEN}` },
-    body: JSON.stringify({ channel: SLACK_CHANNEL, ...body }),
-  });
-  const payload = (await response.json()) as { ok?: boolean; error?: string; ts?: string };
-  if (!payload.ok) console.error(`[health] slack ${method} failed:`, payload.error);
-  return payload;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SLACK_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://slack.com/api/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${SLACK_TOKEN}` },
+      body: JSON.stringify({ channel: SLACK_CHANNEL, ...body }),
+      signal: controller.signal,
+    });
+    const payload = (await response.json()) as { ok?: boolean; error?: string; ts?: string };
+    if (!payload.ok) console.error(`[health] slack ${method} failed:`, payload.error);
+    return payload;
+  } catch (error) {
+    const reason = controller.signal.aborted ? `timed out after ${SLACK_TIMEOUT_MS}ms` : String(error);
+    console.error(`[health] slack ${method} failed: ${reason}`);
+    // Transient: we do not know whether Slack applied it. That is different
+    // from Slack answering "message_not_found", and callers must not treat the
+    // two the same way — see replaceable() below.
+    return { ok: false, error: reason, transient: true };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const clock = (at = Date.now()) => new Date(at).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false });
@@ -796,7 +829,8 @@ async function reportSpeed(state: State): Promise<void> {
   if (state.speedTs && !due) return;
   if (state.speedTs) {
     const updated = await slack("chat.update", { ts: state.speedTs, text });
-    if (!updated?.ok) state.speedTs = null;
+    if (replaceable(updated)) state.speedTs = null;
+    else if (!updated?.ok) return;   // transient: leave the record, retry next round
   }
   if (!state.speedTs) {
     const posted = await slack("chat.postMessage", { text, thread_ts: parent });
@@ -1040,10 +1074,14 @@ async function report(state: State, health: Health): Promise<void> {
   if (state.messageTs) {
     const updated = await slack("chat.update", { ts: state.messageTs, text });
     // A message that can no longer be edited (deleted, too old) should not
-    // silently stop the reporting — start a new one instead.
-    if (!updated?.ok) {
+    // silently stop the reporting — start a new one instead. A transient
+    // failure is not that, and returning here without touching lastPostedAt
+    // retries the same edit on the next tick.
+    if (replaceable(updated)) {
       const posted = await slack("chat.postMessage", { text });
       state.messageTs = posted?.ts ?? null;
+    } else if (!updated?.ok) {
+      return;
     }
   } else {
     const posted = await slack("chat.postMessage", { text });
@@ -1110,9 +1148,25 @@ const deepEvery = () => (last.deep && !last.deep.ok ? DEEP_RETRY_MS : DEEP_MS);
 let pendingChanges: string[] = [];
 let ticking = false;
 
+// The backstop behind every individual timeout.
+//
+// Bounding each call fixes the hang that happened; it does not fix the next one,
+// which will be some await nobody thought to bound. So the loop itself is timed:
+// a tick running longer than any legitimate tick can is treated as wedged, and
+// the process exits. launchd has KeepAlive on this job and restarts it within
+// ThrottleInterval, and all state is on disk, so the cost of a false trip is
+// one restart — against a silent watcher, which is the one failure this service
+// exists to make impossible.
+//
+// 20 minutes is well past a real worst case: two deep probes, each a handful of
+// 45s-bounded commands plus a 90s export budget, is on the order of 11 minutes.
+const TICK_STUCK_MS = Number(process.env.HEALTH_TICK_STUCK_MS || 20 * 60_000);
+let tickStartedAt = 0;
+
 async function tick(): Promise<boolean> {
   if (ticking) return false;
   ticking = true;
+  tickStartedAt = Date.now();
   try {
     await runTick();
     return true;
@@ -1120,6 +1174,15 @@ async function tick(): Promise<boolean> {
     ticking = false;
   }
 }
+
+setInterval(() => {
+  if (!ticking) return;
+  const stuckFor = Date.now() - tickStartedAt;
+  if (stuckFor < TICK_STUCK_MS) return;
+  console.error(`[health] tick has been running for ${Math.round(stuckFor / 1000)}s — `
+    + `treating the loop as wedged and exiting so launchd restarts it`);
+  process.exit(70);
+}, 60_000);
 
 async function runTick(): Promise<void> {
   const health = await shallowCheck();
