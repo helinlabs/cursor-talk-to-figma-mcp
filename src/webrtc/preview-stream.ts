@@ -46,7 +46,23 @@ const AGENT_SOURCE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "w
 let agentBinaryPromise: Promise<string> | null = null;
 
 async function agentBinary(): Promise<string> {
-  if (agentBinaryPromise) return agentBinaryPromise;
+  // The memo is a path, and the path lives in $TMPDIR, which macOS purges on
+  // its own schedule. Once cached it used to be trusted forever: on 2026-09-14
+  // the relay had been up ten days, the file was gone, and the next viewer
+  // spawned a path that no longer existed. Checking it costs one stat per
+  // viewer; a missing file sends us back through the build.
+  if (agentBinaryPromise) {
+    const cached = await agentBinaryPromise.catch(() => null);
+    if (cached) {
+      try {
+        await access(cached, fsConstants.X_OK);
+        return cached;
+      } catch {
+        console.error(`[window-agent] cached binary vanished (${cached}) — rebuilding`);
+      }
+    }
+    agentBinaryPromise = null;
+  }
   agentBinaryPromise = (async () => {
     const source = await readFile(AGENT_SOURCE_PATH, "utf8");
     const hash = createHash("sha256").update(source).digest("hex").slice(0, 12);
@@ -122,6 +138,27 @@ class WindowAgent {
     this.startPromise = (async () => {
       const binary = await agentBinary();
       const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"] });
+      // A spawn failure is an 'error' EVENT, not a rejection or a throw, and an
+      // 'error' event with no listener is an uncaught exception. That is what
+      // took the relay down on 2026-09-14 — with all seven plugin connections
+      // and every console on it — even though startViewer's caller had a
+      // .catch: the promise had already resolved by the time the event fired
+      // (reproduced under Bun: no listener exits 1, one listener survives).
+      // The listener is permanent so a later failure is contained too.
+      let spawnFailure: Error | null = null;
+      child.on("error", (error) => {
+        spawnFailure = error;
+        console.error(`[window-agent:${this.windowMatch}] ${error.message}`);
+        if (this.child === child) this.child = null;
+        this.startPromise = null;
+        this.exitResolve?.();
+        this.onExit?.();
+      });
+      // ENOENT arrives on the next tick. Give it that tick, and if the agent
+      // never started, reject — so the viewer is told (webrtc_error) instead of
+      // waiting on a stream that will never produce a frame.
+      await new Promise((resolve) => setImmediate(resolve));
+      if (spawnFailure) throw spawnFailure;
       this.child = child;
       this.exited = new Promise((resolve) => { this.exitResolve = resolve; });
       child.stdout.on("data", (chunk: Buffer) => this.feed(chunk));

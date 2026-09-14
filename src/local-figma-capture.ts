@@ -57,7 +57,19 @@ print(String(data: data, encoding: .utf8)!)
 let helperPromise: Promise<string> | null = null;
 
 async function localWindowHelper(): Promise<string> {
-  if (helperPromise) return helperPromise;
+  // Same trap as the window agent: the memo is a $TMPDIR path and macOS purges
+  // $TMPDIR. A vanished helper used to surface as "No local Figma window
+  // matches project" forever, which sends a reader after the wrong problem.
+  if (helperPromise) {
+    const cached = await helperPromise.catch(() => null);
+    if (cached) {
+      try {
+        await access(cached, fsConstants.X_OK);
+        return cached;
+      } catch {}
+    }
+    helperPromise = null;
+  }
   helperPromise = (async () => {
     const hash = createHash("sha256").update(WINDOW_HELPER_SOURCE).digest("hex").slice(0, 12);
     const helperPath = join(tmpdir(), `talk-to-figma-window-${hash}`);
@@ -78,6 +90,9 @@ async function localWindowHelper(): Promise<string> {
       await rm(buildDir, { recursive: true, force: true });
     }
   })();
+  // A failed build must not be cached either, or one bad swiftc run disables
+  // the JPEG preview until the relay restarts.
+  helperPromise.catch(() => { helperPromise = null; });
   return helperPromise;
 }
 

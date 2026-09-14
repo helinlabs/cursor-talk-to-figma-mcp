@@ -185,6 +185,21 @@ const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
 
 try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
+// The relay's job is to hold the plugin connections, and nothing else it does
+// is worth losing them for. An error that escapes one feature — a preview agent,
+// an indexer pass — used to exit the process and drop every plugin and every
+// console at once (2026-08-31, 2026-09-14). Record it where list_relay_errors
+// and the health watch will see it, and keep serving. The specific causes are
+// fixed where they arise; this is the backstop for the ones not found yet.
+process.on("uncaughtException", (error) => {
+  console.error("[relay] uncaught exception (kept running):", error);
+  recordRelayError({ source: "relay", message: `uncaught exception: ${error instanceof Error ? error.message : String(error)}` });
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[relay] unhandled rejection (kept running):", reason);
+  recordRelayError({ source: "relay", message: `unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}` });
+});
+
 setInterval(() => {
   try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
 }, 60 * 60 * 1000);
