@@ -46,8 +46,34 @@ const AGENT_SOURCE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "w
 let agentBinaryPromise: Promise<string> | null = null;
 
 async function agentBinary(): Promise<string> {
-  if (agentBinaryPromise) return agentBinaryPromise;
-  agentBinaryPromise = (async () => {
+  // Compare-and-swap on the memo. The cached value is a $TMPDIR path that macOS
+  // can purge, so it is re-checked on every call — and when it is gone, only the
+  // caller that still sees the dead promise replaces it, synchronously, so any
+  // caller arriving meanwhile joins that one rebuild instead of starting its
+  // own. Two viewers opening together after a purge otherwise ran two swiftc
+  // builds (up to 98s each here) racing to rename onto the same path.
+  for (;;) {
+    const current = agentBinaryPromise;
+    if (!current) {
+      agentBinaryPromise = buildAgent();
+      continue;
+    }
+    const cached = await current.catch(() => null);
+    if (cached) {
+      try {
+        await access(cached, fsConstants.X_OK);
+        return cached;
+      } catch {}
+    }
+    if (agentBinaryPromise === current) {
+      if (cached) console.error(`[Agent] cached binary vanished (${cached}) — rebuilding`);
+      agentBinaryPromise = null;
+    }
+  }
+}
+
+function buildAgent(): Promise<string> {
+  const promise = (async () => {
     const source = await readFile(AGENT_SOURCE_PATH, "utf8");
     const hash = createHash("sha256").update(source).digest("hex").slice(0, 12);
     const binaryPath = join(tmpdir(), `figma-window-agent-${hash}`);
@@ -76,8 +102,8 @@ async function agentBinary(): Promise<string> {
       await rm(buildDir, { recursive: true, force: true });
     }
   })();
-  agentBinaryPromise.catch(() => { agentBinaryPromise = null; });
-  return agentBinaryPromise;
+  promise.catch(() => { if (agentBinaryPromise === promise) agentBinaryPromise = null; });
+  return promise;
 }
 
 // Compile at relay boot instead of on the first viewer: swiftc took 98s of
@@ -122,6 +148,27 @@ class WindowAgent {
     this.startPromise = (async () => {
       const binary = await agentBinary();
       const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"] });
+      // A spawn failure is an 'error' EVENT, not a rejection or a throw, and an
+      // 'error' event with no listener is an uncaught exception. That is what
+      // took the relay down on 2026-09-14 — with all seven plugin connections
+      // and every console on it — even though startViewer's caller had a
+      // .catch: the promise had already resolved by the time the event fired
+      // (reproduced under Bun: no listener exits 1, one listener survives).
+      // The listener is permanent so a later failure is contained too.
+      let spawnFailure: Error | null = null;
+      child.on("error", (error) => {
+        spawnFailure = error;
+        console.error(`[window-agent:${this.windowMatch}] ${error.message}`);
+        if (this.child === child) this.child = null;
+        this.startPromise = null;
+        this.exitResolve?.();
+        this.onExit?.();
+      });
+      // ENOENT arrives on the next tick. Give it that tick, and if the agent
+      // never started, reject — so the viewer is told (webrtc_error) instead of
+      // waiting on a stream that will never produce a frame.
+      await new Promise((resolve) => setImmediate(resolve));
+      if (spawnFailure) throw spawnFailure;
       this.child = child;
       this.exited = new Promise((resolve) => { this.exitResolve = resolve; });
       child.stdout.on("data", (chunk: Buffer) => this.feed(chunk));
