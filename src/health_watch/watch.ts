@@ -145,6 +145,17 @@ type State = {
   // the one project this turn happened to probe, and every other project read
   // as "유휴" — including ones whose last probe had failed.
   deepResults: Record<string, { at: number; ok: boolean; ms: number; detail: string }>;
+  // Slowness is judged against each project's OWN recent timings.
+  //
+  // One shared baseline made a heavy file permanently "slow": CA_Product runs
+  // 10-17s where the other six run 0.2-0.8s, so against their mixed average
+  // it was a 3-7x outlier on every probe. And one shared slowActive flag was
+  // re-armed by the very next probe — which is a different, fast project — so
+  // the alert fired again every rotation: a new @mention in #dev_noti_figma
+  // every ~38 minutes all day on 2026-09-15.
+  deepDurations: Record<string, number[]>;
+  slowSince: Record<string, number>;     // an episode in progress, per project
+  slowAlertedAt: Record<string, number>; // last alert per project, for the cooldown
 };
 
 function loadState(): State {
@@ -162,13 +173,30 @@ function loadState(): State {
         ? loaded.deepHistory.filter((entry: { ok?: boolean; ms?: number }) => !entry?.ok || usableMs(entry?.ms))
         : [],
       deepResults: loaded.deepResults && typeof loaded.deepResults === "object" ? loaded.deepResults : {},
+      // Backfill from deepHistory the first time, so per-project judging starts
+      // with the history already on disk instead of hours of silence.
+      deepDurations: loaded.deepDurations && typeof loaded.deepDurations === "object"
+        ? loaded.deepDurations
+        : durationsFromHistory(Array.isArray(loaded.deepHistory) ? loaded.deepHistory : []),
+      slowSince: loaded.slowSince && typeof loaded.slowSince === "object" ? loaded.slowSince : {},
+      slowAlertedAt: loaded.slowAlertedAt && typeof loaded.slowAlertedAt === "object" ? loaded.slowAlertedAt : {},
     };
   } catch {
     return blankState();
   }
 }
+function durationsFromHistory(history: Array<{ project?: string; ok?: boolean; ms?: number }>): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
+  for (const entry of history) {
+    if (!entry?.ok || !entry.project || !usableMs(entry.ms)) continue;
+    const key = nameKey(entry.project);
+    (out[key] ||= []).push(entry.ms as number);
+    if (out[key].length > SPEED_WINDOW) out[key].shift();
+  }
+  return out;
+}
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [], deepResults: {} };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {} };
 }
 function saveState(state: State): void {
   try {
@@ -1107,28 +1135,47 @@ function baselineFor(series: number[]): number | null {
   return prior.length >= SLOW_MIN_SAMPLES ? mean(prior) : null;
 }
 
+// One alert per slowdown per project, and not more than once per cooldown.
+// A project whose normal is slow is not an outlier for being slow; a project
+// that gets slower than ITS normal is, once, and then the card carries it.
+const SLOW_COOLDOWN_MS = Number(process.env.HEALTH_SLOW_COOLDOWN_MS || 6 * 60 * 60_000);
+// A relative baseline alone never notices a project that degrades gradually:
+// 1s, 2s, 4s, 8s, 30s stays under 3x its own trailing mean at every step. Past
+// this, a probe counts as slow whatever the project's history says. CA_Product's
+// normal is ~16s, so this does not bring back the per-rotation alert.
+const SLOW_CEILING_MS = Number(process.env.HEALTH_SLOW_CEILING_MS || 30_000);
+
 async function reportOutlier(state: State, health: Health): Promise<void> {
-  const durations = state.deepHistory.filter((entry) => entry.ok).map((entry) => entry.ms);
-  const latest = durations[durations.length - 1];
-  const base = baselineFor(durations);
+  const entry = state.deepHistory[state.deepHistory.length - 1];
+  if (!entry || !entry.ok) return;
+  const key = nameKey(entry.project);
+  const series = state.deepDurations[key] || [];
+  const latest = series[series.length - 1];
+  const base = baselineFor(series);
   if (latest == null || base == null) return;
 
-  const isOutlier = latest > base * SLOW_FACTOR && latest > SLOW_FLOOR_MS;
+  const isOutlier = (latest > base * SLOW_FACTOR && latest > SLOW_FLOOR_MS) || latest > SLOW_CEILING_MS;
   if (!isOutlier) {
-    state.slowActive = false;   // back in range: re-arm for the next episode
+    delete state.slowSince[key];   // THIS project is back in range: re-arm it
     return;
   }
-  if (state.slowActive) return;
-  state.slowActive = true;
+  if (!state.slowSince[key]) state.slowSince[key] = Date.now();
+  // One alert per episode. An episode already announced stays quiet; one that
+  // began inside the cooldown is not dropped but deferred — announced once the
+  // cooldown ends if it is still going, instead of staying silent for its whole
+  // life because the flag was set while the cooldown held it back.
+  if ((state.slowAlertedAt[key] || 0) >= state.slowSince[key]) return;
+  if (Date.now() - (state.slowAlertedAt[key] || 0) < SLOW_COOLDOWN_MS) return;
+  state.slowAlertedAt[key] = Date.now();
 
-  const entry = state.deepHistory[state.deepHistory.length - 1];
   const mention = ALERT_USER ? `<@${ALERT_USER}> ` : "";
   await slack("chat.postMessage", {
     text: `:warning: ${mention}*Figma 헬스체크 · 응답이 느려졌습니다*\n`
-      + `• ${displayName(entry.project)} 심층 점검 ${secs(latest)} — 최근 평균 ${secs(base)}의 `
+      + `• ${displayName(entry.project)} 심층 점검 ${secs(latest)} — 이 프로젝트의 최근 평균 ${secs(base)}의 `
       + `${(latest / base).toFixed(1)}배\n`
       + `• 아직 실패는 아닙니다. 계속 느려지면 플러그인이 먹통이 되기 전 단계일 수 있습니다.\n`
-      + `• 확인: ${clock()} · 상세는 상태 카드의 스레드에 있습니다.\n`
+      + `• 같은 프로젝트는 ${Math.round(SLOW_COOLDOWN_MS / 3_600_000)}시간 동안 다시 알리지 않습니다. 지금 속도는 상태 카드에 계속 표시됩니다.\n`
+      + `• 확인: ${clock()}\n`
       + `:link: ${consoleLink}`,
   });
 }
@@ -1234,6 +1281,12 @@ async function runTick(): Promise<void> {
           ok: damped.deep.ok && usableMs(damped.deep.ms),
           ms: damped.deep.ms ?? 0,
         });
+        if (damped.deep.ok && usableMs(damped.deep.ms)) {
+          const key = nameKey(damped.deep.project);
+          const series = (state.deepDurations[key] ||= []);
+          series.push(damped.deep.ms as number);
+          if (series.length > SPEED_WINDOW) series.splice(0, series.length - SPEED_WINDOW);
+        }
       }
       if (state.deepHistory.length > SPEED_WINDOW * 3) state.deepHistory.splice(0, state.deepHistory.length - SPEED_WINDOW * 3);
       state.deepResults[nameKey(damped.deep.project)] = {
@@ -1247,8 +1300,10 @@ async function runTick(): Promise<void> {
       // leaving defaultProjectIDs would otherwise leave its verdict — detail
       // string and all — in the state file forever.
       const expectedKeys = new Set(health.expected.map(nameKey));
-      for (const key of Object.keys(state.deepResults)) {
-        if (!expectedKeys.has(key)) delete state.deepResults[key];
+      for (const map of [state.deepResults, state.deepDurations, state.slowSince, state.slowAlertedAt] as Record<string, unknown>[]) {
+        for (const key of Object.keys(map)) {
+          if (!expectedKeys.has(key)) delete map[key];
+        }
       }
     }
   } else {

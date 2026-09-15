@@ -183,6 +183,8 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
 const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
+// Full per-message JSON in relay.log. Off by default — see the message handler.
+const RELAY_VERBOSE = process.env.RELAY_VERBOSE === "1";
 
 try { applyManagedExportRetention(); } catch (error) { console.warn("Managed export retention failed:", error); }
 // The relay's job is to hold the plugin connections, and nothing else it does
@@ -2136,17 +2138,23 @@ const server = Bun.serve({
           return;
         }
 
-        console.log(`\n=== Received message from client ===`);
-        console.log(`Type: ${data.type}, Channel: ${data.channel || 'N/A'}`);
-        if (data.message?.command) {
-          console.log(`Command: ${data.message.command}, ID: ${data.id}`);
-        } else if (data.message?.result) {
-          console.log(`Response: ID: ${data.id}, Has Result: ${!!data.message.result}`);
+        // One line per message, timestamped. This used to print four lines
+        // plus the whole sanitized message as pretty JSON for every frame, which
+        // is how ten days of uptime became a 116MB, 4.4-million-line relay.log.1
+        // — and it had no timestamps, so finding the 15:54 crash in it meant
+        // anchoring on the wrapper's exit marker. The full dump is still one
+        // environment variable away when a protocol problem needs it.
+        const verb = data.message?.command
+          ? `cmd=${data.message.command}`
+          : data.message?.error !== undefined ? "error"
+          : data.message?.result !== undefined ? "result" : "";
+        console.log(`[${new Date().toISOString()}] ${meta?.id ?? "?"} ${data.type} ${data.channel || "-"} ${verb} ${data.id ?? ""}`.trimEnd());
+        if (RELAY_VERBOSE) {
+          console.log(`Message metadata:`, JSON.stringify({
+            ...sanitizeForLog(data),
+            ...(binaryPayload ? { binaryTransfer: { bytes: binaryPayload.byteLength } } : {}),
+          }, null, 2));
         }
-        console.log(`Message metadata:`, JSON.stringify({
-          ...sanitizeForLog(data),
-          ...(binaryPayload ? { binaryTransfer: { bytes: binaryPayload.byteLength } } : {}),
-        }, null, 2));
 
         if (data.type === "join") {
           if (!meta?.protocolVerified) {
