@@ -150,7 +150,9 @@ cmd_crashes() {
 cmd_logs() {
   mkdir -p "$LOG_DIR"; touch "$LOG_FILE"
   echo "tailing $LOG_FILE (Ctrl-C to stop)…"
-  tail -f "$LOG_FILE"
+  # -F follows the NAME: relay.log now rotates while the relay runs, and -f
+  # would keep reading the renamed file and silently stop showing anything.
+  tail -F "$LOG_FILE"
 }
 
 case "${1:-}" in

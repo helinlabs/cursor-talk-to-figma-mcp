@@ -1139,6 +1139,11 @@ function baselineFor(series: number[]): number | null {
 // A project whose normal is slow is not an outlier for being slow; a project
 // that gets slower than ITS normal is, once, and then the card carries it.
 const SLOW_COOLDOWN_MS = Number(process.env.HEALTH_SLOW_COOLDOWN_MS || 6 * 60 * 60_000);
+// A relative baseline alone never notices a project that degrades gradually:
+// 1s, 2s, 4s, 8s, 30s stays under 3x its own trailing mean at every step. Past
+// this, a probe counts as slow whatever the project's history says. CA_Product's
+// normal is ~16s, so this does not bring back the per-rotation alert.
+const SLOW_CEILING_MS = Number(process.env.HEALTH_SLOW_CEILING_MS || 30_000);
 
 async function reportOutlier(state: State, health: Health): Promise<void> {
   const entry = state.deepHistory[state.deepHistory.length - 1];
@@ -1149,13 +1154,17 @@ async function reportOutlier(state: State, health: Health): Promise<void> {
   const base = baselineFor(series);
   if (latest == null || base == null) return;
 
-  const isOutlier = latest > base * SLOW_FACTOR && latest > SLOW_FLOOR_MS;
+  const isOutlier = (latest > base * SLOW_FACTOR && latest > SLOW_FLOOR_MS) || latest > SLOW_CEILING_MS;
   if (!isOutlier) {
     delete state.slowSince[key];   // THIS project is back in range: re-arm it
     return;
   }
-  if (state.slowSince[key]) return;   // same episode, already handled
-  state.slowSince[key] = Date.now();
+  if (!state.slowSince[key]) state.slowSince[key] = Date.now();
+  // One alert per episode. An episode already announced stays quiet; one that
+  // began inside the cooldown is not dropped but deferred — announced once the
+  // cooldown ends if it is still going, instead of staying silent for its whole
+  // life because the flag was set while the cooldown held it back.
+  if ((state.slowAlertedAt[key] || 0) >= state.slowSince[key]) return;
   if (Date.now() - (state.slowAlertedAt[key] || 0) < SLOW_COOLDOWN_MS) return;
   state.slowAlertedAt[key] = Date.now();
 
@@ -1291,8 +1300,10 @@ async function runTick(): Promise<void> {
       // leaving defaultProjectIDs would otherwise leave its verdict — detail
       // string and all — in the state file forever.
       const expectedKeys = new Set(health.expected.map(nameKey));
-      for (const key of Object.keys(state.deepResults)) {
-        if (!expectedKeys.has(key)) delete state.deepResults[key];
+      for (const map of [state.deepResults, state.deepDurations, state.slowSince, state.slowAlertedAt] as Record<string, unknown>[]) {
+        for (const key of Object.keys(map)) {
+          if (!expectedKeys.has(key)) delete map[key];
+        }
       }
     }
   } else {

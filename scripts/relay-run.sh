@@ -46,6 +46,10 @@ rotate_logs() {
 # the size every few hundred lines. A plain `>> relay.log` cannot rotate: the
 # relay would keep writing into the renamed file. bash 3.2 compatible (macOS).
 pump() {
+  # Only EOF (or the wrapper's bounded kill below) ends the pump. A stop signal
+  # reaching the process group would otherwise kill it while the relay is still
+  # printing its shutdown, and the relay's next write would hit a closed pipe.
+  trap '' TERM INT
   exec 3>>"$LOG"
   local n=0 line
   while IFS= read -r line || [ -n "$line" ]; do
@@ -85,6 +89,20 @@ done
 # Let the pump drain before writing the exit marker. What the relay printed
 # last is a crash's stack trace, and the crash-window diagnosis reads the lines
 # just above "relay exited" — they have to land in that order.
+#
+# Bounded, though. The pump only sees EOF once EVERY holder of the FIFO's
+# write end is gone, and the relay's children inherit its stderr: `caffeinate
+# -d`, started while a preview is watched, has no timeout. Waiting for EOF after
+# a crash mid-preview (the 09-14 crash was one) would block the wrapper forever
+# — no exit marker, no crash.log, and launchd never restarting the relay
+# (reproduced: a Bun.spawn'd `sleep 20` held the wrapper for exactly 20s).
+# The relay's own output is already in the pipe and drains in milliseconds.
+i=0
+while kill -0 "$pumper" 2>/dev/null && [ "$i" -lt 50 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+kill -KILL "$pumper" 2>/dev/null
 wait "$pumper" 2>/dev/null
 rm -f "$FIFO"
 
