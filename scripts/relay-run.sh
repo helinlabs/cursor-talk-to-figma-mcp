@@ -20,22 +20,55 @@ cd "$PROJECT_DIR"
 LOG_DIR="$PROJECT_DIR/.relay"
 LOG="$LOG_DIR/relay.log"
 CRASH_LOG="$LOG_DIR/crash.log"
-MAX_BYTES=$((5 * 1024 * 1024))   # rotate relay.log past 5 MB
+FIFO="$LOG_DIR/relay.out.fifo"
+# Rotate relay.log past this size WHILE the relay runs, keeping KEEP older
+# generations (relay.log.1 newest). Rotation used to happen only at startup, so
+# a relay that stayed up ten days wrote a single 116MB file.
+MAX_BYTES=${RELAY_LOG_MAX_BYTES:-$((10 * 1024 * 1024))}
+KEEP=${RELAY_LOG_KEEP:-3}
 BUN="${BUN_BIN:-bun}"
 
 mkdir -p "$LOG_DIR"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
+size_of() { stat -f%z "$1" 2>/dev/null || echo 0; }
 
-# Rotate at startup. The wrapper owns this fd (opened fresh per spawn via >>),
-# so there's no shared-fd race with launchd.
-if [ -f "$LOG" ]; then
-  sz=$(stat -f%z "$LOG" 2>/dev/null || echo 0)
-  [ "$sz" -gt "$MAX_BYTES" ] && mv -f "$LOG" "$LOG.1"
-fi
+rotate_logs() {
+  rm -f "$LOG.$KEEP"
+  local i=$KEEP
+  while [ "$i" -gt 1 ]; do
+    [ -f "$LOG.$((i - 1))" ] && mv -f "$LOG.$((i - 1))" "$LOG.$i"
+    i=$((i - 1))
+  done
+  [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+}
+
+# The relay writes into a FIFO and this pump copies it into relay.log, checking
+# the size every few hundred lines. A plain `>> relay.log` cannot rotate: the
+# relay would keep writing into the renamed file. bash 3.2 compatible (macOS).
+pump() {
+  exec 3>>"$LOG"
+  local n=0 line
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line" >&3
+    n=$((n + 1))
+    if [ $((n % 200)) -eq 0 ] && [ "$(size_of "$LOG")" -gt "$MAX_BYTES" ]; then
+      exec 3>&-
+      rotate_logs
+      exec 3>>"$LOG"
+    fi
+  done
+  exec 3>&-
+}
+
+[ "$(size_of "$LOG")" -gt "$MAX_BYTES" ] && rotate_logs
 
 echo "=== [$(ts)] relay starting (wrapper pid $$, bun=$BUN) ===" >> "$LOG"
 
-"$BUN" run src/socket.ts >> "$LOG" 2>&1 &
+rm -f "$FIFO"
+mkfifo "$FIFO"
+pump < "$FIFO" &
+pumper=$!
+"$BUN" run src/socket.ts > "$FIFO" 2>&1 &
 child=$!
 
 # Forward launchd's stop signal to the relay so it shuts down cleanly.
@@ -48,6 +81,12 @@ while :; do
   wait "$child"; code=$?
   kill -0 "$child" 2>/dev/null || break
 done
+
+# Let the pump drain before writing the exit marker. What the relay printed
+# last is a crash's stack trace, and the crash-window diagnosis reads the lines
+# just above "relay exited" — they have to land in that order.
+wait "$pumper" 2>/dev/null
+rm -f "$FIFO"
 
 line="[$(ts)] relay exited code=$code"
 echo "$line" >> "$LOG"
