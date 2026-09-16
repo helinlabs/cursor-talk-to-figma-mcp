@@ -513,20 +513,30 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // Finding something exportable means moving between pages, not just
     // looking further down one.
     //
-    // GW_Product's current page is empty, so the probe fell through to the
-    // 레퍼런스 page — where all 45 top-level nodes refuse to export. Trying
-    // more of them cannot help: measured 2026-09-09, the first sixteen all
-    // failed. The page itself is the wrong place to look, so when a page
-    // gives up nothing the probe now moves to the next one.
+    // GW_Product's current page is empty, so the probe falls through to other
+    // pages. A page really can hold nothing exportable, and moving on is the
+    // cheap way to find out.
     //
-    // The per-page cap stays small because a refusal is NOT uniformly cheap.
-    // On that page the first eight refused in 90-136ms and the next eight took
-    // 2.8s to 14s, so a generous count is a slow probe waiting to happen. The
-    // shared budget below is what actually bounds this; the count only keeps
-    // any single page from eating it.
+    // What this used to say — that 레퍼런스's 45 top-level nodes simply refuse
+    // to export, measured 2026-09-09 — was wrong, and wrong in the direction
+    // that hides outages. Re-measured 2026-09-16 with the file healthy, all
+    // eight probed nodes on that page exported, RPE among them (PNG 17KB, JPG
+    // 23KB, SVG 65KB). Those 09-09 refusals were the file's raster pipeline
+    // already being dead, a week before anyone noticed. Refusals are evidence
+    // about the file at that moment, never a property of a page.
+    //
+    // The per-page cap stays small because a refusal is NOT uniformly cheap:
+    // measured refusals ranged from 90ms to 14s on one page, so a generous
+    // count is a slow probe waiting to happen. That timing evidence stands on
+    // its own and does not depend on why those nodes were refusing. The shared
+    // budget below is what actually bounds this; the count only keeps any
+    // single page from eating it.
     const EXPORT_PER_PAGE = 5;
     const EXPORT_PAGES = 4;
     const PAGE_OPEN_MS = Number(process.env.HEALTH_PAGE_OPEN_MS || 4_000);
+    // One SVG call decides whether refusals mean a dead raster path; measured
+    // 1.7-3.9s on real nodes, so this is generous without being unbounded.
+    const SVG_WITNESS_MS = Number(process.env.HEALTH_SVG_WITNESS_MS || 8_000);
     const EXPORT_BUDGET_MS = DEEP_COMMAND_MS * 2;
     const exportDeadline = Date.now() + EXPORT_BUDGET_MS;
     const unexportable = (text: string) =>
@@ -535,7 +545,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // The reason is known where the failure happens. Recovering it later by
     // running the regex over "name: message" let a node named after what it
     // contains ("visible layers audit") turn a real failure into a pass.
-    const refusals: { text: string; refused: boolean }[] = [];
+    const refusals: { text: string; refused: boolean; id?: string; label?: string }[] = [];
     let bytes: any = null;
     let usedTarget: any = null;
     let usedPage: string | null = null;
@@ -566,7 +576,7 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
           timings.push(`image(실패) ${Date.now() - attemptStarted}ms`);
           const text = error instanceof Error ? error.message : String(error);
           if (!unexportable(text)) throw error;
-          refusals.push({ text: `${label}/${nodeLabel}: ${text}`, refused: true });
+          refusals.push({ text: `${label}/${nodeLabel}: ${text}`, refused: true, id: candidate.id, label: `${label}/${nodeLabel}` });
           continue;
         }
         const got = imageBytes(image);
@@ -629,9 +639,40 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
       const allRefused = !ranOutOfTime && refusals.length > 0
         && refusals.every((entry) => entry.refused);
       if (allRefused) {
+        // Ask the same node for SVG before calling this "nothing to export".
+        //
+        // Figma answers a dead raster pipeline with the very same sentence it
+        // uses for a genuinely empty node — "Failed to export node. This node
+        // may not have any visible layers." — so the text cannot tell them
+        // apart. Behaviour can: on 2026-09-16 GW_Product returned 65KB of SVG
+        // for the exact node whose PNG and JPG both "had no visible layers",
+        // and every raster export in that file had failed for 14 hours (276 in
+        // the relay ledger) while this probe reported the project green.
+        const witness = refusals.find((entry) => entry.id);
+        if (witness?.id) {
+          const svgStarted = Date.now();
+          let svg: any = null;
+          try {
+            // Outside the export budget, but on a short leash of its own.
+            // deepCheck probes twice per turn, so a full DEEP_COMMAND_MS here
+            // would add up to 90s per rotation on a file whose SVG also hangs
+            // — slowing every other project's turn to learn nothing, since the
+            // verdict without an answer is the same either way.
+            svg = await timed("svg", () => runCommand(channel, "export_node_as_image",
+              { nodeId: witness.id, format: "SVG" }, SVG_WITNESS_MS));
+          } catch (error) {
+            timings.push(`svg(실패) ${Date.now() - svgStarted}ms`);
+          }
+          if (typeof svg?.svg === "string" && svg.svg.length > 0) {
+            return { project: name, ok: false, ms: Date.now() - probeStarted,
+              detail: `래스터 내보내기가 죽었습니다 — 같은 노드(${witness.label})가 SVG 로는 `
+                + `${sizeOf(svg.svg.length)} 나오는데 PNG·JPG 는 "보이는 레이어 없음" 으로 실패합니다 `
+                + `(${scope}). 그 파일의 Figma 플러그인을 다시 실행하면 복구됩니다(2026-09-16 실측) · ${timings.join(" · ")}` };
+          }
+        }
         return { project: name, ok: true, ms: Date.now() - probeStarted,
           detail: `${loadNote} · ${list.length} pages, selection ok, node read, `
-            + `이미지 내보내기 대상 없음(보이는 레이어 없는 노드, ${scope}) · ${timings.join(" · ")}` };
+            + `이미지 내보내기 대상 없음(보이는 레이어 없는 노드, ${scope}, SVG 도 안 나옴) · ${timings.join(" · ")}` };
       }
       const why = ranOutOfTime ? `${scope}, 시간 초과` : scope;
       return { project: name, ok: false, ms: Date.now() - probeStarted,
