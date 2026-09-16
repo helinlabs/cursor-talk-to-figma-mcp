@@ -27,6 +27,8 @@ import {
   listProjectIndexSummaries,
   buildNeedles,
   findNormalizedMatch,
+  matchRank,
+  MATCH_RANKS,
   type ProjectIndex,
 } from "./shared/search-index";
 import {
@@ -1722,7 +1724,7 @@ const server = Bun.serve({
       if (!needle) {
         return new Response(JSON.stringify({ results: [] }), { headers: JSON_HEADERS });
       }
-      type NavResult = { id: string; name: string; type: string | null; pageId: string | null; pageName: string | null; path: string | null; annotation?: boolean };
+      type NavResult = { id: string; name: string; type: string | null; pageId: string | null; pageName: string | null; path: string | null; annotation?: boolean; matchStrength?: string };
       const results: NavResult[] = [];
       const seen = new Set<string>();
       // Annotation cache matches go on top (same precedence as search_nodes).
@@ -1745,20 +1747,31 @@ const server = Bun.serve({
           annotation: true,
         });
       }
-      outer: for (const page of idx.pages) {
+      // Bucket by match rank (see match-rank-policy in shared/search-index.ts)
+      // instead of stopping at the first `limit` hits: a loose word-order match
+      // on the first page must not crowd out an exact match on a later one.
+      const buckets: NavResult[][] = MATCH_RANKS.map(() => []);
+      for (const page of idx.pages) {
         for (const entry of page.entries) {
-          if (results.length >= limit) break outer;
           if (seen.has(entry.id)) continue;
-          if (!findNormalizedMatch(entry.name || "", needle.qLower, needle.qLowerNoSpace)) continue;
+          const range = findNormalizedMatch(entry.name || "", needle.qLower, needle.qLowerNoSpace, needle.qTokens);
+          if (!range) continue;
           seen.add(entry.id);
-          results.push({
+          buckets[matchRank("name", range.strength)].push({
             id: entry.id,
             name: entry.name,
             type: entry.type,
             pageId: page.pageId,
             pageName: page.pageName,
             path: entry.path,
+            ...(range.strength === "tokens" ? { matchStrength: "tokens" } : {}),
           });
+        }
+      }
+      outer: for (const bucket of buckets) {
+        for (const hit of bucket) {
+          if (results.length >= limit) break outer;
+          results.push(hit);
         }
       }
       return new Response(JSON.stringify({ results: results.slice(0, limit) }, null, 2), { headers: JSON_HEADERS });

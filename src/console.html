@@ -1758,6 +1758,7 @@
                     >
                       <span className="badge">{n.annotation ? "★" : (n.type || "?")}</span>
                       <span className="nav-name">{n.name || "(unnamed)"}{n.pageName ? ` · ${n.pageName}` : ""}</span>
+                      {n.matchStrength === "tokens" && <span className="badge" title="Loose match: every word of the query appears, but apart and in any order">≈</span>}
                       {pendingId === n.id && <span className="badge">…</span>}
                       {pendingId !== n.id && selected && selected.id === n.id && <span className="badge sel-badge">selected</span>}
                     </div>
