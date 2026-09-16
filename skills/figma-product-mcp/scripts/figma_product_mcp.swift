@@ -890,6 +890,35 @@ func scriptProbe(baseURL: String, project: Project, timeout: TimeInterval = 8) -
     return ["reached": true, "answered": false, "ms": ms, "error": detail]
 }
 
+// The Window menu is the one place a window's FILE NAME is still legible when
+// the renderer tree is gone.
+//
+// Everything else the launcher uses to tell windows apart comes from the
+// renderer (AXTitle, tabs) or from the window server (kCGWindowName, which
+// needs Screen Recording). Both have read empty on this fleet for over a week,
+// which is why --force-reconnect can reach the Plugins menu and still not know
+// which window to reach it in. macOS builds the Window menu itself, from the
+// same titles, without either of them.
+func windowMenuTitles(_ appElement: AXUIElement) -> [String] {
+    guard let windowMenu = menuBarItem(appElement, named: "Window") else { return [] }
+    let read: () -> [String] = {
+        axChildren(windowMenu)
+            .filter { role($0) == (kAXMenuRole as String) }
+            .flatMap { axChildren($0) }
+            .map(axText)
+            .filter { !$0.isEmpty }
+    }
+    let titles = read()
+    if !titles.isEmpty { return titles }
+    // Menus populate lazily, so an unopened one reads empty. Open it, read, and
+    // put it back — a menu left open swallows every later click.
+    _ = press(windowMenu)
+    _ = waitUntil(timeout: 2) { !read().isEmpty }
+    let opened = read()
+    dismissOpenMenus()
+    return opened
+}
+
 func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, options: Options) {
     let axWindows = windows(root)
     let webAreas = axWindows.filter { window in descendants(window).contains { role($0) == "AXWebArea" } }
@@ -936,6 +965,8 @@ func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, opt
         // The native menu bar: independent of the renderer, and the only path
         // to Plugins > Development.
         "menuBarTitles": menuBarTitles(root),
+        // Whether a recovery path exists at all without the renderer tree.
+        "windowMenuItems": windowMenuTitles(root),
         // The window server: the fallback that identifies windows without AX.
         // Empty names mean Screen Recording is not granted to this process.
         "windowServerNames": serverNames,
