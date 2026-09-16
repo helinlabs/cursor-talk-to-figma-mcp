@@ -890,14 +890,82 @@ function nodePathString(node, page) {
   return parts.join(" > ");
 }
 
-// Find where a query matches inside `haystack`, case-insensitively, either as
-// a plain substring or with ALL whitespace stripped from both sides — so
-// "gym chat" matches a "GymChat" layer and vice versa. Returns a
-// {start, end} range in the ORIGINAL string, or null.
-function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
+// --- Matching (must stay behaviorally identical to the MCP server's matcher) -
+//
+// This plugin runs in the Figma sandbox and cannot import src/shared/
+// search-index.ts, so the matcher lives here a second time. Every piece the two
+// copies share is fenced with ">>> name" / "<<< name" sentinels and must be
+// BYTE-IDENTICAL in both files: scripts/search-token-match.test.mjs extracts
+// both copies, fails if they have drifted, and runs the behaviour spec against
+// the extracted source.
+
+// >>> token-match-policy
+// Third and loosest stage of the matcher: every whitespace-separated token of
+// the query must appear somewhere in the haystack, order-independent and not
+// necessarily adjacent. This is what lets the query "세트 메모" find the section
+// named "[AB] 세트마다 메모 남기기 기능 추가" — neither the plain-substring stage
+// nor the whitespace-stripped stage can see that name, because "세트메모" never
+// occurs as a run of characters inside "세트마다메모남기기".
+//
+// Single-token queries are excluded on purpose: stage 1 already decides those,
+// so this stage could only relabel an exact hit as loose, and a one-token query
+// is exactly the case where order-independent matching drags in everything.
+const TOKEN_SPAN_CAP = 160;
+
+function splitQueryTokens(qLower) {
+  return qLower.split(/\s+/).filter((token) => token.length > 0);
+}
+
+function findTokenMatch(lower, qTokens) {
+  if (!qTokens || qTokens.length < 2) return null;
+  let spanStart = -1;
+  let spanEnd = -1;
+  let leadEnd = -1;
+  for (const token of qTokens) {
+    const at = lower.indexOf(token);
+    if (at === -1) return null;
+    const end = at + token.length;
+    if (spanStart === -1 || at < spanStart) {
+      spanStart = at;
+      leadEnd = end;
+    }
+    if (end > spanEnd) spanEnd = end;
+  }
+  // The range spans the first occurrence of every token so a TEXT snippet shows
+  // the whole match in context. Tokens scattered far apart would swamp that
+  // snippet, so past the cap we report the leftmost token on its own.
+  if (spanEnd - spanStart > TOKEN_SPAN_CAP) {
+    return { start: spanStart, end: leadEnd, strength: "tokens" };
+  }
+  return { start: spanStart, end: spanEnd, strength: "tokens" };
+}
+// <<< token-match-policy
+
+// >>> match-rank-policy
+// Result order. Every exact match outranks every loose (token) match, and
+// within one strength a name hit outranks a text hit. A `limit` cut therefore
+// drops loose matches first: an exact hit is never dropped to make room for a
+// loose one, which is the entire reason the two strengths are ranked apart.
+const MATCH_RANKS = ["name:exact", "text:exact", "name:tokens", "text:tokens"];
+
+function matchRank(matchedBy, matchStrength) {
+  const rank = MATCH_RANKS.indexOf(matchedBy + ":" + (matchStrength || "exact"));
+  return rank === -1 ? MATCH_RANKS.length - 1 : rank;
+}
+// <<< match-rank-policy
+
+// Find where a query matches inside `haystack`, case-insensitively, in three
+// stages: (1) as a plain substring, (2) as a substring with ALL whitespace
+// stripped from both sides — so "gym chat" matches a "GymChat" layer and vice
+// versa — and (3) with every query token present somewhere, in any order and
+// possibly far apart (see token-match-policy above). Stages 1 and 2 report
+// strength "exact", stage 3 reports "tokens". Returns a {start, end} range in
+// the ORIGINAL string, or null. Omitting `qTokens` disables stage 3.
+function findNormalizedMatch(haystack, qLower, qLowerNoSpace, qTokens) {
+  // >>> normalized-match-body
   const lower = haystack.toLowerCase();
   const idx = lower.indexOf(qLower);
-  if (idx !== -1) return { start: idx, end: idx + qLower.length };
+  if (idx !== -1) return { start: idx, end: idx + qLower.length, strength: "exact" };
   if (!qLowerNoSpace) return null;
   // Whitespace-stripped comparison, mapping stripped indices back to originals.
   const map = [];
@@ -910,11 +978,38 @@ function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
     }
   }
   const sIdx = stripped.indexOf(qLowerNoSpace);
-  if (sIdx === -1) return null;
-  return {
-    start: map[sIdx],
-    end: map[sIdx + qLowerNoSpace.length - 1] + 1,
-  };
+  if (sIdx !== -1) {
+    return {
+      start: map[sIdx],
+      end: map[sIdx + qLowerNoSpace.length - 1] + 1,
+      strength: "exact",
+    };
+  }
+  return findTokenMatch(lower, qTokens);
+  // <<< normalized-match-body
+}
+
+// Precompute the per-query needles the matcher runs on: lowercase, the
+// whitespace-stripped form, and the whitespace-separated tokens. Empty queries
+// and duplicate spellings are dropped.
+function buildNeedles(queries) {
+  // >>> build-needles-body
+  const needles = [];
+  const seen = new Set();
+  for (const raw of queries) {
+    const qLower = raw.toLowerCase();
+    const qLowerNoSpace = qLower.replace(/\s+/g, "");
+    if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue; // skip empty/dupes
+    seen.add(qLowerNoSpace);
+    needles.push({
+      raw: raw,
+      qLower: qLower,
+      qLowerNoSpace: qLowerNoSpace,
+      qTokens: splitQueryTokens(qLower),
+    });
+  }
+  return needles;
+  // <<< build-needles-body
 }
 
 // Snippet of the matched TEXT characters: up to 40 chars of context on each
@@ -1170,16 +1265,7 @@ async function searchNodes(params) {
       if (typeof item === "string") rawQueries.push(item);
     }
   }
-  // Precompute per-query lowercase and whitespace-stripped-lowercase needles.
-  const needles = [];
-  const seen = new Set();
-  for (const raw of rawQueries) {
-    const qLower = raw.toLowerCase();
-    const qLowerNoSpace = qLower.replace(/\s+/g, "");
-    if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue; // skip empty/dupes
-    seen.add(qLowerNoSpace);
-    needles.push({ raw: raw, qLower: qLower, qLowerNoSpace: qLowerNoSpace });
-  }
+  const needles = buildNeedles(rawQueries);
   if (!needles.length) {
     throw new Error("Missing query/queries parameter");
   }
@@ -1202,16 +1288,29 @@ async function searchNodes(params) {
 
   const typeSet =
     Array.isArray(types) && types.length > 0 ? new Set(types) : null;
-  // Collected separately so name matches sort before text matches.
-  // Each hit records which query variant matched (first winner in given order).
-  const nameFound = [];
-  const textFound = [];
+  // One bucket per match rank (see match-rank-policy), so exact matches are
+  // emitted before loose token matches and survive the `limit` cut. Each hit
+  // records which query variant matched (first winner in given order).
+  const buckets = MATCH_RANKS.map(() => []);
+  let totalMatches = 0;
   for (const entry of index.entries) {
     let matched = false;
     if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
       for (const needle of needles) {
-        if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
-          nameFound.push({ entry: entry, matchedQuery: needle.raw });
+        const range = findNormalizedMatch(
+          entry.name,
+          needle.qLower,
+          needle.qLowerNoSpace,
+          needle.qTokens
+        );
+        if (range) {
+          buckets[matchRank("name", range.strength)].push({
+            entry: entry,
+            matchedBy: "name",
+            matchedQuery: needle.raw,
+            range: range,
+          });
+          totalMatches++;
           matched = true;
           break;
         }
@@ -1222,10 +1321,17 @@ async function searchNodes(params) {
         const range = findNormalizedMatch(
           entry.characters,
           needle.qLower,
-          needle.qLowerNoSpace
+          needle.qLowerNoSpace,
+          needle.qTokens
         );
         if (range) {
-          textFound.push({ entry: entry, matchedQuery: needle.raw, range: range });
+          buckets[matchRank("text", range.strength)].push({
+            entry: entry,
+            matchedBy: "text",
+            matchedQuery: needle.raw,
+            range: range,
+          });
+          totalMatches++;
           break;
         }
       }
@@ -1234,46 +1340,37 @@ async function searchNodes(params) {
 
   const matches = [];
   let truncated = false;
-  for (const found of nameFound) {
-    if (matches.length >= max) {
-      truncated = true;
-      break;
-    }
-    matches.push({
-      id: found.entry.id,
-      name: found.entry.name,
-      type: found.entry.type,
-      pageId: page.id,
-      pageName: page.name,
-      path: found.entry.path,
-      matchedBy: "name",
-      matchedQuery: found.matchedQuery,
-    });
-  }
-  if (!truncated) {
-    for (const found of textFound) {
+  for (const bucket of buckets) {
+    for (const found of bucket) {
       if (matches.length >= max) {
         truncated = true;
         break;
       }
-      matches.push({
+      const hit = {
         id: found.entry.id,
         name: found.entry.name,
         type: found.entry.type,
         pageId: page.id,
         pageName: page.name,
         path: found.entry.path,
-        matchedBy: "text",
+        matchedBy: found.matchedBy,
         matchedQuery: found.matchedQuery,
-        matchedText: textMatchSnippet(found.entry.characters, found.range),
-      });
+      };
+      // Only loose hits are labelled, so an exact match keeps the shape
+      // callers already parse.
+      if (found.range.strength === "tokens") hit.matchStrength = "tokens";
+      if (found.matchedBy === "text") {
+        hit.matchedText = textMatchSnippet(found.entry.characters, found.range);
+      }
+      matches.push(hit);
     }
+    if (truncated) break;
   }
 
   const result = {
     pageId: page.id,
     pageName: page.name,
-    totalMatches: nameFound.length + textFound.length,
+    totalMatches: totalMatches,
     truncated: truncated,
     fromCache: fromCache,
     matches: matches,

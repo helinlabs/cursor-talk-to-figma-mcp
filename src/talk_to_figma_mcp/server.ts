@@ -23,6 +23,8 @@ import {
   loadProjectIndex,
   buildNeedles,
   findNormalizedMatch,
+  matchRank,
+  MATCH_RANKS,
   textMatchSnippet,
 } from "../shared/search-index";
 import {
@@ -4111,9 +4113,9 @@ server.tool(
 
 server.tool(
   "search_nodes",
-  "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) — by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something — use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once — Korean/English, joined/spaced, product name vs feature name (e.g. ['짐챗','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found — the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
+  "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) — by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something — use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once — Korean/English, joined/spaced, product name vs feature name (e.g. ['짐챗','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer), and as a last resort a multi-word query matches when ALL of its words appear anywhere in the name/text, in any order and not necessarily adjacent — so '세트 메모' finds a section named '[AB] 세트마다 메모 남기기 기능 추가'. Those looser hits carry matchStrength: 'tokens' and are ranked after every exact hit, so they are the first thing `limit` drops; treat them as candidates to verify, not as confirmed answers. When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found — the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet, loose word-order matches a matchStrength: 'tokens' flag); results are ordered exact-name, exact-text, loose-name, loose-text. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
   {
-    query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
+    query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content; a multi-word value also matches when its words appear separately and in any order (flagged matchStrength: 'tokens'). Provide this and/or `queries`."),
     queries: z.array(z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['짐챗','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
     match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
     types: z.array(z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
@@ -4172,18 +4174,22 @@ server.tool(
         if (projectIndex && projectIndex.pages.length > 0) {
           const needles = buildNeedles(allQueries);
           const typeSet = Array.isArray(types) && types.length > 0 ? new Set(types) : null;
-          const matches: any[] = [];
+          // One bucket per match rank (see match-rank-policy in shared/
+          // search-index.ts), filled across ALL pages before anything is
+          // emitted — otherwise a loose hit on page 1 could push an exact hit
+          // on page 9 past the limit. The full scan is what totalMatches
+          // already required, so this costs nothing extra.
+          const buckets: any[][] = MATCH_RANKS.map(() => []);
           let totalMatches = 0;
-          let truncated = false;
           for (const page of projectIndex.pages) {
-            const nameFound: any[] = [];
-            const textFound: any[] = [];
             for (const entry of page.entries) {
               let matched = false;
               if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
                 for (const needle of needles) {
-                  if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
-                    nameFound.push({ entry, matchedQuery: needle.raw });
+                  const range = findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace, needle.qTokens);
+                  if (range) {
+                    buckets[matchRank("name", range.strength)].push({ entry, page, matchedBy: "name", matchedQuery: needle.raw, range });
+                    totalMatches++;
                     matched = true;
                     break;
                   }
@@ -4191,44 +4197,40 @@ server.tool(
               }
               if (!matched && mode !== "name" && entry.characters !== null) {
                 for (const needle of needles) {
-                  const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace);
+                  const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace, needle.qTokens);
                   if (range) {
-                    textFound.push({ entry, matchedQuery: needle.raw, range });
+                    buckets[matchRank("text", range.strength)].push({ entry, page, matchedBy: "text", matchedQuery: needle.raw, range });
+                    totalMatches++;
                     break;
                   }
                 }
               }
             }
-            totalMatches += nameFound.length + textFound.length;
-            for (const found of nameFound) {
+          }
+          const matches: any[] = [];
+          let truncated = false;
+          for (const bucket of buckets) {
+            for (const found of bucket) {
               if (matches.length >= max) { truncated = true; break; }
-              matches.push({
+              const hit: any = {
                 id: found.entry.id,
                 name: found.entry.name,
                 type: found.entry.type,
-                pageId: page.pageId,
-                pageName: page.pageName,
+                pageId: found.page.pageId,
+                pageName: found.page.pageName,
                 path: found.entry.path,
-                matchedBy: "name",
+                matchedBy: found.matchedBy,
                 matchedQuery: found.matchedQuery,
-              });
-            }
-            if (!truncated) {
-              for (const found of textFound) {
-                if (matches.length >= max) { truncated = true; break; }
-                matches.push({
-                  id: found.entry.id,
-                  name: found.entry.name,
-                  type: found.entry.type,
-                  pageId: page.pageId,
-                  pageName: page.pageName,
-                  path: found.entry.path,
-                  matchedBy: "text",
-                  matchedQuery: found.matchedQuery,
-                  matchedText: textMatchSnippet(found.entry.characters as string, found.range),
-                });
+              };
+              // Only loose hits are labelled, so an exact match keeps the shape
+              // callers already parse.
+              if (found.range.strength === "tokens") hit.matchStrength = "tokens";
+              if (found.matchedBy === "text") {
+                hit.matchedText = textMatchSnippet(found.entry.characters as string, found.range);
               }
+              matches.push(hit);
             }
+            if (truncated) break;
           }
           const result: any = {
             ...contextFlag,
@@ -4310,6 +4312,15 @@ server.tool(
         }
       }
 
+      // Pages arrive one at a time here, so the plugin's per-page ordering is
+      // not enough — re-bucket the collected hits by rank so the caller sees
+      // exact matches first across the whole scan. A page that was never
+      // reached (limit or time budget) cannot be recovered this way; that is
+      // the cost of the live path, and the index path above does it properly.
+      const orderedMatches = MATCH_RANKS.map(() => [] as any[]);
+      for (const m of matches) orderedMatches[matchRank(m?.matchedBy, m?.matchStrength)].push(m);
+      const rankedMatches = orderedMatches.flat();
+
       const result: any = {
         ...contextFlag,
         queries: allQueries,
@@ -4319,7 +4330,7 @@ server.tool(
         truncated,
         totalScannedPages,
         totalPages: pageOrder.length,
-        matches: [...annotationMatches, ...matches],
+        matches: [...annotationMatches, ...rankedMatches],
       };
       if (truncated) {
         // totalMatches only covers scanned pages when we stopped early.
