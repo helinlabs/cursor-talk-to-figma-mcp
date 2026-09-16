@@ -513,20 +513,30 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
     // Finding something exportable means moving between pages, not just
     // looking further down one.
     //
-    // GW_Product's current page is empty, so the probe fell through to the
-    // 레퍼런스 page — where all 45 top-level nodes refuse to export. Trying
-    // more of them cannot help: measured 2026-09-09, the first sixteen all
-    // failed. The page itself is the wrong place to look, so when a page
-    // gives up nothing the probe now moves to the next one.
+    // GW_Product's current page is empty, so the probe falls through to other
+    // pages. A page really can hold nothing exportable, and moving on is the
+    // cheap way to find out.
     //
-    // The per-page cap stays small because a refusal is NOT uniformly cheap.
-    // On that page the first eight refused in 90-136ms and the next eight took
-    // 2.8s to 14s, so a generous count is a slow probe waiting to happen. The
-    // shared budget below is what actually bounds this; the count only keeps
-    // any single page from eating it.
+    // What this used to say — that 레퍼런스's 45 top-level nodes simply refuse
+    // to export, measured 2026-09-09 — was wrong, and wrong in the direction
+    // that hides outages. Re-measured 2026-09-16 with the file healthy, all
+    // eight probed nodes on that page exported, RPE among them (PNG 17KB, JPG
+    // 23KB, SVG 65KB). Those 09-09 refusals were the file's raster pipeline
+    // already being dead, a week before anyone noticed. Refusals are evidence
+    // about the file at that moment, never a property of a page.
+    //
+    // The per-page cap stays small because a refusal is NOT uniformly cheap:
+    // measured refusals ranged from 90ms to 14s on one page, so a generous
+    // count is a slow probe waiting to happen. That timing evidence stands on
+    // its own and does not depend on why those nodes were refusing. The shared
+    // budget below is what actually bounds this; the count only keeps any
+    // single page from eating it.
     const EXPORT_PER_PAGE = 5;
     const EXPORT_PAGES = 4;
     const PAGE_OPEN_MS = Number(process.env.HEALTH_PAGE_OPEN_MS || 4_000);
+    // One SVG call decides whether refusals mean a dead raster path; measured
+    // 1.7-3.9s on real nodes, so this is generous without being unbounded.
+    const SVG_WITNESS_MS = Number(process.env.HEALTH_SVG_WITNESS_MS || 8_000);
     const EXPORT_BUDGET_MS = DEEP_COMMAND_MS * 2;
     const exportDeadline = Date.now() + EXPORT_BUDGET_MS;
     const unexportable = (text: string) =>
@@ -643,11 +653,13 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
           const svgStarted = Date.now();
           let svg: any = null;
           try {
-            // Deliberately outside the export budget: reaching here means the
-            // budget was NOT exhausted (allRefused requires !ranOutOfTime), and
-            // one bounded call is worth more than the seconds it costs.
+            // Outside the export budget, but on a short leash of its own.
+            // deepCheck probes twice per turn, so a full DEEP_COMMAND_MS here
+            // would add up to 90s per rotation on a file whose SVG also hangs
+            // — slowing every other project's turn to learn nothing, since the
+            // verdict without an answer is the same either way.
             svg = await timed("svg", () => runCommand(channel, "export_node_as_image",
-              { nodeId: witness.id, format: "SVG" }, DEEP_COMMAND_MS));
+              { nodeId: witness.id, format: "SVG" }, SVG_WITNESS_MS));
           } catch (error) {
             timings.push(`svg(실패) ${Date.now() - svgStarted}ms`);
           }
