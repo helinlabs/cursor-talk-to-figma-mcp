@@ -122,8 +122,9 @@ type State = {
   // was being shown under the first one's clock, which read as though
   // everything had been down all along.
   downSince: Record<string, number>;
-  deepCursor: number;
-  deepPoolSize: number;
+  // Whether the last deep turn was spent re-probing a failure. Retries take
+  // every other turn at most, so the rotation always gets the rest.
+  deepLastWasRetry: boolean;
   // Recent timings, newest last, kept separately because the two probes sample
   // at very different rates. A probe that is merely getting slower is the
   // interesting signal — it shows up here long before anything fails outright.
@@ -196,7 +197,7 @@ function durationsFromHistory(history: Array<{ project?: string; ok?: boolean; m
   return out;
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepCursor: 0, deepPoolSize: 1, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {} };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {} };
 }
 function saveState(state: State): void {
   try {
@@ -385,9 +386,14 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
   // both is better than keeping one — the first carries whatever cold cost a
   // real caller would hit, the second shows the warm floor — and the trend uses
   // the lower of the two so a single hiccup cannot drag the baseline around.
+  //
+  // The second measurement is of the SAME project, by name. It used to re-run
+  // the picker after rewinding a cursor, and the picker could answer
+  // differently the second time — a failure's retry window opens during a 93s
+  // timeout — so the two halves could be two different files, with one file's
+  // pass vouching for the other's verdict.
   await new Promise((resolve) => setTimeout(resolve, DEEP_RETRY_PAUSE_MS));
-  state.deepCursor = (state.deepCursor + state.deepPoolSize - 1) % Math.max(1, state.deepPoolSize);
-  const second = await deepProbe(state);
+  const second = await deepProbe(state, first.project);
   if (!second) return first;
 
   const ok = first.ok || second.ok;
@@ -416,7 +422,7 @@ async function deepCheck(state: State): Promise<Health["deep"]> {
   return { project: second.project, ok, detail, ms: measured };
 }
 
-async function deepProbe(state: State): Promise<Health["deep"]> {
+async function deepProbe(state: State, pinned?: string): Promise<Health["deep"]> {
   let projects: any[] = [];
   try {
     projects = ((await getJson("/projects")).projects || [])
@@ -432,33 +438,18 @@ async function deepProbe(state: State): Promise<Health["deep"]> {
   const pool = managed.length ? managed : [];
   if (!pool.length) return null;
   const projects_ = pool;
-  // A failing project gets re-probed on alternate turns.
-  //
-  // The cursor rotates blindly, so a failure had to wait for six healthy
-  // projects before anything could clear it — a project stayed reported broken
-  // for up to a full rotation after it had already recovered. Failures are what
-  // the rotation exists to find, so they deserve to be looked at sooner.
-  //
-  // But not every turn: always preferring the failure pins the rotation to it,
-  // and the other six are never re-probed at all — they would go stale, which
-  // is a worse blindness than the slow recovery this fixes.
-  //
-  // The bound is TIME SINCE that project was last probed, not a turn counter.
-  // Parity of deepCursor looked equivalent and was not: deepCheck probes twice
-  // and rewinds the cursor between the two, so the parity a probe sees is not
-  // the parity of the turn. Measured, that gave the failing project 8 of 12
-  // consecutive probes — very nearly the pinning this was written to avoid.
-  // Elapsed time cannot be knocked out of step by how many probes a turn runs.
-  const failing = projects_.find((candidate: any) =>
-    state.deepResults[nameKey(String(candidate.name))]?.ok === false);
-  const failingLast = failing
-    ? state.deepResults[nameKey(String(failing.name))]?.at ?? 0
-    : 0;
-  const project = (failing && Date.now() - failingLast >= DEEP_MS)
-    ? failing
-    : projects_[state.deepCursor % projects_.length];
-  state.deepPoolSize = projects_.length;
-  state.deepCursor = (state.deepCursor + 1) % Math.max(1, projects_.length);
+  // Which project this turn probes: see deep-pick-policy below. The second
+  // measurement of a turn names its project instead of asking again.
+  let project: any;
+  if (pinned) {
+    project = projects_.find((candidate: any) => String(candidate.name) === pinned);
+    if (!project) return null;
+  } else {
+    const candidates = projects_.map((candidate: any) => ({ key: nameKey(String(candidate.name)), project: candidate }));
+    const pick = pickDeepTarget(candidates, state.deepResults, state.deepLastWasRetry, Date.now(), DEEP_MS);
+    project = pick.target.project;
+    state.deepLastWasRetry = pick.retry;
+  }
   const name = String(project.name);
   const channel = project.recommendedChannel;
   const probeStarted = Date.now();
@@ -785,6 +776,41 @@ function mean(values) {
   return usable.length ? usable.reduce((sum, value) => sum + value, 0) / usable.length : null;
 }
 // <<< speed-sample-policy
+
+// Which managed project the next deep turn probes. Evaluable block, same trick
+// as speed-sample-policy, so scripts/health-deep-pick-policy.test.mjs replays
+// the outage against the code the watcher runs.
+//
+// From 2026-10-02 to 10-06 three projects were failing at once, and in 90 hours
+// GW_Apple Watch and F_Product were not probed a single time while CO_Product
+// was probed every other turn. Two things did it:
+//
+//   - The retry was "the FIRST failing project in relay order", so CO_Product
+//     (listed first) took every retry and T/GW waited for the rotation.
+//   - A retry turn still advanced the rotation cursor. Retries came every other
+//     turn, so they swallowed every other cursor slot, and with seven projects
+//     that lined up on the same two slots each lap: GW_Apple Watch and
+//     F_Product. Their verdicts went stale ("오래됨") and the card kept
+//     reporting T/GW as broken long after the plugins were re-run, because a
+//     recovery is only noticed when a probe gets there.
+//
+// So the rotation is no longer a cursor. It probes whichever project was probed
+// longest ago (never-probed first), which cannot skip anyone however the turns
+// interleave. A failure may jump the queue once DEEP_MS has passed since its
+// own last probe, oldest failure first — but never two turns running, so the
+// rotation always keeps at least half the turns.
+//
+// pool: [{ key, ... }] in relay order. results: key -> { at, ok }.
+// >>> deep-pick-policy
+function pickDeepTarget(pool, results, lastWasRetry, now, retryAfterMs) {
+  const lastAt = (entry) => (results[entry.key] && results[entry.key].at) || 0;
+  const oldestFirst = (a, b) => lastAt(a) - lastAt(b);
+  const due = pool.filter((entry) =>
+    results[entry.key] && results[entry.key].ok === false && now - lastAt(entry) >= retryAfterMs);
+  if (due.length && !lastWasRetry) return { target: [...due].sort(oldestFirst)[0], retry: true };
+  return { target: [...pool].sort(oldestFirst)[0], retry: false };
+}
+// <<< deep-pick-policy
 
 function trend(series: number[]): { recent: number | null; delta: number | null } {
   const recent = mean(series.slice(-SPEED_WINDOW));
