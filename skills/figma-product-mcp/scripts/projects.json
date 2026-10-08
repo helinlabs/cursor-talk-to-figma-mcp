@@ -5,6 +5,7 @@
     "t-product",
     "c-product",
     "gw-product",
+    "gw-aso",
     "gw-apple-watch",
     "co-product",
     "d-product",
@@ -28,6 +29,12 @@
       "title": "GW_Product",
       "displayTitle": "🔵 GW_Product",
       "url": "https://www.figma.com/design/Z4NCoiedZYU8oB0rEFJRnm/GW_Product?m=draw"
+    },
+    {
+      "id": "gw-aso",
+      "title": "GW_ASO",
+      "displayTitle": "🔵 GW_ASO",
+      "url": "https://www.figma.com/design/LbdjN8FvUMdzaURrESJqUz/GW_ASO?m=draw"
     },
     {
       "id": "gw-apple-watch",
