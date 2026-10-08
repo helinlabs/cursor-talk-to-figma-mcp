@@ -485,6 +485,27 @@ async function deepProbe(state: State, pinned?: string): Promise<Health["deep"]>
     }
     const currentId: string | null = pages?.currentPageId ?? null;
 
+    // A tab whose document has lost Figma's servers still answers everything
+    // above, and from memory. GW_Product sat like that on 2026-10-08 showing 4
+    // of every 14 ASO frames, with each lookup of a missing node failing after
+    // 10s as "Unable to establish connection to Figma" — read by its callers as
+    // a tunnel problem. The plugin asks for an id that cannot exist: null in a
+    // few hundred ms means connected. A plugin from before this command says
+    // "Unknown command"; that is not a verdict either way, so carry on.
+    try {
+      const link: any = await timed("link", () =>
+        runCommand(channel, "get_document_link_status", {}, DEEP_COMMAND_MS));
+      if (link && link.ok === false) {
+        return { project: name, ok: false, ms: Date.now() - probeStarted,
+          detail: `문서가 피그마 서버와 끊겨 있습니다 — 없는 노드 ID 조회가 ${secs(link.ms ?? 0)} 동안 답이 없음`
+            + `(${link.error}). 이 탭의 목록은 빠진 채로 나오고 노드 조회는 10초 뒤 "Unable to establish connection" 으로 실패합니다. `
+            + `피그마 데스크톱에서 이 파일 탭을 닫았다 다시 열고 플러그인을 다시 실행하면 복구됩니다(2026-10-08 실측) · ${timings.join(" · ")}` };
+      }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      if (!/unknown command/i.test(text)) throw error;
+    }
+
     // Page selection, for real — but put the document back where it was. These
     // files are being worked in, so leaving one on a different page would be a
     // worse bug than the one this probe is looking for.

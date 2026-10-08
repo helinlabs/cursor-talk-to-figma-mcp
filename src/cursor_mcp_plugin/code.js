@@ -100,6 +100,62 @@ function describeCommandError(error) {
   return String(error);
 }
 
+// Is this tab's document still talking to Figma's servers?
+//
+// "Unable to establish connection to Figma after 10 seconds" reads like a
+// network or relay fault, and on 2026-10-08 it sent a whole session after the
+// tunnel. It was neither. GW_Product's desktop tab had lost its server session
+// while the plugin, relay and MCP all stayed healthy: getNodeByIdAsync answers
+// from the loaded document when it can and asks the server otherwise, so every
+// id the tab no longer held — th_REFINED_BLUE_01, but equally "999999:1" —
+// waited the full 10s and threw that sentence. The tab was also missing 10 of
+// every 14 ASO frames that the web editor showed intact, so page listings came
+// back short with no error at all.
+//
+// An id that cannot exist tells the two apart without touching the design: a
+// connected document answers null in a server round trip (160-320ms across
+// five files on macmini-1), a disconnected one hangs. The fix is to close and
+// reopen that file's tab, which reloads it from the server; re-running the
+// plugin alone does not.
+const LINK_PROBE_ID = "999999999:999999999";
+const LINK_PROBE_MS = 3000;
+
+async function getDocumentLinkStatus(params) {
+  const timeoutMs = (params && params.timeoutMs) || LINK_PROBE_MS;
+  const started = Date.now();
+  let timer = null;
+  const verdict = await Promise.race([
+    figma.getNodeByIdAsync(LINK_PROBE_ID).then(
+      () => ({ ok: true }),
+      (error) => ({ ok: false, error: describeCommandError(error) })
+    ),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, error: `no answer in ${timeoutMs}ms` }), timeoutMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  verdict.ms = Date.now() - started;
+  return verdict;
+}
+
+const SERVER_LOOKUP_FAILED = /Unable to establish connection to Figma/i;
+
+async function explainCommandError(error) {
+  const text = describeCommandError(error);
+  if (!SERVER_LOOKUP_FAILED.test(text)) return text;
+  let link;
+  try {
+    link = await getDocumentLinkStatus();
+  } catch (e) {
+    return text;
+  }
+  if (link.ok) return text;
+  return `${text} [document link down: this tab cannot reach Figma's servers for this file `
+    + `(a lookup of a nonexistent id also failed: ${link.error}). The node may still exist on the server, `
+    + `so do not treat it as deleted, and page listings from this tab may be incomplete. `
+    + `Close and reopen this file's tab in Figma, then run the plugin again.]`;
+}
+
 figma.ui.onmessage = async (msg) => {
   switch (msg.type) {
     case "update-settings":
@@ -138,7 +194,7 @@ figma.ui.onmessage = async (msg) => {
         figma.ui.postMessage({
           type: "command-error",
           id: msg.id,
-          error: describeCommandError(error),
+          error: await explainCommandError(error),
           docMeta: getDocMeta(),
         });
       }
@@ -231,6 +287,8 @@ async function handleCommand(command, params) {
       return await getNodeByKey(params);
     case "diagnose_pages":
       return await diagnosePages(params);
+    case "get_document_link_status":
+      return await getDocumentLinkStatus(params);
     case "search_nodes":
       return await searchNodes(params);
     case "dump_page_index":
