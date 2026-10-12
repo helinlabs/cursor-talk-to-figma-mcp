@@ -211,6 +211,30 @@ deleted after 30 days by default, and can be configured with
 arbitrary `outputPath` files remain user-managed and are never deleted by the
 dashboard.
 
+## Health watch verdicts
+
+The watcher's Slack card distinguishes **plugin connected to the local relay**
+from **document server lookup succeeded**. A running plugin does not establish
+that an unloaded node can be fetched from Figma.
+
+The document lookup allows 15 seconds (inside the existing 45-second command
+budget). Figma's own connection error is reported as a document lookup failure;
+a local timeout is reported as an inconclusive delay. Neither observation proves
+missing nodes or data loss. The existing second probe still absorbs a transient
+failure. The incident duration and poll count describe the overall watcher
+incident, not a continuous failure of every file.
+
+Project error summaries are capped at 180 characters; full probe detail remains
+available at `http://localhost:3057/preview`. Outgoing Slack text is capped at
+3,500 characters. A `msg_too_long` rejection retries once with 1,500 characters,
+keeping the same message timestamp. Only `message_not_found` creates a replacement
+card; authentication, permission and transient errors cannot create duplicates.
+
+Deploy watcher changes with `./scripts/health-watchctl.sh restart`. These changes
+use the existing plugin's `timeoutMs` parameter, so neither the Figma plugin nor
+the relay needs restarting. Validate the live `/preview` and the Slack card after
+deploying. Run `npm run test:console` for the report-policy regressions.
+
 ## Editing — what makes a change take effect
 
 There is no build step for any piece; each just needs the right reload:

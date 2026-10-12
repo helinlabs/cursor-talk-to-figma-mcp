@@ -26,6 +26,7 @@ import { dirname } from "node:path";
 import { homedir } from "node:os";
 import WebSocket from "ws";
 import { PROTOCOL_VERSION } from "../shared/version";
+import { LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, boundedSlackText, replaceableSlackMessage, deliverSlack } from "./report-policy.mjs";
 
 const RELAY_HTTP = process.env.HEALTH_RELAY_HTTP || "http://127.0.0.1:3055";
 const RELAY_WS = process.env.HEALTH_RELAY_WS || "ws://127.0.0.1:3055";
@@ -490,16 +491,16 @@ async function deepProbe(state: State, pinned?: string): Promise<Health["deep"]>
     // of every 14 ASO frames, with each lookup of a missing node failing after
     // 10s as "Unable to establish connection to Figma" — read by its callers as
     // a tunnel problem. The plugin asks for an id that cannot exist: null in a
-    // few hundred ms means connected. A plugin from before this command says
+    // few hundred ms means the lookup answered. Allow 15s so the API can report
+    // its own 10s connection error; a local deadline alone is inconclusive.
+    // A plugin from before this command says
     // "Unknown command"; that is not a verdict either way, so carry on.
     try {
       const link: any = await timed("link", () =>
-        runCommand(channel, "get_document_link_status", {}, DEEP_COMMAND_MS));
+        runCommand(channel, "get_document_link_status", { timeoutMs: LINK_TIMEOUT_MS }, DEEP_COMMAND_MS));
       if (link && link.ok === false) {
         return { project: name, ok: false, ms: Date.now() - probeStarted,
-          detail: `문서가 피그마 서버와 끊겨 있습니다 — 없는 노드 ID 조회가 ${secs(link.ms ?? 0)} 동안 답이 없음`
-            + `(${link.error}). 이 탭의 목록은 빠진 채로 나오고 노드 조회는 10초 뒤 "Unable to establish connection" 으로 실패합니다. `
-            + `피그마 데스크톱에서 이 파일 탭을 닫았다 다시 열고 플러그인을 다시 실행하면 복구됩니다(2026-10-08 실측) · ${timings.join(" · ")}` };
+          detail: `${linkFailureDetail(link)} · ${timings.join(" · ")}` };
       }
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
@@ -725,9 +726,13 @@ const SLACK_TIMEOUT_MS = Number(process.env.HEALTH_SLACK_TIMEOUT_MS || 15_000);
 // which under a sustained slowdown is a new message in #dev_noti_figma every
 // five minutes — trading a silent watcher for a noisy one. On a transient
 // failure keep the ts and try the edit again next round.
-const replaceable = (result: any) => !result?.ok && !result?.transient;
+const replaceable = replaceableSlackMessage;
 
 async function slack(method: string, body: any): Promise<any> {
+  return deliverSlack(method, body, slackRequest);
+}
+
+async function slackRequest(method: string, body: any): Promise<any> {
   if (!SLACK_TOKEN || !SLACK_CHANNEL) return { ok: false, error: "slack not configured" };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SLACK_TIMEOUT_MS);
@@ -1006,8 +1011,8 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
   // next to a green icon is the point — it explains a slow probe without
   // implying a fault.
   const load = busy
-    ? `처리 ${entry.running} · 대기 ${entry.pending} · 최장 ${secs(entry.oldestQueuedMs)}`
-    : "유휴";
+    ? `플러그인 연결 · 처리 ${entry.running} · 대기 ${entry.pending} · 최장 ${secs(entry.oldestQueuedMs)}`
+    : "플러그인 연결 · 유휴";
 
   const deep = state?.deepResults?.[nameKey(title)];
   // Waiting for a turn is not the same as being unknown.
@@ -1024,7 +1029,7 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
   // A failure is reported however old it is: nothing has come along to say it
   // was fixed, and going quiet about it would be worse than showing its age.
   if (!deep.ok) {
-    return { icon: ":red_circle:", label: `${load} · 심층 실패 (${age} 전) — ${deep.detail}`, broken: true, busy: busy > 0 };
+    return { icon: ":red_circle:", label: `${load} · 심층 점검 미통과 (${age} 전) — ${detailSummary(deep.detail)}`, broken: true, busy: busy > 0 };
   }
   // Yellow, not blue: a verdict this old means the rotation is not reaching
   // this project, which is a finding about the watcher rather than a project
@@ -1082,7 +1087,7 @@ function projectStrip(health: Health, state?: State): string {
 }
 
 function healthyText(state: State, health: Health): string {
-  const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${health.deep.detail}` : "";
+  const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${detailSummary(health.deep.detail)}` : "";
   return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
     + `${projectStrip(health, state)}\n`
     + `• 연결: ${coverage(health)}\n`
@@ -1107,9 +1112,9 @@ function degradedText(state: State, health: Health): string {
   if (health.failingDeep?.length) {
     lines.push(`• 심층 점검 실패: ${health.failingDeep.map(displayName).join(", ")} (자세한 내용은 아래 프로젝트별 상태)`);
   } else if (health.deep && !health.deep.ok) {
-    lines.push(`• 이번 심층 점검 실패: ${displayName(health.deep.project)} — ${health.deep.detail}`);
+    lines.push(`• 이번 심층 점검 실패: ${displayName(health.deep.project)} — ${detailSummary(health.deep.detail)}`);
   }
-  lines.push(`• 최초 이상 감지: ${clock(state.since)} (${humanSince(state.since)} 경과) · 확인 ${state.checks}회`);
+  lines.push(`• 전체 이상 상태 시작: ${clock(state.since)} (${humanSince(state.since)} 경과) · 주기 점검 ${state.checks}회 (파일별 연속 실패 횟수 아님)`);
   // An alert that names only what broke leaves the reader asking whether the
   // rest is fine — which is the first thing anyone wants to know when they are
   // pulled in. The all-clear card already lists every project; the alert needs
@@ -1117,9 +1122,10 @@ function degradedText(state: State, health: Health): string {
   if (health.relayUp && health.expected.length) {
     lines.push(`• 프로젝트별 상태:\n${projectLines(health, state)}`);
   }
-  lines.push(`• 복구: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
+  lines.push(`• 연결 표시와 문서 조회 결과는 별도입니다. 응답 지연만으로 탭을 닫지 마세요.`);
+  lines.push(`• 플러그인 재연결: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
   lines.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
-  return lines.join("\n");
+  return boundedSlackText(lines.join("\n"));
 }
 
 function recoveredText(state: State, health: Health): string {
