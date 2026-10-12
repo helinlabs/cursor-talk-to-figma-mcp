@@ -513,6 +513,22 @@ func fetchRelaySnapshot(baseURL: String, timeout: TimeInterval = 3) -> RelaySnap
     return RelaySnapshot(protocolVersion: root["protocolVersion"] as? String, connectionsByDocument: byDocument)
 }
 
+// A slow relay is not an absent relay. The decisions that hinge on "did the
+// relay answer" — dry-run status, and above all the pre-UI ground truth that
+// lets a run leave connected projects alone — must not be settled by one 3s
+// request. Measured 2026-10-12 on a swapping host (load 10.8, 175MB free): the
+// relay had been up for ten days and answered /channels in 2ms a minute later,
+// but the single probe missed, every project fell through to openProject, and
+// all eight failed `renderer_accessibility` after 250s while the relay itself
+// still showed all eight connected.
+func fetchRelaySnapshotPatiently(baseURL: String, attempts: Int = 4, timeout: TimeInterval = 8) -> RelaySnapshot? {
+    for attempt in 1...max(1, attempts) {
+        if let snapshot = fetchRelaySnapshot(baseURL: baseURL, timeout: timeout) { return snapshot }
+        if attempt < attempts { Thread.sleep(forTimeInterval: 2) }
+    }
+    return nil
+}
+
 // The plugin announces the Figma document name, which is the config's
 // displayTitle (emoji included). Exact match first so near-identical titles
 // (CO_Product / C_Product) cannot swap places.
@@ -1006,7 +1022,7 @@ do {
     if options.dryRun {
         // A dry run is also the status report: no UI is touched, but the relay
         // is asked what is connected and whether it is running current code.
-        let probe = fetchRelaySnapshot(baseURL: options.relayURL)
+        let probe = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
         for (index, project) in config.projects.enumerated() {
             switch pluginState(probe, project: project, window: nil) {
             case .missing:
@@ -1105,7 +1121,7 @@ do {
     // destroys the state it was checking: projectWindow() can never find the
     // window, so openProject() re-opens the file's URL on every run and Figma
     // accumulates a window per project per attempt.
-    var snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+    var snapshot = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
     var healthy: [String: (version: String?, channel: String?)] = [:]
     if !options.openOnly {
         for project in config.projects {
@@ -1123,6 +1139,26 @@ do {
     // re-run that cannot happen, and not to fail a run whose goal is already met.
     func alreadySatisfied(_ project: Project) -> Bool {
         healthy[project.id] != nil && (!options.forceReconnect || !accessibilityReady)
+    }
+
+    // No relay and no renderer tree means the run can neither tell which projects
+    // are already fine nor find any window — so openProject() would only re-open
+    // every URL and leave Figma a duplicate window per project, the exact damage
+    // the relay-first check exists to prevent. Touch nothing and say why.
+    if snapshot == nil && !accessibilityReady && !options.openOnly {
+        emitReport(Report(
+            ok: false, dryRun: false,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results.map { entry in
+                var copy = entry
+                copy.status = "relay_unreachable"
+                copy.step = "relay_unreachable"
+                copy.detail = "Relay at \(options.relayURL) did not answer /channels after 4 attempts and the renderer accessibility tree is down, so no window can be matched — nothing was opened. Check the relay (and host load), then poll `run.sh --dry-run`."
+                return copy
+            },
+            relayReachable: false, relayProtocolVersion: nil, menuBar: nil
+        ))
+        exit(1)
     }
 
     for (index, project) in config.projects.enumerated() {
