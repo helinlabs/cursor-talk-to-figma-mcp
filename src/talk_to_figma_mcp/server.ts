@@ -5051,13 +5051,44 @@ server.tool(
       socket.terminate();
     }
   };
-  return { server, dispose };
+  // Whether closing this session now would cut off work in flight: a plugin
+  // round-trip still waiting for its answer, or a bulk job a caller will poll.
+  // The idle sweep below never evicts a busy session.
+  const busy = () =>
+    pendingRequests.size > 0 ||
+    [...bulkJobs.values()].some((job) => job.status === "queued" || job.status === "running" || job.status === "cancelling");
+  return { server, dispose, busy };
 }
 
 const runtimeArgs = process.argv.slice(2);
 const httpMode = runtimeArgs.includes("--http");
 const httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 const httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
+
+// Streamable HTTP sessions die only when a client sends DELETE, and most
+// callers never do: a Claude Code session exits, a Nexus pod is replaced, a
+// proxy retries with a fresh initialize. Each abandoned session kept its own
+// McpServer and a WebSocket to the relay forever. On macmini-1 (2026-10-13)
+// that was 3,888 open relay sockets and 8.7 GB after 11 days, growing about
+// 0.7 GB a day, and the box ran out of compressor space (Jetsam, 10-12).
+// A session idle this long is closed; a client that comes back gets the spec's
+// 404 and re-initializes.
+function positiveNumberFromEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+const sessionIdleMs = positiveNumberFromEnv("MCP_SESSION_IDLE_MS", 30 * 60 * 1000);
+const sessionSweepMs = positiveNumberFromEnv("MCP_SESSION_SWEEP_MS", 60 * 1000);
+const sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
+
+interface HTTPSession {
+  transport: StreamableHTTPServerTransport;
+  server: McpServer;
+  dispose: () => void;
+  busy: () => boolean;
+  lastSeen: number;
+  open: number;
+}
 
 const exportDirectory = process.env.FIGMA_EXPORT_DIR || path.join(os.homedir(), ".macfleet", "figma-exports");
 const configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
@@ -5204,14 +5235,47 @@ async function startHTTPServer() {
 
   const configuredBase = process.env.NEXUS_TUNNEL_PUBLIC_BASE || process.env.BROKER_PUBLIC_BASE;
   const remoteExportBase = (configuredBase || `http://${httpHost}:${httpPort}`).replace(/\/$/, "");
-  const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer; dispose: () => void }>();
+  const sessions = new Map<string, HTTPSession>();
+  let evictedTotal = 0;
+
+  // Close one session the way a client DELETE would: the transport's onclose
+  // drops it from the map and disposes its relay socket.
+  const evict = (id: string, entry: HTTPSession, why: string) => {
+    sessions.delete(id);
+    evictedTotal++;
+    entry.transport.close().catch((error) => {
+      logger.warn(`Could not close evicted session ${id}: ${error instanceof Error ? error.message : String(error)}`);
+      entry.dispose();
+    });
+    logger.info(`Evicted MCP session ${id} (${why}); ${sessions.size} left`);
+  };
+  const evictable = (entry: HTTPSession) => entry.open === 0 && !entry.busy();
+  const sweepIdleSessions = (now = Date.now()) => {
+    for (const [id, entry] of sessions) {
+      if (evictable(entry) && now - entry.lastSeen >= sessionIdleMs) evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1000)}s`);
+    }
+  };
+  const sweepTimer = setInterval(sweepIdleSessions, sessionSweepMs);
+  sweepTimer.unref();
 
   const httpServer = createHttpServer(async (req, res) => {
     try {
       const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
       if ((req.method === "GET" || req.method === "HEAD") && serveExport(req, res, pathname)) return;
       if (pathname === "/health" && req.method === "GET") {
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
+        // Liveness plus the numbers a session leak shows up in first, so an
+        // outside monitor can see growth without shelling into the box.
+        const memory = process.memoryUsage();
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+          ok: true,
+          sessions: sessions.size,
+          sessionsEvicted: evictedTotal,
+          sessionIdleSeconds: Math.round(sessionIdleMs / 1000),
+          sessionMax,
+          rssMB: Math.round(memory.rss / 1048576),
+          heapUsedMB: Math.round(memory.heapUsed / 1048576),
+          uptimeSeconds: Math.round(process.uptime()),
+        }));
         return;
       }
       if (pathname !== "/mcp") {
@@ -5225,25 +5289,44 @@ async function startHTTPServer() {
       if (req.method === "POST") body = await readJSON(req);
 
       if (!entry && req.method === "POST" && !sessionId && isInitializeRequest(body)) {
-        let transport: StreamableHTTPServerTransport;
-        const { server: mcpServer, dispose } = createMcpServer({ remoteExportBase });
-        transport = new StreamableHTTPServerTransport({
+        // Over the cap, make room by closing the least recently used idle
+        // session. When every session is busy the new one is still admitted —
+        // refusing a caller is worse than briefly holding one more socket.
+        if (sessions.size >= sessionMax) {
+          let oldest: [string, HTTPSession] | undefined;
+          for (const pair of sessions) {
+            if (evictable(pair[1]) && (!oldest || pair[1].lastSeen < oldest[1].lastSeen)) oldest = pair;
+          }
+          if (oldest) evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
+        }
+        const { server: mcpServer, dispose, busy } = createMcpServer({ remoteExportBase });
+        const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: uuidv4,
-          onsessioninitialized: (id) => sessions.set(id, { transport, server: mcpServer, dispose }),
+          onsessioninitialized: (id) => sessions.set(id, created),
         });
+        const created: HTTPSession = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), open: 0 };
         transport.onclose = () => {
           if (transport.sessionId) sessions.delete(transport.sessionId);
           dispose();
         };
         await mcpServer.connect(transport);
-        entry = { transport, server: mcpServer, dispose };
+        entry = created;
       }
 
       if (!entry) {
         sendNoSessionResponse(req, res, { sessionId, body });
         return;
       }
-      await entry.transport.handleRequest(req, res, body);
+      // A request is in flight until its response closes — that covers a
+      // long tool call and an open GET event stream alike.
+      const active = entry;
+      active.lastSeen = Date.now();
+      active.open++;
+      res.once("close", () => {
+        active.open--;
+        active.lastSeen = Date.now();
+      });
+      await active.transport.handleRequest(req, res, body);
     } catch (error) {
       logger.error(`HTTP request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });

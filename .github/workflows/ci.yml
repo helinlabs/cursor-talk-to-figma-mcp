@@ -10,7 +10,7 @@ on:
 
 jobs:
   console:
-    runs-on: ubuntu-latest
+    runs-on: arc-linux
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,7 +24,7 @@ jobs:
   # enforced them — a tool registered in a shape the project-argument wrapper
   # cannot see would have reached main green.
   http:
-    runs-on: ubuntu-latest
+    runs-on: arc-linux
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
