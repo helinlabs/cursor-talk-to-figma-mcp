@@ -672,16 +672,28 @@ func rendererIsUp(_ window: AXUIElement) -> Bool {
     }
 }
 
+func reloadButton(_ window: AXUIElement) -> AXUIElement? {
+    descendants(window).first(where: {
+        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
+    })
+}
+
 func reloadCrashedRenderer(
     _ app: NSRunningApplication,
     appElement: AXUIElement,
     window: AXUIElement,
     timeout: TimeInterval
 ) -> Bool {
+    // A document that was opened or moved to a new window moments ago is not
+    // crashed, it is still loading — and a loading window has neither the
+    // "<file> – Figma" web area nor a Reload button. Judging it on the first
+    // read reported `renderer_crashed` for GW_ASO right after it was opened
+    // (2026-10-14); the same window rendered a minute later and the next run
+    // connected it untouched. Give the window the run's timeout to show one or
+    // the other before deciding.
+    _ = waitUntil(timeout: timeout, interval: 1) { rendererIsUp(window) || reloadButton(window) != nil }
     if rendererIsUp(window) { return true }
-    guard let reload = descendants(window).first(where: {
-        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
-    }) else { return false }
+    guard let reload = reloadButton(window) else { return false }
     // Raise only this window. The other projects hold live plugin channels and
     // a repair of one of them must not disturb the rest.
     _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
