@@ -154,6 +154,11 @@ function persistSelectedProject(project: SelectedProject | null): void {
 
 const SERVER_NAME = "TalkToFigmaMCP";
 
+// Every relay WebSocket any MCP session currently holds. /health reports its
+// size next to `sessions`: each live session owns at most one, so the relay
+// count running ahead of the session count is what a socket leak looks like.
+const relaySockets = new Set<WebSocket>();
+
 function createMcpServer(options: McpServerOptions = {}) {
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
@@ -3629,10 +3634,16 @@ function connectToFigma(port: number = 3055) {
     logger.info('Already connected to Figma');
     return;
   }
+  // A command sent while the socket is still connecting lands here too. Opening
+  // a second one would orphan the first: `ws` no longer points at it, so no
+  // dispose could ever close it.
+  if (ws && ws.readyState === WebSocket.CONNECTING) return;
 
   const wsUrl = serverUrl === 'localhost' ? `ws://localhost:${port}` : RELAY_WS_URL;
   logger.info(`Connecting to Figma socket server at ${wsUrl}...`);
-  ws = new WebSocket(wsUrl);
+  const socket = new WebSocket(wsUrl);
+  ws = socket;
+  relaySockets.add(socket);
 
   ws.on('open', () => {
     logger.info('Connected to Figma socket server');
@@ -3792,6 +3803,7 @@ function connectToFigma(port: number = 3055) {
 
   ws.on('close', () => {
     logger.info('Disconnected from Figma socket server');
+    relaySockets.delete(socket);
     ws = null;
 
     // Reject all pending requests
@@ -5046,6 +5058,7 @@ server.tool(
     if (ws) {
       const socket = ws;
       ws = null;
+      relaySockets.delete(socket);
       socket.removeAllListeners();
       socket.on("error", () => undefined);
       socket.terminate();
@@ -5088,6 +5101,31 @@ interface HTTPSession {
   busy: () => boolean;
   lastSeen: number;
   open: number;
+  closed: boolean;
+}
+
+// process.memoryUsage().rss is the task's resident size (the same number `ps`
+// shows). On macOS that leaves out pages the kernel compressed or swapped, and
+// under memory pressure that is most of an idle heap: macmini-1 reported rssMB
+// 83 next to heapUsedMB 849 while the supervisor measured 0.9 GB. The supervisor,
+// Activity Monitor and Jetsam all count phys_footprint, so /health reports that
+// too. Bun-only (bun:ffi); under Node, or off macOS, footprintMB is null.
+async function loadFootprintReader(): Promise<() => number | null> {
+  if (process.platform !== "darwin" || !(process.versions as Record<string, string | undefined>).bun) return () => null;
+  try {
+    const specifier = "bun:ffi"; // a variable, so tsup leaves the import alone
+    const ffi: any = await import(specifier);
+    const libSystem = ffi.dlopen("/usr/lib/libSystem.B.dylib", {
+      proc_pid_rusage: { args: ["i32", "i32", "ptr"], returns: "i32" },
+    });
+    // struct rusage_info_v0 (flavor 0): 16-byte uuid, then 64-bit counters;
+    // ri_phys_footprint is the 8th counter, word index 9.
+    const info = new BigUint64Array(12);
+    return () => libSystem.symbols.proc_pid_rusage(process.pid, 0, info) === 0 ? Number(info[9]) : null;
+  } catch (error) {
+    logger.warn(`phys_footprint unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return () => null;
+  }
 }
 
 const exportDirectory = process.env.FIGMA_EXPORT_DIR || path.join(os.homedir(), ".macfleet", "figma-exports");
@@ -5237,16 +5275,34 @@ async function startHTTPServer() {
   const remoteExportBase = (configuredBase || `http://${httpHost}:${httpPort}`).replace(/\/$/, "");
   const sessions = new Map<string, HTTPSession>();
   let evictedTotal = 0;
+  const footprintBytes = await loadFootprintReader();
 
-  // Close one session the way a client DELETE would: the transport's onclose
-  // drops it from the map and disposes its relay socket.
+  // The one place a session's resources are released, whichever way it ends —
+  // client DELETE, idle sweep, the session cap, or an initialize that never
+  // produced a session. Before this existed, cleanup hung off a transport.onclose
+  // set ahead of McpServer.connect(), which the SDK replaces with its own handler
+  // (Protocol.connect assigns, it does not chain). dispose() therefore never ran:
+  // every evicted session kept its relay WebSocket, its 10 s heartbeat timer and
+  // its pending-request map. macmini-1, 2026-10-14: sessions 21, sessionsEvicted
+  // 392, and 413 ESTABLISHED sockets to the relay — one for every session ever made.
+  const closeSession = (entry: HTTPSession) => {
+    if (entry.closed) return;
+    entry.closed = true;
+    const id = entry.transport.sessionId;
+    if (id && sessions.get(id) === entry) sessions.delete(id);
+    entry.dispose();
+  };
+  // Close one session the way a client DELETE would. closeSession runs from the
+  // transport's onclose; calling it again afterwards is a no-op, and covers a
+  // close() that throws before reaching onclose.
   const evict = (id: string, entry: HTTPSession, why: string) => {
     sessions.delete(id);
     evictedTotal++;
-    entry.transport.close().catch((error) => {
-      logger.warn(`Could not close evicted session ${id}: ${error instanceof Error ? error.message : String(error)}`);
-      entry.dispose();
-    });
+    entry.transport.close()
+      .catch((error) => {
+        logger.warn(`Could not close evicted session ${id}: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => closeSession(entry));
     logger.info(`Evicted MCP session ${id} (${why}); ${sessions.size} left`);
   };
   const evictable = (entry: HTTPSession) => entry.open === 0 && !entry.busy();
@@ -5259,6 +5315,7 @@ async function startHTTPServer() {
   sweepTimer.unref();
 
   const httpServer = createHttpServer(async (req, res) => {
+    let fresh: HTTPSession | undefined;
     try {
       const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
       if ((req.method === "GET" || req.method === "HEAD") && serveExport(req, res, pathname)) return;
@@ -5266,12 +5323,19 @@ async function startHTTPServer() {
         // Liveness plus the numbers a session leak shows up in first, so an
         // outside monitor can see growth without shelling into the box.
         const memory = process.memoryUsage();
+        const footprint = footprintBytes();
+        let relaySocketsOpen = 0;
+        for (const socket of relaySockets) if (socket.readyState === WebSocket.OPEN) relaySocketsOpen++;
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
           ok: true,
           sessions: sessions.size,
           sessionsEvicted: evictedTotal,
           sessionIdleSeconds: Math.round(sessionIdleMs / 1000),
           sessionMax,
+          // At most one per session; more than `sessions` means sockets leaked.
+          relaySockets: relaySockets.size,
+          relaySocketsOpen,
+          footprintMB: footprint === null ? null : Math.round(footprint / 1048576),
           rssMB: Math.round(memory.rss / 1048576),
           heapUsedMB: Math.round(memory.heapUsed / 1048576),
           uptimeSeconds: Math.round(process.uptime()),
@@ -5289,28 +5353,36 @@ async function startHTTPServer() {
       if (req.method === "POST") body = await readJSON(req);
 
       if (!entry && req.method === "POST" && !sessionId && isInitializeRequest(body)) {
-        // Over the cap, make room by closing the least recently used idle
-        // session. When every session is busy the new one is still admitted —
-        // refusing a caller is worse than briefly holding one more socket.
-        if (sessions.size >= sessionMax) {
-          let oldest: [string, HTTPSession] | undefined;
-          for (const pair of sessions) {
-            if (evictable(pair[1]) && (!oldest || pair[1].lastSeen < oldest[1].lastSeen)) oldest = pair;
-          }
-          if (oldest) evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
-        }
         const { server: mcpServer, dispose, busy } = createMcpServer({ remoteExportBase });
         const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: uuidv4,
-          onsessioninitialized: (id) => sessions.set(id, created),
+          onsessioninitialized: (id) => {
+            // Over the cap, make room by closing the least recently used idle
+            // session. When every session is busy the new one is still admitted —
+            // refusing a caller is worse than briefly holding one more socket.
+            // Done here, once a session id is actually issued, so an initialize
+            // the transport rejects does not push out a live session.
+            if (sessions.size >= sessionMax) {
+              let oldest: [string, HTTPSession] | undefined;
+              for (const pair of sessions) {
+                if (evictable(pair[1]) && (!oldest || pair[1].lastSeen < oldest[1].lastSeen)) oldest = pair;
+              }
+              if (oldest) evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
+            }
+            sessions.set(id, created);
+          },
         });
-        const created: HTTPSession = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), open: 0 };
-        transport.onclose = () => {
-          if (transport.sessionId) sessions.delete(transport.sessionId);
-          dispose();
-        };
+        const created: HTTPSession = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), open: 0, closed: false };
         await mcpServer.connect(transport);
+        // Chain after connect(): connect() overwrites transport.onclose, so a
+        // handler set before it is silently dropped (see closeSession).
+        const sdkOnClose = transport.onclose;
+        transport.onclose = () => {
+          sdkOnClose?.();
+          closeSession(created);
+        };
         entry = created;
+        fresh = created;
       }
 
       if (!entry) {
@@ -5331,6 +5403,11 @@ async function startHTTPServer() {
       logger.error(`HTTP request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
       if (!res.writableEnded) res.end(JSON.stringify({ error: "internal error" }));
+    } finally {
+      // createMcpServer() dials the relay before initialize is handled. If the
+      // transport rejected it (or it threw), no session id was issued and
+      // nothing could ever look this session up again to close it.
+      if (fresh && !fresh.transport.sessionId) closeSession(fresh);
     }
   });
 
