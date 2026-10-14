@@ -268,6 +268,41 @@ func windows(_ appElement: AXUIElement) -> [AXUIElement] {
     axValue(appElement, kAXWindowsAttribute as CFString) as? [AXUIElement] ?? []
 }
 
+// Whether Figma's MAIN process answers accessibility at all.
+//
+// axValue() folds every error into nil, so a main process that has stopped
+// serving accessibility looked exactly like "no windows yet": zero windows,
+// an empty menu bar, and every project blamed on the renderer tree
+// (`renderer_accessibility`, "AXManualAccessibility was accepted but
+// ignored"). Measured 2026-10-12 on a Figma up 9d20h under 42 GB of swap:
+// every app-level read — AXRole, AXTitle, AXWindows, AXMenuBar — returned
+// kAXErrorCannotComplete after the full messaging timeout, while Finder
+// answered in 0.2s from the same process and Figma's AppleEvents timed out
+// too (-1712). The renderers were alive (one plugin kept serving commands),
+// so nothing in the tree was at fault and waiting did not help; quitting and
+// relaunching Figma brought AX back on the first read. A cheap read of
+// AXRole tells the two apart — it never depends on the renderer.
+// Every repair path ends in Figma's Plugins menu, and Figma only publishes that
+// menu for its KEY design window. Behind the lock screen loginwindow is
+// frontmost and no Figma window can become key: measured 2026-10-12, pressing
+// a file's Window-menu entry returned success and the menu bar stayed
+// Apple/Figma/File/Edit/View/Window/Help. Nothing short of unlocking helps,
+// and re-opening URLs meanwhile only stacks duplicate windows.
+func screenIsLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+    return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+}
+
+func appAccessibilityError(_ appElement: AXUIElement) -> AXError {
+    var value: CFTypeRef?
+    var error = AXError.success
+    for _ in 0..<3 {
+        error = AXUIElementCopyAttributeValue(appElement, kAXRoleAttribute as CFString, &value)
+        if error != .cannotComplete { return error }
+    }
+    return error
+}
+
 func projectKey(_ project: Project) -> String {
     URL(string: project.url)?.pathComponents.dropFirst(2).first ?? ""
 }
@@ -974,6 +1009,13 @@ func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, opt
         "doctor": true,
         "figmaPID": app.processIdentifier,
         "accessibilityTrusted": AXIsProcessTrusted(),
+        // Figma's main process answering accessibility at all. -25204
+        // (kAXErrorCannotComplete) means the whole app is unreachable, not
+        // just the renderer tree — relaunch Figma.
+        "appAXError": appAccessibilityError(root).rawValue,
+        // Behind the lock screen no Figma window can become key, so the
+        // Plugins menu never appears.
+        "screenLocked": screenIsLocked(),
         // The renderer tree: needed to match a window to a file via AX.
         "rendererAccessibilityReady": !webAreas.isEmpty,
         "axWindowCount": axWindows.count,
@@ -1106,7 +1148,13 @@ do {
     // loop before this call therefore made every project fail "open_failed" on a
     // file that was open, connected, and serving plugin commands the whole time,
     // and pointed repair at the file instead of at the accessibility tree.
-    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
+    //
+    // Unless the main process does not answer accessibility at all: then no
+    // tree is coming, and polling for one only burns the timeout per call.
+    // The same goes for a locked screen (see screenIsLocked()).
+    let appUnresponsive = appAccessibilityError(root) == .cannotComplete
+    let screenLocked = screenIsLocked()
+    let accessibilityReady = (appUnresponsive || screenLocked) ? false : enableRendererAccessibility(root, timeout: options.timeout)
 
     // Relay ground truth, before any UI is touched.
     //
@@ -1157,6 +1205,38 @@ do {
                 return copy
             },
             relayReachable: false, relayProtocolVersion: nil, menuBar: nil
+        ))
+        exit(1)
+    }
+
+    // A main process that answers neither accessibility nor AppleEvents, or a
+    // locked screen, cannot be repaired from here: no window can be made key, no
+    // Plugins menu driven, and every URL handed over only stacks another
+    // window. Keep the projects the relay already proved connected, open
+    // nothing, and name the actual fix.
+    if appUnresponsive || screenLocked {
+        emitReport(Report(
+            ok: false, dryRun: false,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results.enumerated().map { index, entry in
+                var copy = entry
+                if let live = healthy[config.projects[index].id] {
+                    copy.status = "connected"
+                    copy.pluginVersion = live.version
+                    copy.channel = live.channel
+                    copy.detail = "Talk To Figma MCP is connected"
+                } else if appUnresponsive {
+                    copy.status = "app_unresponsive"
+                    copy.step = "app_unresponsive"
+                    copy.detail = "Figma's main process does not answer accessibility (kAXErrorCannotComplete on AXRole) — the app itself is unreachable, not just the renderer tree, so nothing was opened. Quit Figma (SIGTERM if `quit` times out) and rerun; this drops the connected projects too, and the rerun reconnects them."
+                } else {
+                    copy.status = "screen_locked"
+                    copy.step = "screen_locked"
+                    copy.detail = "The screen is locked, so no Figma window can become key and the Plugins menu never appears — nothing was opened. Unlock this Mac's console session and rerun. Do not restart Figma for this: it cannot help and drops the projects that are still connected."
+                }
+                return copy
+            },
+            relayReachable: snapshot != nil, relayProtocolVersion: snapshot?.protocolVersion, menuBar: nil
         ))
         exit(1)
     }
