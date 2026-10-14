@@ -181,8 +181,9 @@ const MAX_EMPTY = 50;
 const channelDocs = new Map<string, any>();
 const channelAnnouncedAt = new Map<string, number>();
 
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const HEARTBEAT_TIMEOUT_MS = 45_000;
+// Overridable so the regression test can run the sweep in seconds, not minutes.
+const HEARTBEAT_INTERVAL_MS = Number(process.env.RELAY_HEARTBEAT_INTERVAL_MS) || 15_000;
+const HEARTBEAT_TIMEOUT_MS = Number(process.env.RELAY_HEARTBEAT_TIMEOUT_MS) || 45_000;
 const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
 // Full per-message JSON in relay.log. Off by default — see the message handler.
@@ -1293,9 +1294,15 @@ const server = Bun.serve({
 
     // Lightweight liveness probe (for admin dashboards / monitoring).
     if (url.pathname === "/health") {
+      // Connections by role, so a caller can line `controller` up against the
+      // MCP server's own `sessions`/`relaySockets` — the controllers here are
+      // its sessions' sockets, and a gap between the two is a leak on one side.
+      const connections: Record<string, number> = { total: clientMeta.size, controller: 0, figma: 0, monitor: 0, unknown: 0 };
+      for (const meta of clientMeta.values()) connections[meta.role] = (connections[meta.role] || 0) + 1;
       return new Response(JSON.stringify({
         ok: true,
         protocolVersion: PROTOCOL_VERSION,
+        connections,
         index: { lastBuiltAt: indexer.lastCompletedAt, running: indexer.state === "running" },
         errors: summarizeRelayErrors(),
       }), { headers: JSON_HEADERS });

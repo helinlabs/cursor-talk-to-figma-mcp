@@ -60,8 +60,28 @@ print(String(data: data, encoding: .utf8)!)
 `;
 var helperPromise = null;
 async function localWindowHelper() {
-  if (helperPromise) return helperPromise;
-  helperPromise = (async () => {
+  for (; ; ) {
+    const current = helperPromise;
+    if (!current) {
+      helperPromise = buildHelper();
+      continue;
+    }
+    const cached = await current.catch(() => null);
+    if (cached) {
+      try {
+        await access(cached, fsConstants.X_OK);
+        return cached;
+      } catch {
+      }
+    }
+    if (helperPromise === current) {
+      if (cached) console.error(`[Helper] cached binary vanished (${cached}) \u2014 rebuilding`);
+      helperPromise = null;
+    }
+  }
+}
+function buildHelper() {
+  const promise = (async () => {
     const hash = createHash("sha256").update(WINDOW_HELPER_SOURCE).digest("hex").slice(0, 12);
     const helperPath = join(tmpdir(), `talk-to-figma-window-${hash}`);
     try {
@@ -82,7 +102,10 @@ async function localWindowHelper() {
       await rm(buildDir, { recursive: true, force: true });
     }
   })();
-  return helperPromise;
+  promise.catch(() => {
+    if (helperPromise === promise) helperPromise = null;
+  });
+  return promise;
 }
 async function captureLocalFigmaWindow(projectName, maxDimension = 1400) {
   if (process.platform !== "darwin") {
@@ -217,10 +240,39 @@ function loadProjectIndex(projectKey) {
   }
   return null;
 }
-function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
+var TOKEN_SPAN_CAP = 160;
+function splitQueryTokens(qLower) {
+  return qLower.split(/\s+/).filter((token) => token.length > 0);
+}
+function findTokenMatch(lower, qTokens) {
+  if (!qTokens || qTokens.length < 2) return null;
+  let spanStart = -1;
+  let spanEnd = -1;
+  let leadEnd = -1;
+  for (const token of qTokens) {
+    const at = lower.indexOf(token);
+    if (at === -1) return null;
+    const end = at + token.length;
+    if (spanStart === -1 || at < spanStart) {
+      spanStart = at;
+      leadEnd = end;
+    }
+    if (end > spanEnd) spanEnd = end;
+  }
+  if (spanEnd - spanStart > TOKEN_SPAN_CAP) {
+    return { start: spanStart, end: leadEnd, strength: "tokens" };
+  }
+  return { start: spanStart, end: spanEnd, strength: "tokens" };
+}
+var MATCH_RANKS = ["name:exact", "text:exact", "name:tokens", "text:tokens"];
+function matchRank(matchedBy, matchStrength) {
+  const rank = MATCH_RANKS.indexOf(matchedBy + ":" + (matchStrength || "exact"));
+  return rank === -1 ? MATCH_RANKS.length - 1 : rank;
+}
+function findNormalizedMatch(haystack, qLower, qLowerNoSpace, qTokens) {
   const lower = haystack.toLowerCase();
   const idx = lower.indexOf(qLower);
-  if (idx !== -1) return { start: idx, end: idx + qLower.length };
+  if (idx !== -1) return { start: idx, end: idx + qLower.length, strength: "exact" };
   if (!qLowerNoSpace) return null;
   const map = [];
   let stripped = "";
@@ -232,8 +284,14 @@ function findNormalizedMatch(haystack, qLower, qLowerNoSpace) {
     }
   }
   const sIdx = stripped.indexOf(qLowerNoSpace);
-  if (sIdx === -1) return null;
-  return { start: map[sIdx], end: map[sIdx + qLowerNoSpace.length - 1] + 1 };
+  if (sIdx !== -1) {
+    return {
+      start: map[sIdx],
+      end: map[sIdx + qLowerNoSpace.length - 1] + 1,
+      strength: "exact"
+    };
+  }
+  return findTokenMatch(lower, qTokens);
 }
 function textMatchSnippet(characters, range) {
   if (!range) return null;
@@ -249,7 +307,12 @@ function buildNeedles(queries) {
     const qLowerNoSpace = qLower.replace(/\s+/g, "");
     if (!qLowerNoSpace || seen.has(qLowerNoSpace)) continue;
     seen.add(qLowerNoSpace);
-    needles.push({ raw, qLower, qLowerNoSpace });
+    needles.push({
+      raw,
+      qLower,
+      qLowerNoSpace,
+      qTokens: splitQueryTokens(qLower)
+    });
   }
   return needles;
 }
@@ -403,6 +466,7 @@ function persistSelectedProject(project) {
   }
 }
 var SERVER_NAME = "TalkToFigmaMCP";
+var relaySockets = /* @__PURE__ */ new Set();
 function createMcpServer(options = {}) {
   let ws = null;
   let disposed = false;
@@ -3155,9 +3219,12 @@ This detailed process ensures you correctly interpret the reaction data, prepare
       logger.info("Already connected to Figma");
       return;
     }
+    if (ws && ws.readyState === WebSocket.CONNECTING) return;
     const wsUrl = serverUrl === "localhost" ? `ws://localhost:${port}` : RELAY_WS_URL;
     logger.info(`Connecting to Figma socket server at ${wsUrl}...`);
-    ws = new WebSocket(wsUrl);
+    const socket = new WebSocket(wsUrl);
+    ws = socket;
+    relaySockets.add(socket);
     ws.on("open", () => {
       logger.info("Connected to Figma socket server");
       currentChannel = null;
@@ -3271,6 +3338,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     });
     ws.on("close", () => {
       logger.info("Disconnected from Figma socket server");
+      relaySockets.delete(socket);
       ws = null;
       for (const [id, request] of pendingRequests.entries()) {
         clearTimeout(request.timeout);
@@ -3502,9 +3570,9 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
   );
   server.tool(
     "search_nodes",
-    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once \u2014 Korean/English, joined/spaced, product name vs feature name (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer). When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found \u2014 the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet); name matches sort before text matches. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
+    "Search the WHOLE FILE (every page) in a single call for nodes matching the query (case-insensitive) \u2014 by node NAME and/or by on-screen TEXT content (a TEXT node's characters, i.e. the UI copy). So you can find a screen both by its layer name and by the wording visible in it, even when layers are named differently from the feature. Do NOT walk pages one by one with get_document_info or scan whole pages with scan_text_nodes to find something \u2014 use this tool first, then drill into the returned node/page ids. IMPORTANT: pass EVERY plausible spelling of the concept you are looking for in `queries` at once \u2014 Korean/English, joined/spaced, product name vs feature name (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']); they are OR-matched in one pass. Matching also ignores whitespace ('gym chat' matches a 'GymChat' layer), and as a last resort a multi-word query matches when ALL of its words appear anywhere in the name/text, in any order and not necessarily adjacent \u2014 so '\uC138\uD2B8 \uBA54\uBAA8' finds a section named '[AB] \uC138\uD2B8\uB9C8\uB2E4 \uBA54\uBAA8 \uB0A8\uAE30\uAE30 \uAE30\uB2A5 \uCD94\uAC00'. Those looser hits carry matchStrength: 'tokens' and are ranked after every exact hit, so they are the first thing `limit` drops; treat them as candidates to verify, not as confirmed answers. When the relay's background indexer has built a disk index for the project, the search answers from it instantly (response carries source: 'index' and indexedAt); pass fresh: true to force a live search if the index may be stale. Without an index, pages are searched live and sequentially (current page first, then file order), stopping as soon as `limit` matches are found \u2014 the FIRST such search must load and index each page, which can take tens of seconds on large files; later searches hit a per-page cache in the plugin and return in well under a second. Each match includes {id, name, type, pageId, pageName, path, matchedBy, matchedQuery} (text matches also carry a matchedText snippet, loose word-order matches a matchStrength: 'tokens' flag); results are ordered exact-name, exact-text, loose-name, loose-text. Keyword annotations registered via add_search_annotation are returned first with matchedBy: 'annotation' (not counted against `limit`). Optionally filter by node types or restrict to one page.",
     {
-      query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content. Provide this and/or `queries`."),
+      query: z.string().optional().describe("Substring to match (case-insensitive, whitespace-insensitive) against node names and/or TEXT content; a multi-word value also matches when its words appear separately and in any order (flagged matchStrength: 'tokens'). Provide this and/or `queries`."),
       queries: z.array(z.string()).optional().describe("Multiple spellings/variants of the concept, OR-matched in one pass (e.g. ['\uC9D0\uCC57','GymChat','Gym Chat']). Provide this and/or `query`; both are merged."),
       match: z.enum(["name", "text", "both"]).optional().describe("What to match: 'name' = node names only, 'text' = TEXT node characters (UI copy) only, 'both' = either (default)."),
       types: z.array(z.string()).optional().describe("Optional node types to restrict NAME matching to, e.g. ['FRAME','COMPONENT','SECTION','TEXT']. Text matching always targets TEXT nodes."),
@@ -3543,18 +3611,17 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
           if (projectIndex && projectIndex.pages.length > 0) {
             const needles = buildNeedles(allQueries);
             const typeSet = Array.isArray(types) && types.length > 0 ? new Set(types) : null;
-            const matches2 = [];
+            const buckets = MATCH_RANKS.map(() => []);
             let totalMatches2 = 0;
-            let truncated2 = false;
             for (const page of projectIndex.pages) {
-              const nameFound = [];
-              const textFound = [];
               for (const entry of page.entries) {
                 let matched = false;
                 if (mode !== "text" && (!typeSet || typeSet.has(entry.type))) {
                   for (const needle of needles) {
-                    if (findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace)) {
-                      nameFound.push({ entry, matchedQuery: needle.raw });
+                    const range = findNormalizedMatch(entry.name, needle.qLower, needle.qLowerNoSpace, needle.qTokens);
+                    if (range) {
+                      buckets[matchRank("name", range.strength)].push({ entry, page, matchedBy: "name", matchedQuery: needle.raw, range });
+                      totalMatches2++;
                       matched = true;
                       break;
                     }
@@ -3562,50 +3629,41 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
                 }
                 if (!matched && mode !== "name" && entry.characters !== null) {
                   for (const needle of needles) {
-                    const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace);
+                    const range = findNormalizedMatch(entry.characters, needle.qLower, needle.qLowerNoSpace, needle.qTokens);
                     if (range) {
-                      textFound.push({ entry, matchedQuery: needle.raw, range });
+                      buckets[matchRank("text", range.strength)].push({ entry, page, matchedBy: "text", matchedQuery: needle.raw, range });
+                      totalMatches2++;
                       break;
                     }
                   }
                 }
               }
-              totalMatches2 += nameFound.length + textFound.length;
-              for (const found of nameFound) {
+            }
+            const matches2 = [];
+            let truncated2 = false;
+            for (const bucket of buckets) {
+              for (const found of bucket) {
                 if (matches2.length >= max) {
                   truncated2 = true;
                   break;
                 }
-                matches2.push({
+                const hit = {
                   id: found.entry.id,
                   name: found.entry.name,
                   type: found.entry.type,
-                  pageId: page.pageId,
-                  pageName: page.pageName,
+                  pageId: found.page.pageId,
+                  pageName: found.page.pageName,
                   path: found.entry.path,
-                  matchedBy: "name",
+                  matchedBy: found.matchedBy,
                   matchedQuery: found.matchedQuery
-                });
-              }
-              if (!truncated2) {
-                for (const found of textFound) {
-                  if (matches2.length >= max) {
-                    truncated2 = true;
-                    break;
-                  }
-                  matches2.push({
-                    id: found.entry.id,
-                    name: found.entry.name,
-                    type: found.entry.type,
-                    pageId: page.pageId,
-                    pageName: page.pageName,
-                    path: found.entry.path,
-                    matchedBy: "text",
-                    matchedQuery: found.matchedQuery,
-                    matchedText: textMatchSnippet(found.entry.characters, found.range)
-                  });
+                };
+                if (found.range.strength === "tokens") hit.matchStrength = "tokens";
+                if (found.matchedBy === "text") {
+                  hit.matchedText = textMatchSnippet(found.entry.characters, found.range);
                 }
+                matches2.push(hit);
               }
+              if (truncated2) break;
             }
             const result2 = {
               ...contextFlag,
@@ -3677,6 +3735,9 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
             });
           }
         }
+        const orderedMatches = MATCH_RANKS.map(() => []);
+        for (const m of matches) orderedMatches[matchRank(m?.matchedBy, m?.matchStrength)].push(m);
+        const rankedMatches = orderedMatches.flat();
         const result = {
           ...contextFlag,
           queries: allQueries,
@@ -3686,7 +3747,7 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
           truncated,
           totalScannedPages,
           totalPages: pageOrder.length,
-          matches: [...annotationMatches, ...matches]
+          matches: [...annotationMatches, ...rankedMatches]
         };
         if (truncated) {
           result.note = `Stopped after ${totalScannedPages}/${pageOrder.length} pages once the limit of ${max} matches was reached; totalMatches counts scanned pages only.`;
@@ -4349,17 +4410,41 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
     if (ws) {
       const socket = ws;
       ws = null;
+      relaySockets.delete(socket);
       socket.removeAllListeners();
       socket.on("error", () => void 0);
       socket.terminate();
     }
   };
-  return { server, dispose };
+  const busy = () => pendingRequests.size > 0 || [...bulkJobs.values()].some((job) => job.status === "queued" || job.status === "running" || job.status === "cancelling");
+  return { server, dispose, busy };
 }
 var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
 var httpPort = Number(runtimeArgs.find((arg) => arg.startsWith("--port="))?.split("=")[1] || 3056);
 var httpHost = runtimeArgs.find((arg) => arg.startsWith("--host="))?.split("=")[1] || "127.0.0.1";
+function positiveNumberFromEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+var sessionIdleMs = positiveNumberFromEnv("MCP_SESSION_IDLE_MS", 30 * 60 * 1e3);
+var sessionSweepMs = positiveNumberFromEnv("MCP_SESSION_SWEEP_MS", 60 * 1e3);
+var sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
+async function loadFootprintReader() {
+  if (process.platform !== "darwin" || !process.versions.bun) return () => null;
+  try {
+    const specifier = "bun:ffi";
+    const ffi = await import(specifier);
+    const libSystem = ffi.dlopen("/usr/lib/libSystem.B.dylib", {
+      proc_pid_rusage: { args: ["i32", "i32", "ptr"], returns: "i32" }
+    });
+    const info = new BigUint64Array(12);
+    return () => libSystem.symbols.proc_pid_rusage(process.pid, 0, info) === 0 ? Number(info[9]) : null;
+  } catch (error) {
+    logger.warn(`phys_footprint unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return () => null;
+  }
+}
 var exportDirectory = process.env.FIGMA_EXPORT_DIR || path5.join(os5.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
 var exportTTLHours = Number.isFinite(configuredExportTTLHours) && configuredExportTTLHours > 0 ? configuredExportTTLHours : 24;
@@ -4468,12 +4553,55 @@ async function startHTTPServer() {
   const configuredBase = process.env.NEXUS_TUNNEL_PUBLIC_BASE || process.env.BROKER_PUBLIC_BASE;
   const remoteExportBase = (configuredBase || `http://${httpHost}:${httpPort}`).replace(/\/$/, "");
   const sessions = /* @__PURE__ */ new Map();
+  let evictedTotal = 0;
+  const footprintBytes = await loadFootprintReader();
+  const closeSession = (entry) => {
+    if (entry.closed) return;
+    entry.closed = true;
+    const id = entry.transport.sessionId;
+    if (id && sessions.get(id) === entry) sessions.delete(id);
+    entry.dispose();
+  };
+  const evict = (id, entry, why) => {
+    sessions.delete(id);
+    evictedTotal++;
+    entry.transport.close().catch((error) => {
+      logger.warn(`Could not close evicted session ${id}: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => closeSession(entry));
+    logger.info(`Evicted MCP session ${id} (${why}); ${sessions.size} left`);
+  };
+  const evictable = (entry) => entry.open === 0 && !entry.busy();
+  const sweepIdleSessions = (now = Date.now()) => {
+    for (const [id, entry] of sessions) {
+      if (evictable(entry) && now - entry.lastSeen >= sessionIdleMs) evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1e3)}s`);
+    }
+  };
+  const sweepTimer = setInterval(sweepIdleSessions, sessionSweepMs);
+  sweepTimer.unref();
   const httpServer = createHttpServer(async (req, res) => {
+    let fresh;
     try {
       const pathname = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
       if ((req.method === "GET" || req.method === "HEAD") && serveExport(req, res, pathname)) return;
       if (pathname === "/health" && req.method === "GET") {
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
+        const memory = process.memoryUsage();
+        const footprint = footprintBytes();
+        let relaySocketsOpen = 0;
+        for (const socket of relaySockets) if (socket.readyState === WebSocket.OPEN) relaySocketsOpen++;
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+          ok: true,
+          sessions: sessions.size,
+          sessionsEvicted: evictedTotal,
+          sessionIdleSeconds: Math.round(sessionIdleMs / 1e3),
+          sessionMax,
+          // At most one per session; more than `sessions` means sockets leaked.
+          relaySockets: relaySockets.size,
+          relaySocketsOpen,
+          footprintMB: footprint === null ? null : Math.round(footprint / 1048576),
+          rssMB: Math.round(memory.rss / 1048576),
+          heapUsedMB: Math.round(memory.heapUsed / 1048576),
+          uptimeSeconds: Math.round(process.uptime())
+        }));
         return;
       }
       if (pathname !== "/mcp") {
@@ -4485,28 +4613,48 @@ async function startHTTPServer() {
       let body;
       if (req.method === "POST") body = await readJSON(req);
       if (!entry && req.method === "POST" && !sessionId && isInitializeRequest(body)) {
-        let transport;
-        const { server: mcpServer, dispose } = createMcpServer({ remoteExportBase });
-        transport = new StreamableHTTPServerTransport({
+        const { server: mcpServer, dispose, busy } = createMcpServer({ remoteExportBase });
+        const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: uuidv4,
-          onsessioninitialized: (id) => sessions.set(id, { transport, server: mcpServer, dispose })
+          onsessioninitialized: (id) => {
+            if (sessions.size >= sessionMax) {
+              let oldest;
+              for (const pair of sessions) {
+                if (evictable(pair[1]) && (!oldest || pair[1].lastSeen < oldest[1].lastSeen)) oldest = pair;
+              }
+              if (oldest) evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
+            }
+            sessions.set(id, created);
+          }
         });
-        transport.onclose = () => {
-          if (transport.sessionId) sessions.delete(transport.sessionId);
-          dispose();
-        };
+        const created = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), open: 0, closed: false };
         await mcpServer.connect(transport);
-        entry = { transport, server: mcpServer, dispose };
+        const sdkOnClose = transport.onclose;
+        transport.onclose = () => {
+          sdkOnClose?.();
+          closeSession(created);
+        };
+        entry = created;
+        fresh = created;
       }
       if (!entry) {
         sendNoSessionResponse(req, res, { sessionId, body });
         return;
       }
-      await entry.transport.handleRequest(req, res, body);
+      const active = entry;
+      active.lastSeen = Date.now();
+      active.open++;
+      res.once("close", () => {
+        active.open--;
+        active.lastSeen = Date.now();
+      });
+      await active.transport.handleRequest(req, res, body);
     } catch (error) {
       logger.error(`HTTP request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
       if (!res.writableEnded) res.end(JSON.stringify({ error: "internal error" }));
+    } finally {
+      if (fresh && !fresh.transport.sessionId) closeSession(fresh);
     }
   });
   await new Promise((resolve2, reject) => {
