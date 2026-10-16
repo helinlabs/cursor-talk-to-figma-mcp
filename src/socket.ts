@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 
 import { Server, ServerWebSocket } from "bun";
+import { dlopen } from "bun:ffi";
+import { heapStats } from "bun:jsc";
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "fs";
 import { createHash, randomUUID } from "crypto";
 import * as path from "path";
@@ -184,6 +186,7 @@ const channelAnnouncedAt = new Map<string, number>();
 // Overridable so the regression test can run the sweep in seconds, not minutes.
 const HEARTBEAT_INTERVAL_MS = Number(process.env.RELAY_HEARTBEAT_INTERVAL_MS) || 15_000;
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.RELAY_HEARTBEAT_TIMEOUT_MS) || 45_000;
+const MONITOR_BACKLOG_LIMIT_BYTES = Number(process.env.RELAY_MONITOR_BACKLOG_LIMIT_BYTES) || 8 * 1024 * 1024;
 const UNSTABLE_WINDOW = 10;
 const UNSTABLE_TIMEOUT_RATE = 0.5;
 // Full per-message JSON in relay.log. Off by default — see the message handler.
@@ -384,6 +387,7 @@ function pruneEmptyChannels(): void {
     emptyChannels.delete(name);
     channels.delete(name);
     channelDocs.delete(name);
+    channelAnnouncedAt.delete(name);
   }
 }
 
@@ -784,6 +788,7 @@ function resolveNavigatorChannel(project: string): string | null {
 }
 
 function resolveNavigatorIndex(project: string): ProjectIndex | null {
+  scheduleHeapRelease(); // a whole project index is parsed below
   const direct = loadProjectIndex(project);
   if (direct) return direct;
   const f = project.toLowerCase();
@@ -823,7 +828,7 @@ function indexStatus(): any {
       partial: p.partial,
     })),
     // What is on disk (survives restarts), independent of the current job.
-    diskIndexes: listProjectIndexSummaries(),
+    diskIndexes: (scheduleHeapRelease(), listProjectIndexSummaries()), // a missing sidecar is a full parse, once
     // Dirty-page incremental reindexer (5-minute cycle; see below).
     dirty: dirtyStatus(),
   };
@@ -978,6 +983,7 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
           recordRelayError({ source: "indexer", project: pick.p.name, pageId: page.id, pageName: page.name, command: "dump_page_index", message });
         }
         indexer.durations.push(Date.now() - t0);
+        scheduleHeapRelease(); // each step re-serializes the whole project index
         pick.p.nextIndex++;
         indexer.scannedPages++;
         if (pick.p.nextIndex >= pick.p.pages.length) {
@@ -1134,53 +1140,61 @@ async function runIncrementalReindex(): Promise<void> {
         dirtyPages.delete(projectKey);
         continue;
       }
-      for (const [pageId, mark] of [...pages.entries()]) {
-        // Re-read state each step: a full rebuild may start while we await.
-        if ((indexer.state as "idle" | "running") === "running") return; // full rebuild took over
-        if (channelQueueDepth(channel) > 0) break; // real traffic first; retry next cycle
-        try {
-          const dump = await sendInternalCommand(channel, "dump_page_index", { pageId }, INDEX_STEP_TIMEOUT_MS);
-          const pageIndex = {
-            pageId: dump.pageId,
-            pageName: dump.pageName,
-            builtAt: dump.builtAt ?? Date.now(),
-            nodeCount: dump.nodeCount ?? (dump.entries?.length || 0),
-            entries: dump.entries || [],
-          };
-          const existing = idx.pages.findIndex((pg) => pg.pageId === pageIndex.pageId);
-          if (existing !== -1) idx.pages[existing] = pageIndex;
-          else idx.pages.push(pageIndex);
-          saveProjectIndex(idx); // bumps updatedAt
-          updated++;
-          pages.delete(pageId);
-          pushEvent({ kind: "index_incremental", projectKey, pageId, pageName: pageIndex.pageName, nodes: pageIndex.nodeCount });
-          if (dump.skippedNodes > 0 || dump.skippedUnknown) {
-            recordRelayError({
-              source: "indexer",
-              project: idx.projectName || projectKey,
-              pageId,
-              pageName: pageIndex.pageName,
-              command: "dump_page_index",
-              message: `partial page index (${dump.enumeration || "findAll"}): ${dump.skippedError || "unknown-typed nodes skipped"}`,
-              detail: "미지 노드 타입: Figma 데스크톱 앱 업데이트로 해소될 수 있음",
-            });
+      // Merged pages are written once per project per cycle, not once per page:
+      // every save re-serializes the whole index (GW_Product: 433k nodes).
+      let changed = false;
+      try {
+        for (const [pageId, mark] of [...pages.entries()]) {
+          // Re-read state each step: a full rebuild may start while we await.
+          if ((indexer.state as "idle" | "running") === "running") return; // full rebuild took over
+          if (channelQueueDepth(channel) > 0) break; // real traffic first; retry next cycle
+          try {
+            const dump = await sendInternalCommand(channel, "dump_page_index", { pageId }, INDEX_STEP_TIMEOUT_MS);
+            const pageIndex = {
+              pageId: dump.pageId,
+              pageName: dump.pageName,
+              builtAt: dump.builtAt ?? Date.now(),
+              nodeCount: dump.nodeCount ?? (dump.entries?.length || 0),
+              entries: dump.entries || [],
+            };
+            const existing = idx.pages.findIndex((pg) => pg.pageId === pageIndex.pageId);
+            if (existing !== -1) idx.pages[existing] = pageIndex;
+            else idx.pages.push(pageIndex);
+            changed = true;
+            updated++;
+            pages.delete(pageId);
+            pushEvent({ kind: "index_incremental", projectKey, pageId, pageName: pageIndex.pageName, nodes: pageIndex.nodeCount });
+            if (dump.skippedNodes > 0 || dump.skippedUnknown) {
+              recordRelayError({
+                source: "indexer",
+                project: idx.projectName || projectKey,
+                pageId,
+                pageName: pageIndex.pageName,
+                command: "dump_page_index",
+                message: `partial page index (${dump.enumeration || "findAll"}): ${dump.skippedError || "unknown-typed nodes skipped"}`,
+                detail: "미지 노드 타입: Figma 데스크톱 앱 업데이트로 해소될 수 있음",
+              });
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            pages.delete(pageId); // no endless retry loop; the next dirty mark or full build retries
+            recordRelayError({ source: "indexer", project: idx.projectName || projectKey, pageId, pageName: mark.pageName, command: "dump_page_index", message });
+            if (/page not found/i.test(message)) {
+              // Deleted page: drop its stale slice from the disk index too.
+              idx.pages = idx.pages.filter((pg) => pg.pageId !== pageId);
+              changed = true;
+            }
           }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          pages.delete(pageId); // no endless retry loop; the next dirty mark or full build retries
-          recordRelayError({ source: "indexer", project: idx.projectName || projectKey, pageId, pageName: mark.pageName, command: "dump_page_index", message });
-          if (/page not found/i.test(message)) {
-            // Deleted page: drop its stale slice from the disk index too.
-            idx.pages = idx.pages.filter((pg) => pg.pageId !== pageId);
-            saveProjectIndex(idx);
-          }
+          await sleep(INDEX_STEP_IDLE_MS);
         }
-        await sleep(INDEX_STEP_IDLE_MS);
+      } finally {
+        if (changed) saveProjectIndex(idx); // bumps updatedAt
       }
       if (!pages.size) dirtyPages.delete(projectKey);
     }
   } finally {
     incremental.running = false;
+    if (updated > 0) scheduleHeapRelease();
     incremental.lastRunAt = Date.now();
     incremental.lastUpdatedPages = updated;
   }
@@ -1189,6 +1203,148 @@ async function runIncrementalReindex(): Promise<void> {
 setInterval(() => void runIncrementalReindex(), INCREMENTAL_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Memory diagnostics for /health. macmini-1 (2026-10-16): the relay's footprint
+// went 0.1 → 2.0 GB over two days at ~115 connections, and nothing it reported
+// said which part grew. These are the numbers to compare across two readings.
+// ---------------------------------------------------------------------------
+
+// phys_footprint — what the supervisor, Activity Monitor and Jetsam count. rss
+// alone leaves out compressed pages, which is most of an idle heap on macOS.
+const footprintBytes: () => number | null = (() => {
+  if (process.platform !== "darwin") return () => null;
+  try {
+    const libSystem = dlopen("/usr/lib/libSystem.B.dylib", {
+      proc_pid_rusage: { args: ["i32", "i32", "ptr"], returns: "i32" },
+    });
+    // struct rusage_info_v0: 16-byte uuid, then 64-bit counters; ri_phys_footprint is word 9.
+    const info = new BigUint64Array(12);
+    return () => libSystem.symbols.proc_pid_rusage(process.pid, 0, info) === 0 ? Number(info[9]) : null;
+  } catch {
+    return () => null;
+  }
+})();
+
+const MB = 1048576;
+
+// Parsing a project index is a transient of several times its file size — one
+// /index/status over macmini-1's ~115 MB of indexes took the relay from 60 MB to
+// ~1 GB — and Bun keeps those pages until a full collection runs, which an idle
+// relay rarely triggers. Measured locally: 925 MB footprint idle after five
+// parses, 136 MB three seconds after Bun.gc(true). So every heavy index path
+// asks for a collection shortly after it finishes (coalesced: one per burst),
+// and a slow backstop collects whenever the footprint is over the line anyway.
+const HEAP_RELEASE_DELAY_MS = Number(process.env.RELAY_HEAP_RELEASE_DELAY_MS) || 10_000;
+const HEAP_BACKSTOP_INTERVAL_MS = Number(process.env.RELAY_HEAP_BACKSTOP_INTERVAL_MS) || 5 * 60_000;
+const HEAP_BACKSTOP_FOOTPRINT_MB = Number(process.env.RELAY_HEAP_BACKSTOP_FOOTPRINT_MB) || 512;
+// The pages go back to the OS over the following seconds, not during gc(), so
+// the footprint right before is recorded rather than a misleading "freed".
+const heapRelease = { count: 0, lastAt: null as number | null, lastMs: null as number | null, footprintBeforeMB: null as number | null };
+let heapReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+function releaseHeap(): void {
+  const before = footprintBytes();
+  const started = Date.now();
+  Bun.gc(true);
+  heapRelease.count++;
+  heapRelease.lastAt = Date.now();
+  heapRelease.lastMs = heapRelease.lastAt - started;
+  heapRelease.footprintBeforeMB = before === null ? null : Math.round(before / MB);
+}
+
+function scheduleHeapRelease(): void {
+  if (heapReleaseTimer) return; // one collection per burst, not one per call
+  heapReleaseTimer = setTimeout(() => {
+    heapReleaseTimer = null;
+    releaseHeap();
+  }, HEAP_RELEASE_DELAY_MS);
+}
+
+setInterval(() => {
+  const footprint = footprintBytes();
+  if (footprint !== null && footprint / MB > HEAP_BACKSTOP_FOOTPRINT_MB) releaseHeap();
+}, HEAP_BACKSTOP_INTERVAL_MS).unref?.();
+
+function relayMemory(includeTypes: boolean) {
+  const usage = process.memoryUsage();
+  const footprint = footprintBytes();
+  let jsc: any = null;
+  try {
+    const stats = heapStats();
+    jsc = {
+      heapSizeMB: Math.round(stats.heapSize / MB),
+      heapCapacityMB: Math.round(stats.heapCapacity / MB),
+      extraMemoryMB: Math.round(stats.extraMemorySize / MB),
+      objectCount: stats.objectCount,
+      protectedObjectCount: stats.protectedObjectCount,
+      ...(includeTypes
+        ? {
+            topObjectTypes: Object.fromEntries(
+              Object.entries(stats.objectTypeCounts as Record<string, number>)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 25)
+            ),
+          }
+        : {}),
+    };
+  } catch {}
+  return {
+    footprintMB: footprint === null ? null : Math.round(footprint / MB),
+    rssMB: Math.round(usage.rss / MB),
+    heapUsedMB: Math.round(usage.heapUsed / MB),
+    heapTotalMB: Math.round(usage.heapTotal / MB),
+    externalMB: Math.round(usage.external / MB),
+    arrayBuffersMB: Math.round(usage.arrayBuffers / MB),
+    jsc,
+    heapRelease,
+  };
+}
+
+// Sizes of every collection that is keyed by a connection, a channel or a
+// request — the places a leak would have to live if it is in JS at all — plus
+// what is queued in each socket's send buffer, which lives outside the JS heap.
+function relayStateSizes() {
+  let channelMembers = 0;
+  for (const members of channels.values()) channelMembers += members.size;
+  let dirtyPageMarks = 0;
+  for (const pages of dirtyPages.values()) dirtyPageMarks += pages.size;
+  let recentTimeouts = 0;
+  let bufferedBytes = 0;
+  let maxBufferedBytes = 0;
+  let backloggedSockets = 0;
+  for (const [client, meta] of clientMeta) {
+    recentTimeouts += meta.recentTimeouts.length;
+    let buffered = 0;
+    try { buffered = client.getBufferedAmount(); } catch {}
+    bufferedBytes += buffered;
+    if (buffered > maxBufferedBytes) maxBufferedBytes = buffered;
+    if (buffered > 0) backloggedSockets++;
+  }
+  return {
+    clientMeta: clientMeta.size,
+    channels: channels.size,
+    channelMembers,
+    emptyChannels: emptyChannels.size,
+    channelDocs: channelDocs.size,
+    channelAnnouncedAt: channelAnnouncedAt.size,
+    monitors: monitors.size,
+    requests: requests.size,
+    bulkJobs: bulkJobs.size,
+    previewSubscriptions: previewSubscriptions.size,
+    eventLog: eventLog.length,
+    recentTimeouts,
+    dirtyPageProjects: dirtyPages.size,
+    dirtyPageMarks,
+    indexerProjects: indexer.projects.length,
+    indexerDurations: indexer.durations.length,
+    sendBuffer: {
+      totalKB: Math.round(bufferedBytes / 1024),
+      maxKB: Math.round(maxBufferedBytes / 1024),
+      backloggedSockets,
+    },
+  };
+}
 
 function handleConnection(ws: ServerWebSocket<any>) {
   const connection = (ws.data || {}) as ConnectionData;
@@ -1293,6 +1449,8 @@ const server = Bun.serve({
     }
 
     // Lightweight liveness probe (for admin dashboards / monitoring).
+    // ?types=1 adds the JS heap's largest object-type counts, which is what
+    // tells "the heap is full of X" apart from "the heap is not where it went".
     if (url.pathname === "/health") {
       // Connections by role, so a caller can line `controller` up against the
       // MCP server's own `sessions`/`relaySockets` — the controllers here are
@@ -1305,6 +1463,9 @@ const server = Bun.serve({
         connections,
         index: { lastBuiltAt: indexer.lastCompletedAt, running: indexer.state === "running" },
         errors: summarizeRelayErrors(),
+        uptimeSeconds: Math.round(process.uptime()),
+        memory: relayMemory(url.searchParams.get("types") === "1"),
+        state: relayStateSizes(),
       }), { headers: JSON_HEADERS });
     }
 
@@ -2121,6 +2282,7 @@ const server = Bun.serve({
               channels.delete(name);
               emptyChannels.delete(name);
               channelDocs.delete(name);
+              channelAnnouncedAt.delete(name);
               removed++;
             }
           }
@@ -2554,7 +2716,19 @@ serving = true;
 setInterval(() => {
   const now = Date.now();
   for (const [client, meta] of clientMeta) {
-    if (meta.role === "monitor") continue;
+    if (meta.role === "monitor") {
+      // Consoles are exempt from the heartbeat, so a tab that stopped reading
+      // (a sleeping laptop, a half-open tunnel) was never dropped: it held a
+      // full send buffer (Bun caps it at 16 MB) and got every later frame
+      // silently discarded. A live console drains its buffer between sweeps.
+      let buffered = 0;
+      try { buffered = client.getBufferedAmount(); } catch {}
+      if (buffered >= MONITOR_BACKLOG_LIMIT_BYTES) {
+        pushEvent({ kind: "monitor_backlog", clientId: meta.id, bufferedKB: Math.round(buffered / 1024) });
+        client.close(4004, "Console stopped reading");
+      }
+      continue;
+    }
     if (now - meta.lastSeenAt > HEARTBEAT_TIMEOUT_MS) {
       pushEvent({ kind: "heartbeat_timeout", clientId: meta.id, requesterId: meta.requesterId, channel: meta.channel });
       client.close(4001, "Heartbeat timeout");

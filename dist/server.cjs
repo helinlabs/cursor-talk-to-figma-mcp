@@ -4452,6 +4452,7 @@ function positiveNumberFromEnv(name, fallback) {
 var sessionIdleMs = positiveNumberFromEnv("MCP_SESSION_IDLE_MS", 30 * 60 * 1e3);
 var sessionSweepMs = positiveNumberFromEnv("MCP_SESSION_SWEEP_MS", 60 * 1e3);
 var sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
+var sessionStreamIdleMs = positiveNumberFromEnv("MCP_SESSION_STREAM_IDLE_MS", sessionIdleMs * 2);
 async function loadFootprintReader() {
   if (process.platform !== "darwin" || !process.versions.bun) return () => null;
   try {
@@ -4592,10 +4593,13 @@ async function startHTTPServer() {
     }).finally(() => closeSession(entry));
     logger.info(`Evicted MCP session ${id} (${why}); ${sessions.size} left`);
   };
-  const evictable = (entry) => entry.open === 0 && !entry.busy();
+  const evictable = (entry) => entry.inflight === 0 && !entry.busy();
+  const idleLimit = (entry) => entry.streams > 0 ? sessionStreamIdleMs : sessionIdleMs;
   const sweepIdleSessions = (now = Date.now()) => {
     for (const [id, entry] of sessions) {
-      if (evictable(entry) && now - entry.lastSeen >= sessionIdleMs) evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1e3)}s`);
+      if (evictable(entry) && now - entry.lastSeen >= idleLimit(entry)) {
+        evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1e3)}s${entry.streams > 0 ? `, ${entry.streams} open stream(s)` : ""}`);
+      }
     }
   };
   const sweepTimer = setInterval(sweepIdleSessions, sessionSweepMs);
@@ -4610,11 +4614,25 @@ async function startHTTPServer() {
         const footprint = footprintBytes();
         let relaySocketsOpen = 0;
         for (const socket of relaySockets) if (socket.readyState === import_ws.default.OPEN) relaySocketsOpen++;
+        let sessionsStreaming = 0;
+        let sessionsBusy = 0;
+        let oldestIdleMs = 0;
+        const now = Date.now();
+        for (const entry2 of sessions.values()) {
+          if (entry2.streams > 0) sessionsStreaming++;
+          if (!evictable(entry2)) sessionsBusy++;
+          oldestIdleMs = Math.max(oldestIdleMs, now - entry2.lastSeen);
+        }
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
           ok: true,
           sessions: sessions.size,
+          // Holding a GET stream / protected from eviction by work in flight.
+          sessionsStreaming,
+          sessionsBusy,
+          oldestIdleSeconds: Math.round(oldestIdleMs / 1e3),
           sessionsEvicted: evictedTotal,
           sessionIdleSeconds: Math.round(sessionIdleMs / 1e3),
+          sessionStreamIdleSeconds: Math.round(sessionStreamIdleMs / 1e3),
           sessionMax,
           // At most one per session; more than `sessions` means sockets leaked.
           relaySockets: relaySockets.size,
@@ -4639,17 +4657,18 @@ async function startHTTPServer() {
         const transport = new import_streamableHttp.StreamableHTTPServerTransport({
           sessionIdGenerator: import_uuid.v4,
           onsessioninitialized: (id) => {
-            if (sessions.size >= sessionMax) {
+            while (sessions.size >= sessionMax) {
               let oldest;
               for (const pair of sessions) {
                 if (evictable(pair[1]) && (!oldest || pair[1].lastSeen < oldest[1].lastSeen)) oldest = pair;
               }
-              if (oldest) evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
+              if (!oldest) break;
+              evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
             }
             sessions.set(id, created);
           }
         });
-        const created = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), open: 0, closed: false };
+        const created = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), inflight: 0, streams: 0, closed: false };
         await mcpServer.connect(transport);
         const sdkOnClose = transport.onclose;
         transport.onclose = () => {
@@ -4664,11 +4683,17 @@ async function startHTTPServer() {
         return;
       }
       const active = entry;
+      const isStream = req.method === "GET";
       active.lastSeen = Date.now();
-      active.open++;
+      if (isStream) active.streams++;
+      else active.inflight++;
       res.once("close", () => {
-        active.open--;
-        active.lastSeen = Date.now();
+        if (isStream) {
+          active.streams--;
+        } else {
+          active.inflight--;
+          active.lastSeen = Date.now();
+        }
       });
       await active.transport.handleRequest(req, res, body);
     } catch (error) {
