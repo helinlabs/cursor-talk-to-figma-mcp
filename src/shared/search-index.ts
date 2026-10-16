@@ -77,32 +77,75 @@ export function saveProjectIndex(index: ProjectIndex): void {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(index));
   fs.renameSync(tmp, file);
+  // After the index itself, so a summary is never newer than what it describes
+  // unless it matches it (listProjectIndexSummaries checks exactly that).
+  writeSummary(file, summaryOf(index, path.basename(file)));
 }
 
-// List every persisted project index WITHOUT loading node entries into the
-// result (summary fields only) — for status endpoints.
-export function listProjectIndexSummaries(): Array<Omit<ProjectIndex, "pages"> & { file: string }> {
+type ProjectIndexSummary = Omit<ProjectIndex, "pages"> & { file: string };
+
+// Each project index has a small sidecar holding just its summary fields.
+// Reading those fields used to mean JSON.parse of the whole index — 433k nodes
+// for GW_Product — and /index/status did that for every project on every call.
+// On the relay that is a ~1 GB transient per call (8 projects, ~115 MB of JSON)
+// which Bun does not hand back to the OS: macmini-1's relay sat at 2 GB.
+// Not `.json`, so nothing that lists `project-*.json` mistakes it for an index.
+function summaryPath(indexFile: string): string {
+  return `${indexFile}.summary`;
+}
+
+function summaryOf(raw: any, file: string): ProjectIndexSummary {
+  return {
+    projectKey: raw.projectKey,
+    projectName: raw.projectName,
+    builtAt: raw.builtAt ?? null,
+    updatedAt: raw.updatedAt ?? null,
+    pageCount: raw.pageCount ?? (Array.isArray(raw.pages) ? raw.pages.length : 0),
+    nodeCount: raw.nodeCount ?? 0,
+    file,
+  };
+}
+
+function writeSummary(indexFile: string, summary: ProjectIndexSummary): void {
+  try {
+    const target = summaryPath(indexFile);
+    const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(summary));
+    fs.renameSync(tmp, target);
+  } catch {
+    // Best-effort: without a sidecar the next listing parses the index once.
+  }
+}
+
+// List every persisted project index WITHOUT loading node entries (summary
+// fields only) — for status endpoints. Reads the sidecar summaries; an index
+// with no sidecar, or one older than the index (written by a relay from before
+// sidecars existed), is parsed once and gets one.
+export function listProjectIndexSummaries(): ProjectIndexSummary[] {
   try {
     return fs
       .readdirSync(INDEX_DIR)
       .filter((f) => f.startsWith("project-") && f.endsWith(".json"))
       .map((f) => {
+        const file = path.join(INDEX_DIR, f);
         try {
-          const raw = JSON.parse(fs.readFileSync(path.join(INDEX_DIR, f), "utf8"));
-          return {
-            projectKey: raw.projectKey,
-            projectName: raw.projectName,
-            builtAt: raw.builtAt ?? null,
-            updatedAt: raw.updatedAt ?? null,
-            pageCount: raw.pageCount ?? (Array.isArray(raw.pages) ? raw.pages.length : 0),
-            nodeCount: raw.nodeCount ?? 0,
-            file: f,
-          };
+          const indexMtime = fs.statSync(file).mtimeMs;
+          try {
+            if (fs.statSync(summaryPath(file)).mtimeMs >= indexMtime) {
+              const summary = JSON.parse(fs.readFileSync(summaryPath(file), "utf8"));
+              if (summary && typeof summary.projectKey === "string") return { ...summary, file: f };
+            }
+          } catch {
+            // no usable sidecar — fall through to the one-time full parse
+          }
+          const summary = summaryOf(JSON.parse(fs.readFileSync(file, "utf8")), f);
+          writeSummary(file, summary);
+          return summary;
         } catch {
           return null;
         }
       })
-      .filter((s): s is any => !!s && typeof s.projectKey === "string");
+      .filter((s): s is ProjectIndexSummary => !!s && typeof s.projectKey === "string");
   } catch {
     return [];
   }

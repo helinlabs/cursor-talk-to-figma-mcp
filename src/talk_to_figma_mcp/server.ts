@@ -5093,14 +5093,25 @@ function positiveNumberFromEnv(name: string, fallback: number): number {
 const sessionIdleMs = positiveNumberFromEnv("MCP_SESSION_IDLE_MS", 30 * 60 * 1000);
 const sessionSweepMs = positiveNumberFromEnv("MCP_SESSION_SWEEP_MS", 60 * 1000);
 const sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
+// A session whose client still holds its GET event stream open gets longer
+// before the idle sweep closes it — but not forever. An open stream used to
+// exempt a session from both the sweep and the cap: macmini-1 (2026-10-16) had
+// sessions 106 over a cap of 64, each holding a relay socket, because streams
+// whose client was gone (a dead caller behind the Nexus tunnel) never closed.
+const sessionStreamIdleMs = positiveNumberFromEnv("MCP_SESSION_STREAM_IDLE_MS", sessionIdleMs * 2);
 
 interface HTTPSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   dispose: () => void;
   busy: () => boolean;
+  // When the client last sent anything (POST/DELETE, or opened a stream).
+  // Holding a stream open is not activity: that is what a vanished client does.
   lastSeen: number;
-  open: number;
+  // Requests whose response is still open, excluding GET event streams.
+  inflight: number;
+  // Open GET event streams.
+  streams: number;
   closed: boolean;
 }
 
@@ -5305,10 +5316,16 @@ async function startHTTPServer() {
       .finally(() => closeSession(entry));
     logger.info(`Evicted MCP session ${id} (${why}); ${sessions.size} left`);
   };
-  const evictable = (entry: HTTPSession) => entry.open === 0 && !entry.busy();
+  // Only work in flight protects a session: a request still being answered, a
+  // plugin round-trip, a bulk job. An open GET stream does not — it stretches
+  // the idle limit (sessionStreamIdleMs) and is otherwise closed with the session.
+  const evictable = (entry: HTTPSession) => entry.inflight === 0 && !entry.busy();
+  const idleLimit = (entry: HTTPSession) => entry.streams > 0 ? sessionStreamIdleMs : sessionIdleMs;
   const sweepIdleSessions = (now = Date.now()) => {
     for (const [id, entry] of sessions) {
-      if (evictable(entry) && now - entry.lastSeen >= sessionIdleMs) evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1000)}s`);
+      if (evictable(entry) && now - entry.lastSeen >= idleLimit(entry)) {
+        evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1000)}s${entry.streams > 0 ? `, ${entry.streams} open stream(s)` : ""}`);
+      }
     }
   };
   const sweepTimer = setInterval(sweepIdleSessions, sessionSweepMs);
@@ -5326,11 +5343,25 @@ async function startHTTPServer() {
         const footprint = footprintBytes();
         let relaySocketsOpen = 0;
         for (const socket of relaySockets) if (socket.readyState === WebSocket.OPEN) relaySocketsOpen++;
+        let sessionsStreaming = 0;
+        let sessionsBusy = 0;
+        let oldestIdleMs = 0;
+        const now = Date.now();
+        for (const entry of sessions.values()) {
+          if (entry.streams > 0) sessionsStreaming++;
+          if (!evictable(entry)) sessionsBusy++;
+          oldestIdleMs = Math.max(oldestIdleMs, now - entry.lastSeen);
+        }
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
           ok: true,
           sessions: sessions.size,
+          // Holding a GET stream / protected from eviction by work in flight.
+          sessionsStreaming,
+          sessionsBusy,
+          oldestIdleSeconds: Math.round(oldestIdleMs / 1000),
           sessionsEvicted: evictedTotal,
           sessionIdleSeconds: Math.round(sessionIdleMs / 1000),
+          sessionStreamIdleSeconds: Math.round(sessionStreamIdleMs / 1000),
           sessionMax,
           // At most one per session; more than `sessions` means sockets leaked.
           relaySockets: relaySockets.size,
@@ -5357,22 +5388,25 @@ async function startHTTPServer() {
         const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: uuidv4,
           onsessioninitialized: (id) => {
-            // Over the cap, make room by closing the least recently used idle
-            // session. When every session is busy the new one is still admitted —
-            // refusing a caller is worse than briefly holding one more socket.
+            // At the cap, make room by closing least recently used sessions with
+            // nothing in flight (an open event stream does not count) until the
+            // new one fits. When every session has work in flight the new one is
+            // still admitted — refusing a caller is worse than briefly holding
+            // one more socket — and the surplus goes with the next initialize.
             // Done here, once a session id is actually issued, so an initialize
             // the transport rejects does not push out a live session.
-            if (sessions.size >= sessionMax) {
+            while (sessions.size >= sessionMax) {
               let oldest: [string, HTTPSession] | undefined;
               for (const pair of sessions) {
                 if (evictable(pair[1]) && (!oldest || pair[1].lastSeen < oldest[1].lastSeen)) oldest = pair;
               }
-              if (oldest) evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
+              if (!oldest) break;
+              evict(oldest[0], oldest[1], `over the ${sessionMax}-session cap`);
             }
             sessions.set(id, created);
           },
         });
-        const created: HTTPSession = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), open: 0, closed: false };
+        const created: HTTPSession = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), inflight: 0, streams: 0, closed: false };
         await mcpServer.connect(transport);
         // Chain after connect(): connect() overwrites transport.onclose, so a
         // handler set before it is silently dropped (see closeSession).
@@ -5389,14 +5423,21 @@ async function startHTTPServer() {
         sendNoSessionResponse(req, res, { sessionId, body });
         return;
       }
-      // A request is in flight until its response closes — that covers a
-      // long tool call and an open GET event stream alike.
+      // A request is in flight until its response closes. A GET is the
+      // session's event stream: counted apart, and its close is not activity —
+      // a tunnel dropping a dead client's stream must not renew the session.
       const active = entry;
+      const isStream = req.method === "GET";
       active.lastSeen = Date.now();
-      active.open++;
+      if (isStream) active.streams++;
+      else active.inflight++;
       res.once("close", () => {
-        active.open--;
-        active.lastSeen = Date.now();
+        if (isStream) {
+          active.streams--;
+        } else {
+          active.inflight--;
+          active.lastSeen = Date.now();
+        }
       });
       await active.transport.handleRequest(req, res, body);
     } catch (error) {
