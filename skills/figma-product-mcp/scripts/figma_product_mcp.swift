@@ -906,6 +906,13 @@ func scriptProbe(baseURL: String, project: Project, timeout: TimeInterval = 8) -
     return ["reached": true, "answered": false, "ms": ms, "error": detail]
 }
 
+// Whether the console session is locked. The flag lives in the CoreGraphics
+// session dictionary and reads without Screen Recording or Accessibility.
+func screenIsLocked() -> Bool {
+    let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+    return (session?["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue ?? false
+}
+
 // The Window menu is the one place a window's FILE NAME is still legible when
 // the renderer tree is gone.
 //
@@ -974,6 +981,8 @@ func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, opt
         "doctor": true,
         "figmaPID": app.processIdentifier,
         "accessibilityTrusted": AXIsProcessTrusted(),
+        // A locked session keeps Figma from ever becoming active — no Plugins menu.
+        "screenLocked": screenIsLocked(),
         // The renderer tree: needed to match a window to a file via AX.
         "rendererAccessibilityReady": !webAreas.isEmpty,
         "axWindowCount": axWindows.count,
@@ -1096,6 +1105,43 @@ do {
     if options.doctor {
         runDoctor(app: app, root: root, config: config, options: options)
         exit(0)
+    }
+
+    // A locked screen is not something any later step can work around, and it
+    // used to be reported as something else. With the session locked the front
+    // process is loginwindow: Figma cannot become active (activate() returns
+    // false, `open -a` is a no-op), so its menu bar stays on the browser layout
+    // with no Plugins menu, and the renderer tree reads empty. Measured on
+    // macmini-1, 2026-10-16: every project failed `renderer_accessibility`
+    // after 250s, a Figma relaunch did not help, and the run re-opened all eight
+    // URLs into a Figma it could not drive. Settle from the relay, touch no UI,
+    // and name the real blocker — only a person at the console can unlock it.
+    if screenIsLocked() {
+        let lockedSnapshot = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
+        var allConnected = true
+        let lockedResults: [ProjectResult] = zip(config.projects, results).map { project, entry in
+            var copy = entry
+            if case .current(let version, let channelName) = pluginState(lockedSnapshot, project: project, window: nil),
+               documentMismatch(baseURL: options.relayURL, project: project) == nil {
+                copy.status = "connected"
+                copy.pluginVersion = version
+                copy.channel = channelName
+                copy.detail = "Talk To Figma MCP is connected (screen is locked, so no UI was touched)"
+            } else {
+                allConnected = false
+                copy.status = "screen_locked"
+                copy.step = "screen_locked"
+                copy.detail = "The macOS session is locked (front process loginwindow), so Figma cannot be activated and its Plugins menu cannot be reached — nothing was opened. Someone must unlock this Mac's console, then rerun."
+            }
+            return copy
+        }
+        emitReport(Report(
+            ok: allConnected, dryRun: false,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: lockedResults,
+            relayReachable: lockedSnapshot != nil, relayProtocolVersion: lockedSnapshot?.protocolVersion, menuBar: nil
+        ))
+        exit(allConnected ? 0 : 1)
     }
 
     // Renderer accessibility has to be up BEFORE anything reads the tree.
