@@ -993,6 +993,11 @@ function startIndexJob(opts: { trigger: string; projectFilter?: string; resume?:
           idx.pages = idx.pages.filter((pg) => liveIds.has(pg.pageId));
           idx.builtAt = Date.now();
           saveProjectIndex(idx);
+          // A finished project is never picked again; holding its parsed index
+          // until the whole job ends kept every project in memory at once —
+          // macmini-1's startup build (2026-10-16) peaked at ~910 MB footprint,
+          // 476 MB of it live heap that no collection could free.
+          working.delete(pick.p.projectKey);
           pushEvent({ kind: "index_project_done", projectKey: pick.p.projectKey, name: pick.p.name, pages: idx.pages.length, nodes: idx.nodeCount, failures: pick.p.failures.length, partial: pick.p.partial.length });
           // A completed full build supersedes dirty marks made before it began.
           clearDirtyPages(pick.p.projectKey, indexer.startedAt);
