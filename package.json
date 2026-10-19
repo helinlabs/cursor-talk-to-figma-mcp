@@ -17,7 +17,7 @@
     "socket": "bun run src/socket.ts",
     "setup": "./scripts/setup.sh",
     "build": "tsup",
-    "test:http": "bun run build && node scripts/http-smoke.mjs && node scripts/http-session-eviction.test.mjs && node scripts/http-session-stream-eviction.test.mjs && node scripts/http-relay-socket-release.test.mjs && node scripts/relay-dead-peer.test.mjs && node scripts/relay-memory.test.mjs",
+    "test:http": "bun run build && node scripts/http-smoke.mjs && node scripts/http-session-eviction.test.mjs && node scripts/http-session-stream-eviction.test.mjs && node scripts/http-session-busy-stall.test.mjs && node scripts/http-relay-socket-release.test.mjs && node scripts/relay-dead-peer.test.mjs && node scripts/relay-memory.test.mjs",
     "test:console": "node scripts/viewport-poll-policy.test.mjs && node scripts/health-speed-policy.test.mjs && node scripts/health-deep-pick-policy.test.mjs && node scripts/search-token-match.test.mjs && node scripts/health-report-policy.test.mjs",
     "test": "npm run test:console && npm run test:http",
     "build:watch": "tsup --watch",

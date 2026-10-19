@@ -467,6 +467,7 @@ function persistSelectedProject(project) {
 }
 var SERVER_NAME = "TalkToFigmaMCP";
 var relaySockets = /* @__PURE__ */ new Set();
+var relayHttpTimeoutMs = positiveNumberFromEnv("FIGMA_RELAY_HTTP_TIMEOUT_MS", 15e3);
 function createMcpServer(options = {}) {
   let ws = null;
   let disposed = false;
@@ -500,9 +501,19 @@ function createMcpServer(options = {}) {
     url.pathname = `${url.pathname.replace(/\/$/, "")}/${endpoint.replace(/^\//, "")}`;
     return url.toString();
   }
+  async function fetchRelay(endpoint, init = {}, timeoutMs = relayHttpTimeoutMs) {
+    try {
+      return await fetch(relayHttpUrl(endpoint), { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      if (error?.name === "TimeoutError") {
+        throw new Error(`relay did not answer /${endpoint.replace(/^\//, "")} within ${Math.round(timeoutMs / 1e3)}s`);
+      }
+      throw error;
+    }
+  }
   async function saveToRelayGallery(bytes, suggestedName, extension) {
     const body = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Buffer.from(bytes);
-    const response = await fetch(relayHttpUrl("exports"), {
+    const response = await fetchRelay("exports", {
       method: "POST",
       headers: {
         "Content-Type": "application/octet-stream",
@@ -510,7 +521,7 @@ function createMcpServer(options = {}) {
         "X-Figma-Export-Extension": extension
       },
       body
-    });
+    }, relayHttpTimeoutMs * 4);
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(result.error || `Gallery upload failed with HTTP ${response.status}`);
     return result;
@@ -3370,8 +3381,7 @@ This detailed process ensures you correctly interpret the reaction data, prepare
     }
   }
   async function relayProjectsPayload() {
-    const httpUrl = relayHttpUrl("projects");
-    const response = await fetch(httpUrl);
+    const response = await fetchRelay("projects");
     if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
     return await response.json();
   }
@@ -3388,7 +3398,7 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
   }
   async function knownOfflineProjects(live) {
     try {
-      const response = await fetch(relayHttpUrl("index/status"));
+      const response = await fetchRelay("index/status");
       if (!response.ok) return [];
       const data = await response.json();
       const liveKeys = new Set(live.map((project) => project.projectKey));
@@ -4118,6 +4128,12 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
     job.status = "running";
     publishBulk(job);
     for (let index = 0; index < job.items.length; index++) {
+      if (disposed) {
+        job.status = "error";
+        job.error = "MCP session closed before the job finished";
+        job.currentIndex = null;
+        return;
+      }
       if (job.cancelRequested) {
         job.status = "cancelled";
         job.currentIndex = null;
@@ -4299,8 +4315,7 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
     {},
     async () => {
       try {
-        const httpUrl = relayHttpUrl("channels");
-        const res = await fetch(httpUrl);
+        const res = await fetchRelay("channels");
         if (!res.ok) throw new Error(`relay returned HTTP ${res.status}`);
         const data = await res.json();
         const channels = (data.channels || []).map((c) => ({
@@ -4416,8 +4431,19 @@ If it reports "repair_in_progress" (exit 75), another machine is already repairi
       socket.terminate();
     }
   };
-  const busy = () => pendingRequests.size > 0 || [...bulkJobs.values()].some((job) => job.status === "queued" || job.status === "running" || job.status === "cancelling");
-  return { server, dispose, busy };
+  const work = () => {
+    let lastProgress = 0;
+    for (const request of pendingRequests.values()) lastProgress = Math.max(lastProgress, request.lastActivity);
+    let activeBulk = 0;
+    for (const job of bulkJobs.values()) {
+      if (job.status === "queued" || job.status === "running" || job.status === "cancelling") {
+        activeBulk++;
+        lastProgress = Math.max(lastProgress, job.updatedAt);
+      }
+    }
+    return { pendingRequests: pendingRequests.size, bulkJobs: activeBulk, lastProgress };
+  };
+  return { server, dispose, work };
 }
 var runtimeArgs = process.argv.slice(2);
 var httpMode = runtimeArgs.includes("--http");
@@ -4431,6 +4457,11 @@ var sessionIdleMs = positiveNumberFromEnv("MCP_SESSION_IDLE_MS", 30 * 60 * 1e3);
 var sessionSweepMs = positiveNumberFromEnv("MCP_SESSION_SWEEP_MS", 60 * 1e3);
 var sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
 var sessionStreamIdleMs = positiveNumberFromEnv("MCP_SESSION_STREAM_IDLE_MS", sessionIdleMs * 2);
+var sessionBusyIdleMs = positiveNumberFromEnv("MCP_SESSION_BUSY_IDLE_MS", Math.max(sessionStreamIdleMs, sessionIdleMs) * 2);
+var rpcIdKey = (id) => `${typeof id}:${String(id)}`;
+var rpcMessages = (body) => (Array.isArray(body) ? body : [body]).filter((m) => m && typeof m === "object");
+var rpcRequestIds = (body) => rpcMessages(body).filter((m) => typeof m.method === "string" && m.id !== void 0 && m.id !== null).map((m) => m.id);
+var rpcCancelledIds = (body) => rpcMessages(body).filter((m) => m.method === "notifications/cancelled" && m.params?.requestId !== void 0).map((m) => m.params.requestId);
 async function loadFootprintReader() {
   if (process.platform !== "darwin" || !process.versions.bun) return () => null;
   try {
@@ -4571,11 +4602,22 @@ async function startHTTPServer() {
     }).finally(() => closeSession(entry));
     logger.info(`Evicted MCP session ${id} (${why}); ${sessions.size} left`);
   };
-  const evictable = (entry) => entry.inflight === 0 && !entry.busy();
+  const isBusy = (entry, work = entry.work()) => entry.inflight > 0 || work.pendingRequests > 0 || work.bulkJobs > 0;
+  const lastProgress = (entry, work = entry.work()) => Math.max(entry.lastSeen, work.lastProgress);
+  const isStalled = (entry, now, work = entry.work()) => isBusy(entry, work) && now - lastProgress(entry, work) >= sessionBusyIdleMs;
+  const evictable = (entry, now = Date.now()) => {
+    const work = entry.work();
+    return !isBusy(entry, work) || isStalled(entry, now, work);
+  };
   const idleLimit = (entry) => entry.streams > 0 ? sessionStreamIdleMs : sessionIdleMs;
+  let evictedStalledTotal = 0;
   const sweepIdleSessions = (now = Date.now()) => {
     for (const [id, entry] of sessions) {
-      if (evictable(entry) && now - entry.lastSeen >= idleLimit(entry)) {
+      const work = entry.work();
+      if (isStalled(entry, now, work)) {
+        evictedStalledTotal++;
+        evict(id, entry, `stalled: no progress for ${Math.round((now - lastProgress(entry, work)) / 1e3)}s with ${entry.inflight} open request(s), ${work.pendingRequests} plugin request(s), ${work.bulkJobs} bulk job(s)`);
+      } else if (!isBusy(entry, work) && now - entry.lastSeen >= idleLimit(entry)) {
         evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1e3)}s${entry.streams > 0 ? `, ${entry.streams} open stream(s)` : ""}`);
       }
     }
@@ -4594,12 +4636,24 @@ async function startHTTPServer() {
         for (const socket of relaySockets) if (socket.readyState === WebSocket.OPEN) relaySocketsOpen++;
         let sessionsStreaming = 0;
         let sessionsBusy = 0;
+        let sessionsStalled = 0;
         let oldestIdleMs = 0;
+        let oldestBusyMs = 0;
+        const busyReasons = { inflight: 0, pendingRequests: 0, bulkJobs: 0 };
         const now = Date.now();
         for (const entry2 of sessions.values()) {
           if (entry2.streams > 0) sessionsStreaming++;
-          if (!evictable(entry2)) sessionsBusy++;
-          oldestIdleMs = Math.max(oldestIdleMs, now - entry2.lastSeen);
+          const work = entry2.work();
+          if (isBusy(entry2, work)) {
+            sessionsBusy++;
+            if (isStalled(entry2, now, work)) sessionsStalled++;
+            oldestBusyMs = Math.max(oldestBusyMs, now - lastProgress(entry2, work));
+            busyReasons.inflight += entry2.inflight;
+            busyReasons.pendingRequests += work.pendingRequests;
+            busyReasons.bulkJobs += work.bulkJobs;
+          } else {
+            oldestIdleMs = Math.max(oldestIdleMs, now - entry2.lastSeen);
+          }
         }
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
           ok: true,
@@ -4607,10 +4661,18 @@ async function startHTTPServer() {
           // Holding a GET stream / protected from eviction by work in flight.
           sessionsStreaming,
           sessionsBusy,
+          // Busy, but nothing has moved for sessionBusyIdleSeconds: the next sweep closes them.
+          sessionsStalled,
+          busyReasons,
+          // Idle sessions only. Busy ones are measured from their last progress
+          // (client request, plugin progress/answer, bulk step) in oldestBusySeconds.
           oldestIdleSeconds: Math.round(oldestIdleMs / 1e3),
+          oldestBusySeconds: Math.round(oldestBusyMs / 1e3),
           sessionsEvicted: evictedTotal,
+          sessionsEvictedStalled: evictedStalledTotal,
           sessionIdleSeconds: Math.round(sessionIdleMs / 1e3),
           sessionStreamIdleSeconds: Math.round(sessionStreamIdleMs / 1e3),
+          sessionBusyIdleSeconds: Math.round(sessionBusyIdleMs / 1e3),
           sessionMax,
           // At most one per session; more than `sessions` means sockets leaked.
           relaySockets: relaySockets.size,
@@ -4631,7 +4693,7 @@ async function startHTTPServer() {
       let body;
       if (req.method === "POST") body = await readJSON(req);
       if (!entry && req.method === "POST" && !sessionId && isInitializeRequest(body)) {
-        const { server: mcpServer, dispose, busy } = createMcpServer({ remoteExportBase });
+        const { server: mcpServer, dispose, work } = createMcpServer({ remoteExportBase });
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: uuidv4,
           onsessioninitialized: (id) => {
@@ -4646,7 +4708,17 @@ async function startHTTPServer() {
             sessions.set(id, created);
           }
         });
-        const created = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), inflight: 0, streams: 0, closed: false };
+        const created = {
+          transport,
+          server: mcpServer,
+          dispose,
+          work,
+          lastSeen: Date.now(),
+          inflight: 0,
+          streams: 0,
+          requestStreams: /* @__PURE__ */ new Map(),
+          closed: false
+        };
         await mcpServer.connect(transport);
         const sdkOnClose = transport.onclose;
         transport.onclose = () => {
@@ -4665,15 +4737,28 @@ async function startHTTPServer() {
       active.lastSeen = Date.now();
       if (isStream) active.streams++;
       else active.inflight++;
+      const requestIds = isStream ? [] : rpcRequestIds(body);
+      for (const id of requestIds) active.requestStreams.set(rpcIdKey(id), { res, requests: requestIds.length });
       res.once("close", () => {
         if (isStream) {
           active.streams--;
         } else {
           active.inflight--;
           active.lastSeen = Date.now();
+          for (const id of requestIds) {
+            const key = rpcIdKey(id);
+            if (active.requestStreams.get(key)?.res === res) active.requestStreams.delete(key);
+          }
         }
       });
       await active.transport.handleRequest(req, res, body);
+      for (const id of rpcCancelledIds(body)) {
+        const stream = active.requestStreams.get(rpcIdKey(id));
+        if (stream && stream.requests === 1 && !stream.res.writableEnded) {
+          logger.info(`Closing the response stream of cancelled request ${String(id)}`);
+          stream.res.end();
+        }
+      }
     } catch (error) {
       logger.error(`HTTP request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
