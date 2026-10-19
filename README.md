@@ -151,6 +151,18 @@ legacy `BROKER_PUBLIC_BASE` variable is accepted only as a compatibility input.
 For security, HTTP clients cannot provide `outputPath`; remote exports are
 confined to this directory.
 
+Sessions a client abandons are closed by a sweep. `MCP_SESSION_IDLE_MS`
+(default 30 min) and `MCP_SESSION_STREAM_IDLE_MS` (default 2× that, for a
+session holding a GET stream) bound idle sessions; a session with work in flight
+— an open request, a plugin round-trip, a bulk job — is kept only while that
+work makes progress, and is closed after `MCP_SESSION_BUSY_IDLE_MS` (default 2 h)
+with no progress. Every HTTP call to the relay is bounded by
+`FIGMA_RELAY_HTTP_TIMEOUT_MS` (default 15 s). `/health` separates the two:
+`oldestIdleSeconds` covers idle sessions, `oldestBusySeconds` the busy ones
+(since their last progress), `busyReasons` says what holds them
+(`inflight` / `pendingRequests` / `bulkJobs`), and `sessionsStalled` /
+`sessionsEvictedStalled` count busy sessions that stopped moving.
+
 ### 5. Connect and use
 
 In the AI client:

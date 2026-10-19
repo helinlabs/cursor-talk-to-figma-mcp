@@ -159,6 +159,18 @@ const SERVER_NAME = "TalkToFigmaMCP";
 // count running ahead of the session count is what a socket leak looks like.
 const relaySockets = new Set<WebSocket>();
 
+// Upper bound on one HTTP call to the relay (see fetchRelay).
+const relayHttpTimeoutMs = positiveNumberFromEnv("FIGMA_RELAY_HTTP_TIMEOUT_MS", 15_000);
+
+// What a session has in flight, for the HTTP layer's sweep and /health.
+// lastProgress is the last time any of it moved: a request sent or a progress
+// update / answer from the plugin, a bulk job advancing.
+interface SessionWork {
+  pendingRequests: number;
+  bulkJobs: number;
+  lastProgress: number;
+}
+
 function createMcpServer(options: McpServerOptions = {}) {
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
@@ -201,6 +213,7 @@ interface BulkJob {
   updatedAt: number;
   results: any[];
   cancelRequested: boolean;
+  error?: string;
 }
 
 const bulkJobs = new Map<string, BulkJob>();
@@ -233,9 +246,27 @@ function relayHttpUrl(endpoint: string): string {
   return url.toString();
 }
 
+// Every HTTP call to the relay is bounded. None used to be: a relay that
+// accepted the connection and never answered left the calling tool awaiting
+// forever, its POST response open, and the session counted as busy (inflight)
+// for good — the idle sweep never evicts a busy session. macmini-1, 2026-10-16
+// 18:00 KST onward: sessionsBusy 1 with oldestIdleSeconds growing 1:1 with the
+// wall clock for three days after every Figma plugin dropped.
+async function fetchRelay(endpoint: string, init: RequestInit = {}, timeoutMs = relayHttpTimeoutMs): Promise<Response> {
+  try {
+    return await fetch(relayHttpUrl(endpoint), { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (error) {
+    if ((error as { name?: string } | null)?.name === "TimeoutError") {
+      throw new Error(`relay did not answer /${endpoint.replace(/^\//, "")} within ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  }
+}
+
 async function saveToRelayGallery(bytes: Uint8Array | string, suggestedName: string, extension: string): Promise<any> {
   const body = typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Buffer.from(bytes);
-  const response = await fetch(relayHttpUrl("exports"), {
+  // An upload carries the whole export, so it gets more room than a lookup.
+  const response = await fetchRelay("exports", {
     method: "POST",
     headers: {
       "Content-Type": "application/octet-stream",
@@ -243,7 +274,7 @@ async function saveToRelayGallery(bytes: Uint8Array | string, suggestedName: str
       "X-Figma-Export-Extension": extension,
     },
     body,
-  });
+  }, relayHttpTimeoutMs * 4);
   const result: any = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.error || `Gallery upload failed with HTTP ${response.status}`);
   return result;
@@ -3843,8 +3874,7 @@ async function joinChannel(channelName: string): Promise<void> {
 
 // Function to send commands to Figma
 async function relayProjectsPayload(): Promise<any> {
-  const httpUrl = relayHttpUrl("projects");
-  const response = await fetch(httpUrl);
+  const response = await fetchRelay("projects");
   if (!response.ok) throw new Error(`relay returned HTTP ${response.status}`);
   return (await response.json()) as any;
 }
@@ -3883,7 +3913,7 @@ function repairHint(subject: string): string {
 // fatal: it only costs a less specific message.
 async function knownOfflineProjects(live: any[]): Promise<{ name: string; projectKey: string }[]> {
   try {
-    const response = await fetch(relayHttpUrl("index/status"));
+    const response = await fetchRelay("index/status");
     if (!response.ok) return [];
     const data = (await response.json()) as any;
     const liveKeys = new Set(live.map((project: any) => project.projectKey));
@@ -4750,6 +4780,14 @@ async function runBulk(job: BulkJob): Promise<void> {
   job.status = "running";
   publishBulk(job);
   for (let index = 0; index < job.items.length; index++) {
+    if (disposed) {
+      // dispose() already rejected the item in flight; nobody can poll this job
+      // any more, but do not leave it looking alive.
+      job.status = "error";
+      job.error = "MCP session closed before the job finished";
+      job.currentIndex = null;
+      return;
+    }
     if (job.cancelRequested) {
       job.status = "cancelled";
       job.currentIndex = null;
@@ -4938,8 +4976,7 @@ server.tool(
   {},
   async () => {
     try {
-      const httpUrl = relayHttpUrl("channels");
-      const res = await fetch(httpUrl);
+      const res = await fetchRelay("channels");
       if (!res.ok) throw new Error(`relay returned HTTP ${res.status}`);
       const data: any = await res.json();
       const channels = (data.channels || []).map((c: any) => ({
@@ -5064,13 +5101,22 @@ server.tool(
       socket.terminate();
     }
   };
-  // Whether closing this session now would cut off work in flight: a plugin
-  // round-trip still waiting for its answer, or a bulk job a caller will poll.
-  // The idle sweep below never evicts a busy session.
-  const busy = () =>
-    pendingRequests.size > 0 ||
-    [...bulkJobs.values()].some((job) => job.status === "queued" || job.status === "running" || job.status === "cancelling");
-  return { server, dispose, busy };
+  // Work in flight that closing this session now would cut off: plugin
+  // round-trips still waiting for their answer, bulk jobs a caller will poll.
+  // The HTTP sweep protects a session with work — but only while it moves.
+  const work = (): SessionWork => {
+    let lastProgress = 0;
+    for (const request of pendingRequests.values()) lastProgress = Math.max(lastProgress, request.lastActivity);
+    let activeBulk = 0;
+    for (const job of bulkJobs.values()) {
+      if (job.status === "queued" || job.status === "running" || job.status === "cancelling") {
+        activeBulk++;
+        lastProgress = Math.max(lastProgress, job.updatedAt);
+      }
+    }
+    return { pendingRequests: pendingRequests.size, bulkJobs: activeBulk, lastProgress };
+  };
+  return { server, dispose, work };
 }
 
 const runtimeArgs = process.argv.slice(2);
@@ -5099,12 +5145,22 @@ const sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
 // sessions 106 over a cap of 64, each holding a relay socket, because streams
 // whose client was gone (a dead caller behind the Nexus tunnel) never closed.
 const sessionStreamIdleMs = positiveNumberFromEnv("MCP_SESSION_STREAM_IDLE_MS", sessionIdleMs * 2);
+// Work in flight protects a session from the sweep, but only while it makes
+// progress. The protection had no bound: macmini-1 kept one "busy" session from
+// 2026-10-16 18:00 KST — when all eight Figma plugins dropped — for days
+// (oldestIdleSeconds 146276 on 10-18, 232678 on 10-19, +86402 s in a day). A
+// session whose client has sent nothing and whose work has not moved for this
+// long is closed like an idle one. Legitimate work keeps moving: a plugin
+// command reports progress at least every 60 s or times out, and a bulk job
+// advances an item at a time, so the default (2 h) is many times the longest
+// silence real work produces.
+const sessionBusyIdleMs = positiveNumberFromEnv("MCP_SESSION_BUSY_IDLE_MS", Math.max(sessionStreamIdleMs, sessionIdleMs) * 2);
 
 interface HTTPSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   dispose: () => void;
-  busy: () => boolean;
+  work: () => SessionWork;
   // When the client last sent anything (POST/DELETE, or opened a stream).
   // Holding a stream open is not activity: that is what a vanished client does.
   lastSeen: number;
@@ -5112,8 +5168,21 @@ interface HTTPSession {
   inflight: number;
   // Open GET event streams.
   streams: number;
+  // JSON-RPC request id → the POST response carrying it, for requests whose
+  // response is still open (see the notifications/cancelled handling).
+  requestStreams: Map<string, { res: ServerResponse; requests: number }>;
   closed: boolean;
 }
+
+// JSON-RPC ids are strings or numbers; 1 and "1" are different requests.
+const rpcIdKey = (id: unknown) => `${typeof id}:${String(id)}`;
+const rpcMessages = (body: unknown): any[] => (Array.isArray(body) ? body : [body]).filter((m) => m && typeof m === "object");
+const rpcRequestIds = (body: unknown) =>
+  rpcMessages(body).filter((m) => typeof m.method === "string" && m.id !== undefined && m.id !== null).map((m) => m.id);
+const rpcCancelledIds = (body: unknown) =>
+  rpcMessages(body)
+    .filter((m) => m.method === "notifications/cancelled" && m.params?.requestId !== undefined)
+    .map((m) => m.params.requestId);
 
 // process.memoryUsage().rss is the task's resident size (the same number `ps`
 // shows). On macOS that leaves out pages the kernel compressed or swapped, and
@@ -5319,11 +5388,27 @@ async function startHTTPServer() {
   // Only work in flight protects a session: a request still being answered, a
   // plugin round-trip, a bulk job. An open GET stream does not — it stretches
   // the idle limit (sessionStreamIdleMs) and is otherwise closed with the session.
-  const evictable = (entry: HTTPSession) => entry.inflight === 0 && !entry.busy();
+  // Work protects only while it moves: past sessionBusyIdleMs with neither the
+  // client nor the work showing any sign of life, the session is stalled.
+  const isBusy = (entry: HTTPSession, work = entry.work()) =>
+    entry.inflight > 0 || work.pendingRequests > 0 || work.bulkJobs > 0;
+  const lastProgress = (entry: HTTPSession, work = entry.work()) => Math.max(entry.lastSeen, work.lastProgress);
+  const isStalled = (entry: HTTPSession, now: number, work = entry.work()) =>
+    isBusy(entry, work) && now - lastProgress(entry, work) >= sessionBusyIdleMs;
+  const evictable = (entry: HTTPSession, now = Date.now()) => {
+    const work = entry.work();
+    return !isBusy(entry, work) || isStalled(entry, now, work);
+  };
   const idleLimit = (entry: HTTPSession) => entry.streams > 0 ? sessionStreamIdleMs : sessionIdleMs;
+  let evictedStalledTotal = 0;
   const sweepIdleSessions = (now = Date.now()) => {
     for (const [id, entry] of sessions) {
-      if (evictable(entry) && now - entry.lastSeen >= idleLimit(entry)) {
+      const work = entry.work();
+      if (isStalled(entry, now, work)) {
+        evictedStalledTotal++;
+        evict(id, entry, `stalled: no progress for ${Math.round((now - lastProgress(entry, work)) / 1000)}s with `
+          + `${entry.inflight} open request(s), ${work.pendingRequests} plugin request(s), ${work.bulkJobs} bulk job(s)`);
+      } else if (!isBusy(entry, work) && now - entry.lastSeen >= idleLimit(entry)) {
         evict(id, entry, `idle ${Math.round((now - entry.lastSeen) / 1000)}s${entry.streams > 0 ? `, ${entry.streams} open stream(s)` : ""}`);
       }
     }
@@ -5345,12 +5430,26 @@ async function startHTTPServer() {
         for (const socket of relaySockets) if (socket.readyState === WebSocket.OPEN) relaySocketsOpen++;
         let sessionsStreaming = 0;
         let sessionsBusy = 0;
+        let sessionsStalled = 0;
         let oldestIdleMs = 0;
+        let oldestBusyMs = 0;
+        // What is holding the busy sessions, summed over them: open POST
+        // responses, plugin round-trips awaiting an answer, unfinished bulk jobs.
+        const busyReasons = { inflight: 0, pendingRequests: 0, bulkJobs: 0 };
         const now = Date.now();
         for (const entry of sessions.values()) {
           if (entry.streams > 0) sessionsStreaming++;
-          if (!evictable(entry)) sessionsBusy++;
-          oldestIdleMs = Math.max(oldestIdleMs, now - entry.lastSeen);
+          const work = entry.work();
+          if (isBusy(entry, work)) {
+            sessionsBusy++;
+            if (isStalled(entry, now, work)) sessionsStalled++;
+            oldestBusyMs = Math.max(oldestBusyMs, now - lastProgress(entry, work));
+            busyReasons.inflight += entry.inflight;
+            busyReasons.pendingRequests += work.pendingRequests;
+            busyReasons.bulkJobs += work.bulkJobs;
+          } else {
+            oldestIdleMs = Math.max(oldestIdleMs, now - entry.lastSeen);
+          }
         }
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
           ok: true,
@@ -5358,10 +5457,18 @@ async function startHTTPServer() {
           // Holding a GET stream / protected from eviction by work in flight.
           sessionsStreaming,
           sessionsBusy,
+          // Busy, but nothing has moved for sessionBusyIdleSeconds: the next sweep closes them.
+          sessionsStalled,
+          busyReasons,
+          // Idle sessions only. Busy ones are measured from their last progress
+          // (client request, plugin progress/answer, bulk step) in oldestBusySeconds.
           oldestIdleSeconds: Math.round(oldestIdleMs / 1000),
+          oldestBusySeconds: Math.round(oldestBusyMs / 1000),
           sessionsEvicted: evictedTotal,
+          sessionsEvictedStalled: evictedStalledTotal,
           sessionIdleSeconds: Math.round(sessionIdleMs / 1000),
           sessionStreamIdleSeconds: Math.round(sessionStreamIdleMs / 1000),
+          sessionBusyIdleSeconds: Math.round(sessionBusyIdleMs / 1000),
           sessionMax,
           // At most one per session; more than `sessions` means sockets leaked.
           relaySockets: relaySockets.size,
@@ -5384,7 +5491,7 @@ async function startHTTPServer() {
       if (req.method === "POST") body = await readJSON(req);
 
       if (!entry && req.method === "POST" && !sessionId && isInitializeRequest(body)) {
-        const { server: mcpServer, dispose, busy } = createMcpServer({ remoteExportBase });
+        const { server: mcpServer, dispose, work } = createMcpServer({ remoteExportBase });
         const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: uuidv4,
           onsessioninitialized: (id) => {
@@ -5406,7 +5513,9 @@ async function startHTTPServer() {
             sessions.set(id, created);
           },
         });
-        const created: HTTPSession = { transport, server: mcpServer, dispose, busy, lastSeen: Date.now(), inflight: 0, streams: 0, closed: false };
+        const created: HTTPSession = {
+          transport, server: mcpServer, dispose, work, lastSeen: Date.now(), inflight: 0, streams: 0, requestStreams: new Map(), closed: false,
+        };
         await mcpServer.connect(transport);
         // Chain after connect(): connect() overwrites transport.onclose, so a
         // handler set before it is silently dropped (see closeSession).
@@ -5431,15 +5540,35 @@ async function startHTTPServer() {
       active.lastSeen = Date.now();
       if (isStream) active.streams++;
       else active.inflight++;
+      const requestIds = isStream ? [] : rpcRequestIds(body);
+      for (const id of requestIds) active.requestStreams.set(rpcIdKey(id), { res, requests: requestIds.length });
       res.once("close", () => {
         if (isStream) {
           active.streams--;
         } else {
           active.inflight--;
           active.lastSeen = Date.now();
+          for (const id of requestIds) {
+            const key = rpcIdKey(id);
+            if (active.requestStreams.get(key)?.res === res) active.requestStreams.delete(key);
+          }
         }
       });
       await active.transport.handleRequest(req, res, body);
+      // A cancelled request is never answered: the SDK drops the handler's
+      // result once the request is aborted, and the streaming transport keeps
+      // that request's POST response open until every request on it has an
+      // answer — so it stayed open, and the session busy (inflight), until the
+      // client's connection closed. Behind the Nexus tunnel a gone caller's
+      // connection need not close. Nothing more can be sent on it; end it.
+      // A batch POST with other requests still due is left to finish on its own.
+      for (const id of rpcCancelledIds(body)) {
+        const stream = active.requestStreams.get(rpcIdKey(id));
+        if (stream && stream.requests === 1 && !stream.res.writableEnded) {
+          logger.info(`Closing the response stream of cancelled request ${String(id)}`);
+          stream.res.end();
+        }
+      }
     } catch (error) {
       logger.error(`HTTP request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
