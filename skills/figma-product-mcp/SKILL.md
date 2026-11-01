@@ -44,12 +44,28 @@ Every run writes its JSON report to `~/.talk-to-figma/launcher-report.json` (and
 | `plugin_menu_item_missing` | `Cursor MCP Plugin` is not under `Plugins > Development` in that window. |
 | `renderer_crashed` | The window's Figma renderer had crashed (title and shell intact, but the document replaced by a "Something went wrong" page) and the launcher's Reload click did not bring it back. The launcher repairs this automatically before touching the plugin, so seeing it means the reload itself failed. |
 | `connect_timeout` | The plugin ran, but the relay never reported it connected — or it reconnected still speaking the old version, meaning Figma reloaded stale `code.js`. |
+| `link_down` status | The plugin is connected but the tab's **document cannot reach Figma's servers** (a lookup of a nonexistent id failed with Figma's own `Unable to establish connection to Figma`, on every one of `--link-probes` probes in a row). Re-running the plugin does not fix this; the tab must be reloaded from the server, which a normal run does by itself — see *Link-down tabs* below. The `step` says why this tab was left alone instead: `busy` (requests were running/queued on it), `renderer_accessibility` / `window_missing` (its window could not be found — e.g. a locked console), `unsaved_changes` (closing the tab asked about unsaved work; Cancel was pressed and nothing was discarded — a person must look), `waiting_on_first_repair` (an earlier tab's repair did not restore its link, so this one was not touched), `close_tab_missing` / `close_tab_no_effect` / `save_and_reload_*`, or `repair_disabled` (`--no-link-repair`). |
+| `link_down_after_repair` | The tab was reloaded and the plugin re-attached, but the document still cannot reach Figma's servers. Then it is Figma itself (offline, or a stuck desktop session) — a person decides on restarting Figma. |
 
 Exit codes: `0` everything connected · `1` one or more projects failed (read the report) · `2` usage / config / Accessibility problem · `75` a repair was already running so this run did nothing (**not** a failure — poll `--dry-run` until it reports connected) · `70` unexpected error.
 
 Repair runs are serialised: the mutating path holds an exclusive `flock` on `~/.talk-to-figma/launcher.lock`, because two runs clicking Figma's menus at once fight over which window is frontmost. `--dry-run` never takes the lock, so status checks are always free. The lock is held by the kernel and released when the process exits, so a killed run cannot strand it.
 
 `--dry-run` touches no UI and doubles as a status report: it lists each configured project with its live plugin version, channel, and whether it is connected, stale, or missing.
+
+## Link-down tabs
+
+A connected plugin only proves the tab runs. From 2026-10-30 20:07 KST all eight product tabs on macmini-1 kept a live, current plugin while every server lookup failed — 38 hours, because the launcher only asked the relay whether a plugin was connected. A normal run now also probes each connected project's link (the same nonexistent-id lookup as the health watch's deep check) and, for a tab that failed every probe in a row **and has no requests running or queued**:
+
+1. presses Figma's **Save and reload** banner in that window if it is there (*A new version of Figma Design is available …*); otherwise
+2. closes that file's tab (its own context menu → *Close Tab*, falling back to *File → Close Tab*) and opens the file's URL again — stopping, with Cancel, if Figma asks about unsaved changes;
+3. re-attaches the plugin and probes the link again; only an answered probe counts as connected.
+
+Tabs are repaired **one at a time, each proven before the next**: when every tab is down at once the cause may be Figma itself, and a reopened file would come back just as cut off. The first repair that does not bring its link back stops the rest (`waiting_on_first_repair`), and its own result says `link_down_after_repair` — that is the point to involve a person about Figma itself.
+
+Only the target window is raised; the other windows keep their channels. `--link-check` is the read-only view of the same decision (no lock, no UI): per project the probes, the load and `linked` / `inconclusive` / `busy` / `repair`. A slow probe (`no answer in 15s`) is inconclusive and never triggers a reload. `--no-link-repair` reports link-down tabs without reloading them.
+
+The health watch (`src/health_watch`) shows the same recovery on its card once a project has been link-down for 15 minutes (`HEALTH_LINK_REPAIR_MS`), and runs it once per incident when `HEALTH_LINK_REPAIR_CMD` is set (e.g. to this skill's `scripts/run-broker.sh`; output in `~/.talk-to-figma/link-repair.log`).
 
 ## Fallback
 

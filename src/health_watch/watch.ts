@@ -26,7 +26,10 @@ import { dirname } from "node:path";
 import { homedir } from "node:os";
 import WebSocket from "ws";
 import { PROTOCOL_VERSION } from "../shared/version";
-import { LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, boundedSlackText, replaceableSlackMessage, deliverSlack } from "./report-policy.mjs";
+import {
+  LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, boundedSlackText, replaceableSlackMessage, deliverSlack,
+  LINK_REPAIR_AFTER_MS, trackLinkDown, linkRepairPlan, linkRepairLine, shouldTriggerLinkRepair,
+} from "./report-policy.mjs";
 
 const RELAY_HTTP = process.env.HEALTH_RELAY_HTTP || "http://127.0.0.1:3055";
 const RELAY_WS = process.env.HEALTH_RELAY_WS || "ws://127.0.0.1:3055";
@@ -91,6 +94,16 @@ const DEGRADED_UPDATE_MS = Number(process.env.HEALTH_DEGRADED_UPDATE_MS || 60_00
 // own retry loop is 15s, so anything self-healing is back well inside a single
 // minute-long poll. Two in a row means it did not come back on its own.
 const FAIL_STREAK = Number(process.env.HEALTH_FAIL_STREAK || 2);
+// How long a document must stay link-down before the card names the recovery
+// that works (and, if configured, runs it once).
+const LINK_REPAIR_MS = Number(process.env.HEALTH_LINK_REPAIR_MS || LINK_REPAIR_AFTER_MS);
+// Opt-in: a shell command that runs the launcher's repair, e.g. the device's
+// `~/.codex/skills/figma-product-mcp/scripts/run-broker.sh`. Empty means the
+// card only says what to run. The launcher holds its own lock (exit 75 when a
+// repair is already running), touches only idle link-down tabs, and stops on
+// an unsaved-changes prompt, so one run per incident is safe to automate.
+const LINK_REPAIR_CMD = process.env.HEALTH_LINK_REPAIR_CMD || "";
+const LINK_REPAIR_LOG = `${homedir()}/.talk-to-figma/link-repair.log`;
 
 const STATE_PATH = process.env.HEALTH_STATE_PATH
   || `${homedir()}/.talk-to-figma/health-state.json`;
@@ -158,6 +171,12 @@ type State = {
   deepDurations: Record<string, number[]>;
   slowSince: Record<string, number>;     // an episode in progress, per project
   slowAlertedAt: Record<string, number>; // last alert per project, for the cooldown
+  // When each project's document was first seen unable to reach Figma's
+  // servers, per its deep verdicts. Separate from downSince (plugin missing):
+  // the plugin is fine here, and the fix is a different one.
+  linkDownSince: Record<string, number>;
+  linkRepairTriggeredAt: number;  // last automatic repair run, 0 = never
+  linkRepairResult: { at: number; code: number } | null;
 };
 
 function loadState(): State {
@@ -182,6 +201,9 @@ function loadState(): State {
         : durationsFromHistory(Array.isArray(loaded.deepHistory) ? loaded.deepHistory : []),
       slowSince: loaded.slowSince && typeof loaded.slowSince === "object" ? loaded.slowSince : {},
       slowAlertedAt: loaded.slowAlertedAt && typeof loaded.slowAlertedAt === "object" ? loaded.slowAlertedAt : {},
+      linkDownSince: loaded.linkDownSince && typeof loaded.linkDownSince === "object" ? loaded.linkDownSince : {},
+      linkRepairTriggeredAt: Number(loaded.linkRepairTriggeredAt) || 0,
+      linkRepairResult: loaded.linkRepairResult ?? null,
     };
   } catch {
     return blankState();
@@ -198,7 +220,7 @@ function durationsFromHistory(history: Array<{ project?: string; ok?: boolean; m
   return out;
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {} };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {}, linkDownSince: {}, linkRepairTriggeredAt: 0, linkRepairResult: null };
 }
 function saveState(state: State): void {
   try {
@@ -1123,9 +1145,55 @@ function degradedText(state: State, health: Health): string {
     lines.push(`• 프로젝트별 상태:\n${projectLines(health, state)}`);
   }
   lines.push(`• 연결 표시와 문서 조회 결과는 별도입니다. 응답 지연만으로 탭을 닫지 마세요.`);
+  const repairLine = linkRepairLine(linkPlan(state, health), displayName);
+  if (repairLine) lines.push(repairLine);
+  if (state.linkRepairTriggeredAt && state.linkRepairTriggeredAt >= state.since) {
+    const result = state.linkRepairResult && state.linkRepairResult.at >= state.linkRepairTriggeredAt
+      ? `exit ${state.linkRepairResult.code} · 로그 ~/.talk-to-figma/link-repair.log`
+      : "실행 중";
+    lines.push(`• 자동 복구: ${clock(state.linkRepairTriggeredAt)} 실행 (${result})`);
+  }
   lines.push(`• 플러그인 재연결: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
   lines.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
   return boundedSlackText(lines.join("\n"));
+}
+
+function linkPlan(state: State, health: Health) {
+  const load: Record<string, number> = {};
+  for (const entry of health.load) load[nameKey(entry.name)] = (entry.running || 0) + (entry.pending || 0);
+  return linkRepairPlan(state.linkDownSince, load, Date.now(), LINK_REPAIR_MS);
+}
+
+// Fire-and-forget: the launcher can take minutes, and the tick must not wait
+// on it (the tick watchdog would kill the watcher). Its outcome lands in the
+// incident thread, and the next deep turns re-probe the repaired projects.
+function runLinkRepair(targets: string[]): void {
+  state.linkRepairTriggeredAt = Date.now();
+  state.linkRepairResult = null;
+  pendingChanges.push(`:wrench: ${clock()} · 문서 서버 연결 끊김 자동 복구 시작 — ${targets.map(displayName).join(", ")}`);
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(["/bin/zsh", "-c", LINK_REPAIR_CMD], { stdout: "pipe", stderr: "pipe" });
+  } catch (error) {
+    state.linkRepairResult = { at: Date.now(), code: -1 };
+    pendingChanges.push(`:warning: ${clock()} · 자동 복구를 시작하지 못함: ${String(error).slice(0, 200)}`);
+    return;
+  }
+  void (async () => {
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout as ReadableStream).text(),
+      new Response(proc.stderr as ReadableStream).text(),
+    ]);
+    const code = await proc.exited;
+    try {
+      writeFileSync(LINK_REPAIR_LOG, `${new Date().toISOString()} exit ${code}\n${out}\n${err}`);
+    } catch {}
+    state.linkRepairResult = { at: Date.now(), code };
+    pendingChanges.push(`${code === 0 ? ":white_check_mark:" : ":warning:"} ${clock()} · 자동 복구 끝 (exit ${code}`
+      + `${code === 75 ? " — 다른 복구가 이미 진행 중" : ""}) · 로그 ~/.talk-to-figma/link-repair.log`);
+    lastDeepAt = 0;   // re-probe now rather than after a full interval
+    saveState(state);
+  })();
 }
 
 function recoveredText(state: State, health: Health): string {
@@ -1423,6 +1491,22 @@ async function runTick(): Promise<void> {
     (title) => state.deepResults[nameKey(title)]?.ok === false);
   if (failingDeep.length) damped.ok = false;
   damped.failingDeep = failingDeep;
+
+  const expectedKeys = new Set(health.expected.map(nameKey));
+  state.linkDownSince = trackLinkDown(
+    state.linkDownSince,
+    Object.fromEntries(Object.entries(state.deepResults).filter(([key]) => expectedKeys.has(key))),
+    Date.now());
+  // Only inside an incident that is already on the card, so the run is tied to
+  // that incident's clock and cannot repeat on the tick that opens it.
+  if (!damped.ok && state.status === "degraded") {
+    const plan = linkPlan(state, damped);
+    if (shouldTriggerLinkRepair(plan, {
+      configured: Boolean(LINK_REPAIR_CMD),
+      triggeredAt: state.linkRepairTriggeredAt,
+      incidentSince: state.since,
+    })) runLinkRepair(plan.ready);
+  }
 
   last = damped;
   await report(state, damped);
