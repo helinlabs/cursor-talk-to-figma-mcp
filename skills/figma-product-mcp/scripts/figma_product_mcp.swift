@@ -67,6 +67,14 @@ struct Options {
     var allProjects = false
     var forceReconnect = false
     var doctor = false
+    // Read-only: probe each connected tab's server link and print what a run
+    // would do about it. Never locked, never touches the UI.
+    var linkCheck = false
+    // A normal run reloads tabs whose document lost Figma's servers. This turns
+    // that branch off (report only), for a run that must not reload anything.
+    var linkRepair = true
+    // Consecutive failed link probes before a tab counts as down.
+    var linkProbes = 2
     var timeout: TimeInterval = 25
     var relayURL = ProcessInfo.processInfo.environment["TALK_TO_FIGMA_RELAY_URL"] ?? "http://127.0.0.1:3055"
     var selectedIDs = Set<String>()
@@ -97,18 +105,32 @@ func parseOptions() throws -> Options {
         case "--all": options.allProjects = true
         case "--force-reconnect": options.forceReconnect = true
         case "--doctor": options.doctor = true
+        case "--link-check": options.linkCheck = true
+        case "--no-link-repair": options.linkRepair = false
+        case "--link-probes":
+            guard !args.isEmpty, let value = Int(args.removeFirst()), value > 0 else {
+                throw LauncherError.usage("--link-probes requires a positive integer")
+            }
+            options.linkProbes = value
         case "--prompt-accessibility": options.promptAccessibility = true
         case "--help", "-h":
             print("""
             Usage: run.sh [--dry-run] [--open-only] [--all | --project ID]
                           [--force-reconnect] [--timeout SECONDS] [--relay-url URL]
-                          [--prompt-accessibility]
+                          [--prompt-accessibility] [--link-check]
+                          [--no-link-repair] [--link-probes N]
 
             --force-reconnect  Re-run the plugin even in windows that are already
                                connected. Needed after a plugin code deploy: Figma
                                only re-reads code.js when the plugin is run again.
                                (A plugin whose version differs from the relay's is
                                re-run anyway, without this flag.)
+            --link-check       Read-only. Probe every connected tab's link to
+                               Figma's servers and print what a run would do.
+            --no-link-repair   Report tabs whose document lost Figma's servers
+                               instead of reloading them.
+            --link-probes N    Consecutive failed probes before a tab counts as
+                               link-down (default 2).
 
             Exit codes: 0 all target projects connected · 1 one or more projects
             failed (see each result's status/step) · 2 usage/config/accessibility
@@ -481,6 +503,9 @@ struct RelayConnection {
 struct RelaySnapshot {
     let protocolVersion: String?
     let connectionsByDocument: [String: [RelayConnection]]
+    // Requests running or queued on each document right now. A tab someone is
+    // driving must not be reloaded under them, whatever its link says.
+    var loadByDocument: [String: Int] = [:]
 }
 
 func fetchRelaySnapshot(baseURL: String, timeout: TimeInterval = 3) -> RelaySnapshot? {
@@ -498,8 +523,11 @@ func fetchRelaySnapshot(baseURL: String, timeout: TimeInterval = 3) -> RelaySnap
           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
 
     var byDocument: [String: [RelayConnection]] = [:]
+    var load: [String: Int] = [:]
     for project in root["projects"] as? [[String: Any]] ?? [] {
         guard let name = project["name"] as? String else { continue }
+        load[name] = ((project["runningRequests"] as? NSNumber)?.intValue ?? 0)
+            + ((project["pendingRequests"] as? NSNumber)?.intValue ?? 0)
         var live: [RelayConnection] = []
         for connection in project["connections"] as? [[String: Any]] ?? [] {
             let channel = connection["channel"] as? String ?? ""
@@ -510,7 +538,7 @@ func fetchRelaySnapshot(baseURL: String, timeout: TimeInterval = 3) -> RelaySnap
         }
         if !live.isEmpty { byDocument[name] = live }
     }
-    return RelaySnapshot(protocolVersion: root["protocolVersion"] as? String, connectionsByDocument: byDocument)
+    return RelaySnapshot(protocolVersion: root["protocolVersion"] as? String, connectionsByDocument: byDocument, loadByDocument: load)
 }
 
 // A slow relay is not an absent relay. The decisions that hinge on "did the
@@ -593,6 +621,156 @@ func documentMismatch(baseURL: String, project: Project) -> String? {
     if live == project.displayTitle { return nil }
     if live.localizedCaseInsensitiveContains(project.title) { return nil }
     return live
+}
+
+// ---------------------------------------------------------------------------
+// Is the tab's document still linked to Figma's servers?
+//
+// A connected plugin proves the tab runs and answers. It does not prove the
+// document behind it still talks to Figma. From 2026-10-30 20:07 KST all eight
+// product tabs on macmini-1 kept a live, current plugin and listed their pages,
+// while every server lookup failed after 10s with "Unable to establish
+// connection to Figma" — for 38 hours, because this launcher only ever asked
+// the relay whether a plugin was connected and so reported all eight as fine.
+// The plugin's own note (2026-10-08, GW_Product) is the fix: reload the file
+// from the server. Re-running the plugin re-attaches to the same frozen
+// document and changes nothing.
+//
+// The probe is the one the health watch uses: look up an id that cannot exist.
+// A linked document answers null in a few hundred ms; an unlinked one throws
+// Figma's own connection error after 10s. A local deadline alone proves
+// nothing (a busy or swapping host is slow, not disconnected), so only Figma's
+// error counts as down.
+// ---------------------------------------------------------------------------
+// >>> link-policy (pure; scripts/launcher-link-policy.test.mjs compiles this block)
+enum LinkState {
+    case up(ms: Int)
+    case down(ms: Int, error: String)
+    case unknown(String)   // timeout, relay error, old plugin — not a verdict
+
+    var isDown: Bool { if case .down = self { return true } else { return false } }
+    var summary: String {
+        switch self {
+        case .up(let ms): return "link ok (\(ms)ms)"
+        case .down(let ms, let error): return "link down after \(ms)ms: \(error)"
+        case .unknown(let why): return "link unknown: \(why)"
+        }
+    }
+}
+
+func classifyLinkVerdict(_ verdict: [String: Any]) -> LinkState {
+    let ms = (verdict["ms"] as? NSNumber)?.intValue ?? 0
+    if verdict["ok"] as? Bool == true { return .up(ms: ms) }
+    let error = verdict["error"] as? String ?? "no error text"
+    if verdict["timeout"] as? Bool == true { return .unknown("no answer in 15s") }
+    if error.localizedCaseInsensitiveContains("Unable to establish connection to Figma") {
+        return .down(ms: ms, error: error)
+    }
+    return .unknown(error)
+}
+
+enum LinkDecision: String {
+    case linked        // nothing to do
+    case inconclusive  // no verdict — leave the tab alone
+    case busy          // down, but someone's requests are on it — never reload under them
+    case repair        // down on every probe and idle: reload this tab only
+}
+
+func linkRepairDecision(_ probes: [LinkState], required: Int, load: Int) -> LinkDecision {
+    if probes.contains(where: { if case .up = $0 { return true } else { return false } }) { return .linked }
+    guard probes.count >= max(1, required), probes.allSatisfy(\.isDown) else { return .inconclusive }
+    return load > 0 ? .busy : .repair
+}
+
+// Is this a prompt about unsaved work? Either sign is enough: a false alarm
+// costs one skipped repair, a missed prompt could cost someone's work.
+let discardWords = ["Don't save", "Don’t save", "Discard", "Close without saving", "Delete changes", "저장 안 함", "저장하지 않음", "변경 사항 삭제", "버리기"]
+let unsavedWords = ["unsaved", "not been saved", "haven't been saved", "haven’t been saved", "저장되지 않", "저장하지 않은"]
+let cancelWords = ["Cancel", "Keep editing", "Stay", "취소"]
+
+func asksAboutUnsavedWork(texts: [String], buttons: [String]) -> Bool {
+    texts.contains { text in unsavedWords.contains { text.localizedCaseInsensitiveContains($0) } }
+        || buttons.contains { title in discardWords.contains { title.localizedCaseInsensitiveContains($0) } }
+}
+
+func cancelButtonIndex(_ buttons: [String]) -> Int? {
+    buttons.firstIndex { title in cancelWords.contains { title.caseInsensitiveCompare($0) == .orderedSame } }
+}
+
+// <<< link-policy
+
+let linkProbeCode = """
+const started = Date.now();
+let timer = null;
+const verdict = await Promise.race([
+  figma.getNodeByIdAsync("999999999:999999999").then(
+    () => ({ ok: true }),
+    (e) => ({ ok: false, error: String((e && e.message) || e) })),
+  new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, timeout: true, error: "no answer in 15000ms" }), 15000); }),
+]);
+if (timer) clearTimeout(timer);
+verdict.ms = Date.now() - started;
+return verdict;
+"""
+
+func linkProbe(baseURL: String, project: Project) -> LinkState {
+    var components = URLComponents(string: baseURL.hasSuffix("/") ? baseURL + "script/run" : baseURL + "/script/run")
+    components?.queryItems = [URLQueryItem(name: "project", value: project.displayTitle)]
+    guard let url = components?.url else { return .unknown("bad relay URL") }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 30
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["code": linkProbeCode])
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    guard semaphore.wait(timeout: .now() + 31) == .success,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return .unknown("relay did not answer")
+    }
+    guard root["ok"] as? Bool == true,
+          let encoded = root["result"] as? String,
+          let verdict = try? JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String: Any] else {
+        return .unknown((root["error"] as? String) ?? "script did not run")
+    }
+    return classifyLinkVerdict(verdict)
+}
+
+// Probe up to `attempts` times, stopping at the first answer that is not
+// "down". One failed lookup can be a blip on Figma's side; a tab is only
+// reloaded when every probe in a row came back with Figma's connection error.
+func linkProbes(baseURL: String, project: Project, attempts: Int, gap: TimeInterval = 3) -> [LinkState] {
+    var seen: [LinkState] = []
+    for attempt in 1...max(1, attempts) {
+        let state = linkProbe(baseURL: baseURL, project: project)
+        seen.append(state)
+        if !state.isDown { break }
+        if attempt < attempts { Thread.sleep(forTimeInterval: gap) }
+    }
+    return seen
+}
+
+// After a reload the document needs a moment to finish syncing; give it a few
+// probes and take the first that answers.
+func linkRecovery(baseURL: String, project: Project, attempts: Int = 4, gap: TimeInterval = 5) -> LinkState {
+    var last: LinkState = .unknown("not probed")
+    for attempt in 1...attempts {
+        last = linkProbe(baseURL: baseURL, project: project)
+        if case .up = last { return last }
+        if attempt < attempts { Thread.sleep(forTimeInterval: gap) }
+    }
+    return last
+}
+
+func relayLoad(_ snapshot: RelaySnapshot?, project: Project) -> Int {
+    guard let snapshot else { return 0 }
+    if let exact = snapshot.loadByDocument[project.displayTitle] { return exact }
+    return snapshot.loadByDocument.first { $0.key.localizedCaseInsensitiveContains(project.title) }?.value ?? 0
 }
 
 enum PluginState {
@@ -815,6 +993,132 @@ func activatePlugin(
         )
     }
     return .connected(version: version, channel: channelName)
+}
+
+// ---------------------------------------------------------------------------
+// Reload one link-down tab from Figma's servers.
+//
+// Two ways back, in order:
+//   1. Figma's own "A new version of Figma Design is available … [Save and
+//      reload]" banner. A tab that shows it has stopped taking server edits;
+//      the button saves and reloads that tab and nothing else (macmini-1,
+//      2026-10-01: D_Product top-level 14→42, pages 4→5).
+//   2. No banner: close the file's tab and open its URL again, which loads the
+//      document from the server (the plugin note's fix, 2026-10-08).
+//
+// Only the target window is raised; the others keep their plugin channels.
+// Closing a tab is the one step that could lose work, so a dialog about
+// unsaved changes stops the repair: Cancel is pressed, never a discard button,
+// and the run reports it for a person to look at.
+// ---------------------------------------------------------------------------
+enum LinkRepairOutcome {
+    case reloaded(String)                    // how; the window stays
+    case reopen                              // tab closed — open the URL again
+    case failed(step: String, detail: String)
+}
+
+let closeTabTitles = ["Close Tab", "Close tab", "탭 닫기"]
+
+func saveAndReloadButton(_ window: AXUIElement) -> AXUIElement? {
+    descendants(window).first {
+        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("Save and reload")
+    }
+}
+
+func raiseOnly(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement) {
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+    app.activate(options: [.activateAllWindows])
+    _ = waitUntil(timeout: 2) { (axValue(window, kAXMainAttribute as CFString) as? Bool) ?? false }
+}
+
+// Whatever Figma put up after a close was asked for: a native sheet/dialog or
+// a modal inside the web content. Returns its text when it is about unsaved
+// work, so the caller can stop.
+func unsavedChangesPrompt(_ appElement: AXUIElement, window: AXUIElement?) -> (text: String, cancel: AXUIElement?)? {
+    var roots = windows(appElement).filter {
+        let subrole = axString($0, kAXSubroleAttribute as CFString) ?? ""
+        return subrole == "AXDialog" || subrole == "AXSystemDialog"
+    }
+    if let window { roots.append(window) }
+    for root in roots {
+        let elements = descendants(root)
+        let texts = elements.map(axText)
+        let buttons = elements.filter { role($0) == "AXButton" }
+        let titles = buttons.map(axText)
+        guard asksAboutUnsavedWork(texts: texts, buttons: titles) else { continue }
+        let cancel = cancelButtonIndex(titles).map { buttons[$0] }
+        let summary = texts.filter { !$0.isEmpty }.prefix(6).joined(separator: " / ")
+        return (String(summary.prefix(300)), cancel)
+    }
+    return nil
+}
+
+func closeProjectTab(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> LinkRepairOutcome {
+    // The tab's own context menu names the tab it acts on, so it cannot close
+    // a neighbour that happens to be active. File > Close Tab is the fallback
+    // and only runs once the design window is key.
+    var pressed = false
+    if let (tabWindow, tab) = projectTab(appElement, project: project), CFEqual(tabWindow, window) {
+        raiseOnly(app, appElement: appElement, window: window)
+        if rightClick(tab) {
+            _ = waitUntil(timeout: 2) { closeTabTitles.contains { menuItem(appElement, named: $0) != nil } }
+            if let item = closeTabTitles.lazy.compactMap({ menuItem(appElement, named: $0) }).first, press(item) {
+                pressed = true
+            } else {
+                dismissOpenMenus()
+            }
+        }
+    }
+    if !pressed {
+        guard focusWindow(app, appElement: appElement, project: project, window: window, timeout: timeout),
+              let file = menuBarItem(appElement, named: "File"), press(file) else {
+            return .failed(step: "close_tab_unreachable", detail: "Could not make this window key to close the file's tab")
+        }
+        _ = waitUntil(timeout: 2) { closeTabTitles.contains { submenuItem(file, named: $0) != nil } }
+        guard let item = closeTabTitles.lazy.compactMap({ submenuItem(file, named: $0) }).first, press(item) else {
+            dismissOpenMenus()
+            return .failed(step: "close_tab_missing", detail: "Neither the tab's context menu nor File has Close Tab")
+        }
+    }
+    // Watch for an unsaved-work prompt for a few seconds before trusting the
+    // tab's disappearance — a prompt is exactly what keeps it there.
+    let deadline = Date().addingTimeInterval(min(timeout, 8))
+    while Date() < deadline {
+        let stillThere = projectWindow(appElement, project: project)
+        if let prompt = unsavedChangesPrompt(appElement, window: stillThere) {
+            if let cancel = prompt.cancel { _ = press(cancel) || leftClick(cancel) }
+            return .failed(
+                step: "unsaved_changes",
+                detail: "Closing the tab asked about unsaved work — pressed \(prompt.cancel == nil ? "nothing (no Cancel found; the prompt is still up)" : "Cancel"), nothing was discarded. A person must look at this tab: \(prompt.text)"
+            )
+        }
+        if stillThere == nil { return .reopen }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+    }
+    return projectWindow(appElement, project: project) == nil
+        ? .reopen
+        : .failed(step: "close_tab_no_effect", detail: "Close Tab was pressed but the file's tab is still open")
+}
+
+func reloadFromServer(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> LinkRepairOutcome {
+    if let banner = saveAndReloadButton(window) {
+        raiseOnly(app, appElement: appElement, window: window)
+        guard press(banner) || leftClick(banner) else {
+            return .failed(step: "save_and_reload_press", detail: "Found Figma's Save and reload banner but could not press it")
+        }
+        // The reload replaces the page; wait for the banner to go and the
+        // document to be back before anyone re-runs the plugin in it.
+        let back = waitUntil(timeout: max(timeout, 30), interval: 0.5) {
+            guard let current = projectWindow(appElement, project: project) else { return false }
+            return saveAndReloadButton(current) == nil && rendererIsUp(current)
+        }
+        return back
+            ? .reloaded("save_and_reload")
+            : .failed(step: "save_and_reload_timeout", detail: "Pressed Save and reload but the document did not come back")
+    }
+    return closeProjectTab(app, appElement: appElement, project: project, window: window, timeout: timeout)
 }
 
 // stdout for the caller, stderr so a nonzero exit still carries the reason
@@ -1050,6 +1354,46 @@ do {
         exit(0)
     }
 
+    // Read-only like --dry-run, and unlocked for the same reason: it is how a
+    // caller (or the health watch's card) sees whether a run would reload
+    // anything before asking for one. Slower — up to ~25s per down tab.
+    if options.linkCheck {
+        let probe = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
+        var rows: [[String: Any]] = []
+        var allLinked = true
+        for project in config.projects {
+            var row: [String: Any] = ["id": project.id, "title": project.title]
+            guard case .current(_, let channelName) = pluginState(probe, project: project, window: nil) else {
+                row["relay"] = probe == nil ? "unreachable" : "no current plugin"
+                row["decision"] = "plugin_first"
+                allLinked = false
+                rows.append(row)
+                continue
+            }
+            let probes = linkProbes(baseURL: options.relayURL, project: project, attempts: options.linkProbes)
+            let load = relayLoad(probe, project: project)
+            let decision = linkRepairDecision(probes, required: options.linkProbes, load: load)
+            if decision != .linked { allLinked = false }
+            row["channel"] = channelName ?? ""
+            row["load"] = load
+            row["probes"] = probes.map(\.summary)
+            row["decision"] = decision.rawValue
+            rows.append(row)
+        }
+        let report: [String: Any] = [
+            "linkCheck": true,
+            "ok": allLinked,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "relayReachable": probe != nil,
+            "projects": rows,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]),
+           let text = String(data: data, encoding: .utf8) {
+            print(text)
+        }
+        exit(0)
+    }
+
     // Everything past here mutates the UI, so serialise it.
     //
     // The grace period is deliberately short. Most collisions are several
@@ -1161,7 +1505,122 @@ do {
         exit(1)
     }
 
+    // A connected plugin on a document that lost Figma's servers is not
+    // connected in any sense a caller cares about: every lookup of a node the
+    // tab does not hold fails, and page listings come back short without an
+    // error. Find those tabs and reload them from the server — Save and reload
+    // when Figma offers it, otherwise close and reopen the tab — then re-attach
+    // the plugin and prove the link. Only an idle tab is touched, and only
+    // after every probe in a row came back with Figma's connection error.
+    var linkHeld = Set<String>()               // handled here; its result is final
+    var linkCanaryFailed: String? = nil
+
+    // Open (after a close), give the file its own window, run the plugin, and
+    // only call it connected once the document answers Figma's servers. The
+    // relay may still list the frozen tab's old socket for a moment, so a
+    // connect alone proves nothing here.
+    func reattachAfterReload(index: Int, project: Project, how: String, oldChannel: String?) {
+        func fail(_ step: String, _ detail: String) {
+            results[index].status = "plugin_failed"
+            results[index].step = step
+            results[index].detail = detail
+        }
+        // Let the frozen tab's plugin socket go first, or the handshake below
+        // is satisfied by the very connection the reload just killed.
+        if let oldChannel {
+            _ = waitUntil(timeout: 30, interval: 1) {
+                guard let snapshot = fetchRelaySnapshot(baseURL: options.relayURL) else { return false }
+                return relayConnection(snapshot, for: project)?.channel != oldChannel
+            }
+        }
+        guard openProject(project, app: app, appElement: root, timeout: options.timeout) else {
+            return fail("open_failed", "Reloaded the tab (\(how)) but the file did not open again before timeout")
+        }
+        guard splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout),
+              let window = projectWindow(root, project: project) else {
+            return fail("separation_failed", "Reloaded the tab (\(how)) but could not give the file its own window")
+        }
+        let outcome = activatePlugin(
+            app, appElement: root, window: window, project: project,
+            pluginTitle: config.pluginMenuTitle, relayURL: options.relayURL,
+            relayReachable: true, timeout: options.timeout
+        )
+        guard case .connected(let version, let channelName) = outcome else {
+            if case .failed(let step, let detail, _) = outcome { fail(step, "Reloaded the tab (\(how)); \(detail)") }
+            return
+        }
+        results[index].pluginVersion = version
+        results[index].channel = channelName ?? channel(in: window)
+        if let live = documentMismatch(baseURL: options.relayURL, project: project) {
+            return fail("wrong_document", "Reloaded the tab (\(how)) but the plugin answers from \(live)")
+        }
+        let link = linkRecovery(baseURL: options.relayURL, project: project)
+        guard case .up = link else {
+            return fail("link_down_after_repair", "Reloaded the tab (\(how)) and re-attached the plugin, but the document still cannot reach Figma's servers — \(link.summary). Figma itself may be offline or its session stuck; that needs a person (check its connection, or restart Figma)")
+        }
+        results[index].status = "connected"
+        results[index].step = nil
+        results[index].detail = "Document reloaded from Figma's servers (\(how)) and plugin re-attached — \(link.summary)"
+    }
+    if !options.openOnly {
+        for (index, project) in config.projects.enumerated() where healthy[project.id] != nil {
+            let probes = linkProbes(baseURL: options.relayURL, project: project, attempts: options.linkProbes)
+            let load = relayLoad(snapshot, project: project)
+            let last = probes.last?.summary ?? "no probe"
+            func hold(_ step: String, _ detail: String) {
+                linkHeld.insert(project.id)
+                results[index].status = "link_down"
+                results[index].step = step
+                results[index].detail = "\(detail) (\(last))"
+                results[index].pluginVersion = healthy[project.id]?.version
+                results[index].channel = healthy[project.id]?.channel
+            }
+            switch linkRepairDecision(probes, required: options.linkProbes, load: load) {
+            case .linked, .inconclusive:
+                continue
+            case .busy:
+                hold("busy", "Document lost Figma's servers, but \(load) request(s) are running or queued on it — not reloaded under them. Rerun once it is idle")
+                healthy[project.id] = nil
+            case .repair:
+                guard options.linkRepair else {
+                    hold("repair_disabled", "Document lost Figma's servers; --no-link-repair, so the tab was not reloaded")
+                    healthy[project.id] = nil
+                    continue
+                }
+                guard accessibilityReady, let window = projectWindow(root, project: project) else {
+                    hold(accessibilityReady ? "window_missing" : "renderer_accessibility",
+                         "Document lost Figma's servers, but its window cannot be found to reload it — Save and reload or close and reopen this file's tab by hand, then rerun")
+                    healthy[project.id] = nil
+                    continue
+                }
+                let oldChannel = healthy[project.id]?.channel ?? nil
+                healthy[project.id] = nil
+                // One tab at a time, each proven before the next. When every
+                // tab is down at once the cause may be Figma itself, and then
+                // a reopened file would come back just as cut off — or not
+                // load at all. The first failure stops the rest.
+                if let failed = linkCanaryFailed {
+                    hold("waiting_on_first_repair", "Document lost Figma's servers; not reloaded because reloading \(failed) did not bring its link back, so Figma itself is the likely cause")
+                    continue
+                }
+                linkHeld.insert(project.id)
+                let how: String
+                switch reloadFromServer(app, appElement: root, project: project, window: window, timeout: options.timeout) {
+                case .reloaded(let way): how = way
+                case .reopen: how = "close_and_reopen"
+                case .failed(let step, let detail):
+                    hold(step, detail)
+                    if step != "unsaved_changes" { linkCanaryFailed = project.title }
+                    continue
+                }
+                reattachAfterReload(index: index, project: project, how: how, oldChannel: oldChannel)
+                if results[index].status != "connected" { linkCanaryFailed = project.title }
+            }
+        }
+    }
+
     for (index, project) in config.projects.enumerated() {
+        if linkHeld.contains(project.id) { continue }
         if alreadySatisfied(project), let live = healthy[project.id] {
             results[index].status = "connected"
             results[index].pluginVersion = live.version
