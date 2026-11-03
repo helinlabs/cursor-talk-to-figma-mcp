@@ -947,20 +947,37 @@ func activatePlugin(
             menuBar: titles
         )
     }
-    guard let plugins = menuBarItem(appElement, named: "Plugins"), press(plugins) else {
-        return .failed(step: "plugins_menu_press", detail: "Could not open Figma's Plugins menu", menuBar: menuBarTitles(appElement))
-    }
     // A file the launcher just opened has not finished registering its
     // development plugins yet, and 3s was not enough for one: `--project
     // f-product` failed with this step, yet a dump showed the item present and
     // an immediate retry against the now-warm document connected. Nothing on
     // the healthy path waits longer — the item is already there — so this only
     // stops a cold open from being called a missing plugin.
+    //
+    // Waiting with the menu held open is not enough on its own: Figma builds
+    // the Plugins menu when it opens, so a menu opened before the document
+    // registered its plugins never grows the item. macmini_m1, 2026-11-03: the
+    // link repair closed and reopened CO_Product, the item stayed missing for
+    // the whole 12s, and a rerun seconds later connected at once. So close the
+    // menu and open it again, a few times, before calling the plugin missing.
     let menuItemWait = max(3, min(timeout, 12))
-    guard waitUntil(timeout: menuItemWait, { menuItem(appElement, named: pluginTitle) != nil }),
-          let plugin = menuItem(appElement, named: pluginTitle) else {
+    var found: AXUIElement?
+    for attempt in 0..<3 {
+        if attempt > 0 {
+            dismissOpenMenus()
+            Thread.sleep(forTimeInterval: 3)
+        }
+        guard let plugins = menuBarItem(appElement, named: "Plugins"), press(plugins) else {
+            return .failed(step: "plugins_menu_press", detail: "Could not open Figma's Plugins menu", menuBar: menuBarTitles(appElement))
+        }
+        if waitUntil(timeout: menuItemWait, { menuItem(appElement, named: pluginTitle) != nil }) {
+            found = menuItem(appElement, named: pluginTitle)
+            if found != nil { break }
+        }
+    }
+    guard let plugin = found else {
         dismissOpenMenus()
-        return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window", menuBar: nil)
+        return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window (Plugins menu opened 3 times)", menuBar: nil)
     }
     guard press(plugin) else {
         dismissOpenMenus()
