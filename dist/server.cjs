@@ -4480,6 +4480,7 @@ var sessionSweepMs = positiveNumberFromEnv("MCP_SESSION_SWEEP_MS", 60 * 1e3);
 var sessionMax = Math.floor(positiveNumberFromEnv("MCP_SESSION_MAX", 64));
 var sessionStreamIdleMs = positiveNumberFromEnv("MCP_SESSION_STREAM_IDLE_MS", sessionIdleMs * 2);
 var sessionBusyIdleMs = positiveNumberFromEnv("MCP_SESSION_BUSY_IDLE_MS", Math.max(sessionStreamIdleMs, sessionIdleMs) * 2);
+var gcIntervalMs = positiveNumberFromEnv("MCP_GC_INTERVAL_MS", 5 * 60 * 1e3);
 var rpcIdKey = (id) => `${typeof id}:${String(id)}`;
 var rpcMessages = (body) => (Array.isArray(body) ? body : [body]).filter((m) => m && typeof m === "object");
 var rpcRequestIds = (body) => rpcMessages(body).filter((m) => typeof m.method === "string" && m.id !== void 0 && m.id !== null).map((m) => m.id);
@@ -4498,6 +4499,21 @@ async function loadFootprintReader() {
     logger.warn(`phys_footprint unavailable: ${error instanceof Error ? error.message : String(error)}`);
     return () => null;
   }
+}
+async function loadHeapControls() {
+  const bun = globalThis.Bun;
+  if (bun?.gc) {
+    try {
+      const specifier = "bun:jsc";
+      const jsc = await import(specifier);
+      return { heapBytes: () => jsc.heapSize(), gc: () => bun.gc(true) };
+    } catch (error) {
+      logger.warn(`bun:jsc unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return { heapBytes: () => process.memoryUsage().heapUsed, gc: () => bun.gc(true) };
+    }
+  }
+  const exposed = globalThis.gc;
+  return { heapBytes: () => process.memoryUsage().heapUsed, gc: typeof exposed === "function" ? () => exposed() : null };
 }
 var exportDirectory = process.env.FIGMA_EXPORT_DIR || path5.join(os5.homedir(), ".macfleet", "figma-exports");
 var configuredExportTTLHours = Number(process.env.FIGMA_EXPORT_TTL_HOURS || 24);
@@ -4609,12 +4625,59 @@ async function startHTTPServer() {
   const sessions = /* @__PURE__ */ new Map();
   let evictedTotal = 0;
   const footprintBytes = await loadFootprintReader();
+  const heap = await loadHeapControls();
+  let sessionsCreated = 0;
+  let sessionsClosed = 0;
+  let sessionsCollected = 0;
+  const sessionFinalizer = new FinalizationRegistry(() => {
+    sessionsCollected++;
+  });
+  let activitySinceGc = false;
+  const gcStats = {
+    runs: 0,
+    lastAt: 0,
+    lastMs: 0,
+    heapMBBefore: null,
+    heapMBAfter: null,
+    uncollectedBefore: null
+  };
+  const mb = (bytes) => Math.round(bytes / 1048576);
+  const collectIfDue = (now = Date.now()) => {
+    if (!heap.gc || !activitySinceGc || now - gcStats.lastAt < gcIntervalMs) return;
+    activitySinceGc = false;
+    const before = heap.heapBytes();
+    const uncollectedBefore = sessionsClosed - sessionsCollected;
+    const started = performance.now();
+    try {
+      heap.gc();
+    } catch (error) {
+      logger.warn(`Full GC failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    Object.assign(gcStats, {
+      runs: gcStats.runs + 1,
+      lastAt: now,
+      lastMs: Math.round(performance.now() - started),
+      heapMBBefore: mb(before),
+      heapMBAfter: mb(heap.heapBytes()),
+      uncollectedBefore
+    });
+  };
+  const closedResponses = /* @__PURE__ */ new WeakSet();
+  const endStream = (res) => {
+    if (!res.writableEnded) res.end();
+    if (!closedResponses.has(res)) res.emit("close");
+  };
   const closeSession = (entry) => {
     if (entry.closed) return;
     entry.closed = true;
+    sessionsClosed++;
+    activitySinceGc = true;
     const id = entry.transport.sessionId;
     if (id && sessions.get(id) === entry) sessions.delete(id);
     entry.dispose();
+    for (const stream of entry.streamResponses) endStream(stream);
+    entry.requestStreams.clear();
   };
   const evict = (id, entry, why) => {
     sessions.delete(id);
@@ -4644,7 +4707,10 @@ async function startHTTPServer() {
       }
     }
   };
-  const sweepTimer = setInterval(sweepIdleSessions, sessionSweepMs);
+  const sweepTimer = setInterval(() => {
+    sweepIdleSessions();
+    collectIfDue();
+  }, sessionSweepMs);
   sweepTimer.unref();
   const httpServer = (0, import_http.createServer)(async (req, res) => {
     let fresh;
@@ -4701,7 +4767,25 @@ async function startHTTPServer() {
           relaySocketsOpen,
           footprintMB: footprint === null ? null : Math.round(footprint / 1048576),
           rssMB: Math.round(memory.rss / 1048576),
+          // Under Bun this lags a collection behind (see loadHeapControls); heapMB
+          // is the collector's own figure, garbage included until the next GC.
           heapUsedMB: Math.round(memory.heapUsed / 1048576),
+          heapMB: mb(heap.heapBytes()),
+          sessionsCreated,
+          sessionsClosed,
+          // Closed but still in memory. Falls back toward 0 after each gc run
+          // when it is only garbage; a figure that stays up across runs is a leak.
+          sessionsUncollected: sessionsClosed - sessionsCollected,
+          gc: {
+            available: heap.gc !== null,
+            intervalSeconds: Math.round(gcIntervalMs / 1e3),
+            runs: gcStats.runs,
+            lastAgoSeconds: gcStats.lastAt ? Math.round((now - gcStats.lastAt) / 1e3) : null,
+            lastMs: gcStats.lastMs,
+            heapMBBefore: gcStats.heapMBBefore,
+            heapMBAfter: gcStats.heapMBAfter,
+            sessionsUncollectedBefore: gcStats.uncollectedBefore
+          },
           uptimeSeconds: Math.round(process.uptime())
         }));
         return;
@@ -4710,6 +4794,7 @@ async function startHTTPServer() {
         res.writeHead(404).end("not found");
         return;
       }
+      activitySinceGc = true;
       const sessionId = req.headers["mcp-session-id"];
       let entry = sessionId ? sessions.get(sessionId) : void 0;
       let body;
@@ -4738,9 +4823,12 @@ async function startHTTPServer() {
           lastSeen: Date.now(),
           inflight: 0,
           streams: 0,
+          streamResponses: /* @__PURE__ */ new Set(),
           requestStreams: /* @__PURE__ */ new Map(),
           closed: false
         };
+        sessionsCreated++;
+        sessionFinalizer.register(mcpServer, void 0);
         await mcpServer.connect(transport);
         const sdkOnClose = transport.onclose;
         transport.onclose = () => {
@@ -4757,13 +4845,25 @@ async function startHTTPServer() {
       const active = entry;
       const isStream = req.method === "GET";
       active.lastSeen = Date.now();
-      if (isStream) active.streams++;
-      else active.inflight++;
+      if (isStream) {
+        for (const stale of active.streamResponses) {
+          logger.info(`Replacing the event stream of session ${sessionId}: the client opened a new one`);
+          endStream(stale);
+        }
+      }
+      if (isStream) {
+        active.streams++;
+        active.streamResponses.add(res);
+      } else {
+        active.inflight++;
+      }
       const requestIds = isStream ? [] : rpcRequestIds(body);
       for (const id of requestIds) active.requestStreams.set(rpcIdKey(id), { res, requests: requestIds.length });
       res.once("close", () => {
+        closedResponses.add(res);
         if (isStream) {
           active.streams--;
+          active.streamResponses.delete(res);
         } else {
           active.inflight--;
           active.lastSeen = Date.now();
@@ -4778,7 +4878,7 @@ async function startHTTPServer() {
         const stream = active.requestStreams.get(rpcIdKey(id));
         if (stream && stream.requests === 1 && !stream.res.writableEnded) {
           logger.info(`Closing the response stream of cancelled request ${String(id)}`);
-          stream.res.end();
+          endStream(stream.res);
         }
       }
     } catch (error) {

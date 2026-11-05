@@ -5155,6 +5155,21 @@ const sessionStreamIdleMs = positiveNumberFromEnv("MCP_SESSION_STREAM_IDLE_MS", 
 // advances an item at a time, so the default (2 h) is many times the longest
 // silence real work produces.
 const sessionBusyIdleMs = positiveNumberFromEnv("MCP_SESSION_BUSY_IDLE_MS", Math.max(sessionStreamIdleMs, sessionIdleMs) * 2);
+// A closed session is garbage — an McpServer with every tool schema, about
+// 1.8 MB — and nothing guaranteed the runtime would ever collect it. macmini-1,
+// 2026-11-04 10:40 onward: footprintMB 128 → 1849 in a day with sessions 18–24,
+// sessionsBusy 0 and relaySockets = sessions, growing ~1.8 MB per evicted
+// session (+24 MB over 13 evictions, 11-05 10:27→10:47) through a night with no
+// tool calls at all. The same churn had sat flat at ~120 MB for two weeks; what
+// changed was the box: swap 31.9/32 GB, memory pressure "warn", rssMB 64 next
+// to footprintMB 1849 — the idle heap paged out, and the collector stopped
+// reclaiming it. Locally the same Bun (1.3.14) frees every session within
+// seconds. So after any activity the server runs a full collection itself, at
+// most once per interval; /health reports how many closed sessions are still
+// waiting to be reclaimed (sessionsUncollected) so the next leak, if it is a
+// real reference rather than an idle collector, shows up as that number growing
+// across collections.
+const gcIntervalMs = positiveNumberFromEnv("MCP_GC_INTERVAL_MS", 5 * 60 * 1000);
 
 interface HTTPSession {
   transport: StreamableHTTPServerTransport;
@@ -5168,6 +5183,9 @@ interface HTTPSession {
   inflight: number;
   // Open GET event streams.
   streams: number;
+  // The responses behind `streams` (see the GET handling: under Bun 1.3 a
+  // vanished client's stream never reports close).
+  streamResponses: Set<ServerResponse>;
   // JSON-RPC request id → the POST response carrying it, for requests whose
   // response is still open (see the notifications/cancelled handling).
   requestStreams: Map<string, { res: ServerResponse; requests: number }>;
@@ -5206,6 +5224,28 @@ async function loadFootprintReader(): Promise<() => number | null> {
     logger.warn(`phys_footprint unavailable: ${error instanceof Error ? error.message : String(error)}`);
     return () => null;
   }
+}
+
+// The heap as the collector sees it, and a way to run a full collection.
+// process.memoryUsage().heapUsed is not that under Bun 1.3: it keeps the value
+// from before the last collection (195 MB after Bun.gc(true) had freed all of
+// it, while bun:jsc heapSize() read 0), so heapUsedMB alone cannot tell a heap
+// full of garbage from a heap full of live objects. Under Node, the full
+// collection needs --expose-gc; without it gc is null and nothing is forced.
+async function loadHeapControls(): Promise<{ heapBytes: () => number; gc: (() => void) | null }> {
+  const bun = (globalThis as { Bun?: { gc?: (sync: boolean) => void } }).Bun;
+  if (bun?.gc) {
+    try {
+      const specifier = "bun:jsc"; // a variable, so tsup leaves the import alone
+      const jsc: any = await import(specifier);
+      return { heapBytes: () => jsc.heapSize(), gc: () => bun.gc!(true) };
+    } catch (error) {
+      logger.warn(`bun:jsc unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      return { heapBytes: () => process.memoryUsage().heapUsed, gc: () => bun.gc!(true) };
+    }
+  }
+  const exposed = (globalThis as { gc?: () => void }).gc;
+  return { heapBytes: () => process.memoryUsage().heapUsed, gc: typeof exposed === "function" ? () => exposed() : null };
 }
 
 const exportDirectory = process.env.FIGMA_EXPORT_DIR || path.join(os.homedir(), ".macfleet", "figma-exports");
@@ -5356,6 +5396,60 @@ async function startHTTPServer() {
   const sessions = new Map<string, HTTPSession>();
   let evictedTotal = 0;
   const footprintBytes = await loadFootprintReader();
+  const heap = await loadHeapControls();
+
+  // Whether closed sessions actually leave memory (see gcIntervalMs). A session
+  // counts as collected when the runtime finalizes its McpServer, so
+  // sessionsClosed - sessionsCollected is what is still held after closing —
+  // garbage not yet reclaimed, or a reference nobody meant to keep.
+  let sessionsCreated = 0;
+  let sessionsClosed = 0;
+  let sessionsCollected = 0;
+  const sessionFinalizer = new FinalizationRegistry<undefined>(() => { sessionsCollected++; });
+  let activitySinceGc = false;
+  const gcStats = {
+    runs: 0,
+    lastAt: 0,
+    lastMs: 0,
+    heapMBBefore: null as number | null,
+    heapMBAfter: null as number | null,
+    uncollectedBefore: null as number | null,
+  };
+  const mb = (bytes: number) => Math.round(bytes / 1048576);
+  const collectIfDue = (now = Date.now()) => {
+    if (!heap.gc || !activitySinceGc || now - gcStats.lastAt < gcIntervalMs) return;
+    activitySinceGc = false;
+    const before = heap.heapBytes();
+    const uncollectedBefore = sessionsClosed - sessionsCollected;
+    const started = performance.now();
+    try {
+      heap.gc();
+    } catch (error) {
+      logger.warn(`Full GC failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    Object.assign(gcStats, {
+      runs: gcStats.runs + 1,
+      lastAt: now,
+      lastMs: Math.round(performance.now() - started),
+      heapMBBefore: mb(before),
+      heapMBAfter: mb(heap.heapBytes()),
+      uncollectedBefore,
+    });
+  };
+
+  // A response whose client went away never emits "close" under Bun 1.3
+  // (oven-sh/bun#29219; fixed in 1.4): not on disconnect, and not when the
+  // server ends it afterwards — `destroyed`, `closed` and write() results do not
+  // change either, so the disconnect cannot be seen at all. Everything hung off
+  // "close" then never runs: the SDK keeps the stream mapped, and our inflight /
+  // streams counters stay up. Where the server itself decides a response is
+  // over, it ends it and reports the close itself.
+  const closedResponses = new WeakSet<ServerResponse>();
+  const endStream = (res: ServerResponse) => {
+    if (!res.writableEnded) res.end();
+    if (!closedResponses.has(res)) res.emit("close");
+  };
 
   // The one place a session's resources are released, whichever way it ends —
   // client DELETE, idle sweep, the session cap, or an initialize that never
@@ -5368,9 +5462,13 @@ async function startHTTPServer() {
   const closeSession = (entry: HTTPSession) => {
     if (entry.closed) return;
     entry.closed = true;
+    sessionsClosed++;
+    activitySinceGc = true;
     const id = entry.transport.sessionId;
     if (id && sessions.get(id) === entry) sessions.delete(id);
     entry.dispose();
+    for (const stream of entry.streamResponses) endStream(stream);
+    entry.requestStreams.clear();
   };
   // Close one session the way a client DELETE would. closeSession runs from the
   // transport's onclose; calling it again afterwards is a no-op, and covers a
@@ -5413,7 +5511,10 @@ async function startHTTPServer() {
       }
     }
   };
-  const sweepTimer = setInterval(sweepIdleSessions, sessionSweepMs);
+  const sweepTimer = setInterval(() => {
+    sweepIdleSessions();
+    collectIfDue();
+  }, sessionSweepMs);
   sweepTimer.unref();
 
   const httpServer = createHttpServer(async (req, res) => {
@@ -5475,7 +5576,25 @@ async function startHTTPServer() {
           relaySocketsOpen,
           footprintMB: footprint === null ? null : Math.round(footprint / 1048576),
           rssMB: Math.round(memory.rss / 1048576),
+          // Under Bun this lags a collection behind (see loadHeapControls); heapMB
+          // is the collector's own figure, garbage included until the next GC.
           heapUsedMB: Math.round(memory.heapUsed / 1048576),
+          heapMB: mb(heap.heapBytes()),
+          sessionsCreated,
+          sessionsClosed,
+          // Closed but still in memory. Falls back toward 0 after each gc run
+          // when it is only garbage; a figure that stays up across runs is a leak.
+          sessionsUncollected: sessionsClosed - sessionsCollected,
+          gc: {
+            available: heap.gc !== null,
+            intervalSeconds: Math.round(gcIntervalMs / 1000),
+            runs: gcStats.runs,
+            lastAgoSeconds: gcStats.lastAt ? Math.round((now - gcStats.lastAt) / 1000) : null,
+            lastMs: gcStats.lastMs,
+            heapMBBefore: gcStats.heapMBBefore,
+            heapMBAfter: gcStats.heapMBAfter,
+            sessionsUncollectedBefore: gcStats.uncollectedBefore,
+          },
           uptimeSeconds: Math.round(process.uptime()),
         }));
         return;
@@ -5484,6 +5603,7 @@ async function startHTTPServer() {
         res.writeHead(404).end("not found");
         return;
       }
+      activitySinceGc = true;
 
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
       let entry = sessionId ? sessions.get(sessionId) : undefined;
@@ -5514,8 +5634,11 @@ async function startHTTPServer() {
           },
         });
         const created: HTTPSession = {
-          transport, server: mcpServer, dispose, work, lastSeen: Date.now(), inflight: 0, streams: 0, requestStreams: new Map(), closed: false,
+          transport, server: mcpServer, dispose, work, lastSeen: Date.now(), inflight: 0, streams: 0,
+          streamResponses: new Set(), requestStreams: new Map(), closed: false,
         };
+        sessionsCreated++;
+        sessionFinalizer.register(mcpServer, undefined);
         await mcpServer.connect(transport);
         // Chain after connect(): connect() overwrites transport.onclose, so a
         // handler set before it is silently dropped (see closeSession).
@@ -5538,13 +5661,31 @@ async function startHTTPServer() {
       const active = entry;
       const isStream = req.method === "GET";
       active.lastSeen = Date.now();
-      if (isStream) active.streams++;
-      else active.inflight++;
+      // A client that opens the event stream again has lost the one it had.
+      // Under Bun 1.3 that one never reports close (see endStream), so the SDK
+      // still holds it and answers every reopen with 409 "Only one SSE stream"
+      // for the rest of the session: macmini-1's Codex sessions got a 409 pair
+      // every ~10 minutes all night (11-04→11-05), and each 409 renewed lastSeen
+      // so those sessions never idled out either. Close the old stream first.
+      if (isStream) {
+        for (const stale of active.streamResponses) {
+          logger.info(`Replacing the event stream of session ${sessionId}: the client opened a new one`);
+          endStream(stale);
+        }
+      }
+      if (isStream) {
+        active.streams++;
+        active.streamResponses.add(res);
+      } else {
+        active.inflight++;
+      }
       const requestIds = isStream ? [] : rpcRequestIds(body);
       for (const id of requestIds) active.requestStreams.set(rpcIdKey(id), { res, requests: requestIds.length });
       res.once("close", () => {
+        closedResponses.add(res);
         if (isStream) {
           active.streams--;
+          active.streamResponses.delete(res);
         } else {
           active.inflight--;
           active.lastSeen = Date.now();
@@ -5566,7 +5707,7 @@ async function startHTTPServer() {
         const stream = active.requestStreams.get(rpcIdKey(id));
         if (stream && stream.requests === 1 && !stream.res.writableEnded) {
           logger.info(`Closing the response stream of cancelled request ${String(id)}`);
-          stream.res.end();
+          endStream(stream.res);
         }
       }
     } catch (error) {
