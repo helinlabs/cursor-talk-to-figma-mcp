@@ -1072,16 +1072,63 @@ func unsavedChangesPrompt(_ appElement: AXUIElement, window: AXUIElement?) -> (t
     return nil
 }
 
+// A menu item from an open CONTEXT menu, never from the menu bar.
+//
+// File > Close Tab lives in the menu bar's AX tree whether or not any menu is
+// open, so an app-wide lookup for "Close Tab" is satisfied by it the instant
+// the right-click is sent. When the tab's context menu did not open, pressing
+// that item closes the KEY window's active tab — some other project's. Measured
+// on macmini_m1, 2026-11-05 13:10 KST: the CO_Product repair reported
+// close_tab_no_effect, and the Enfit tab (window and plugin channel) was gone.
+func contextMenuItem(_ appElement: AXUIElement, named title: String) -> AXUIElement? {
+    for child in axChildren(appElement) where role(child) != (kAXMenuBarRole as String) {
+        if let item = descendants(child, maxDepth: 15).first(where: {
+            role($0) == (kAXMenuItemRole as String) && axText($0) == title
+        }) {
+            return item
+        }
+    }
+    return nil
+}
+
+// Whether File > Close Tab would act on THIS window's tab for THIS project.
+//
+// File-menu commands go to Figma's key window, and nothing the launcher
+// otherwise checks proves which window that is: AXFocusedWindow follows the
+// raise while Figma keeps its own key window, and a Plugins menu only proves
+// that SOME design window is key. The window server's front-to-back order
+// needs no Screen Recording (only window names do), so the target must be
+// Figma's frontmost real window — and when its AX title is legible, the active
+// tab it names must be this project's, not a neighbour tab in the same window.
+func closeTabTargetsProject(_ app: NSRunningApplication, window: AXUIElement, project: Project) -> Bool {
+    guard let identifier = axWindowID(window),
+          let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    else { return false }
+    let front = rows.first { row in
+        let bounds = row[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        return (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier
+            && (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+            && ((bounds["Height"] as? NSNumber)?.doubleValue ?? 0) >= 200
+            && ((bounds["Width"] as? NSNumber)?.doubleValue ?? 0) >= 200
+    }
+    guard (front?[kCGWindowNumber as String] as? NSNumber)?.uint32Value == identifier else { return false }
+    let title = axString(window, kAXTitleAttribute as CFString) ?? ""
+    if title.isEmpty || title == "Figma" { return true }
+    return title.localizedCaseInsensitiveContains(project.title)
+        || title.localizedCaseInsensitiveContains(project.displayTitle)
+}
+
 func closeProjectTab(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> LinkRepairOutcome {
     // The tab's own context menu names the tab it acts on, so it cannot close
-    // a neighbour that happens to be active. File > Close Tab is the fallback
-    // and only runs once the design window is key.
+    // a neighbour that happens to be active — as long as the item pressed is
+    // really from that context menu (contextMenuItem). File > Close Tab is the
+    // fallback and only runs once this window is proven to be the one it hits.
     var pressed = false
     if let (tabWindow, tab) = projectTab(appElement, project: project), CFEqual(tabWindow, window) {
         raiseOnly(app, appElement: appElement, window: window)
         if rightClick(tab) {
-            _ = waitUntil(timeout: 2) { closeTabTitles.contains { menuItem(appElement, named: $0) != nil } }
-            if let item = closeTabTitles.lazy.compactMap({ menuItem(appElement, named: $0) }).first, press(item) {
+            _ = waitUntil(timeout: 2) { closeTabTitles.contains { contextMenuItem(appElement, named: $0) != nil } }
+            if let item = closeTabTitles.lazy.compactMap({ contextMenuItem(appElement, named: $0) }).first, press(item) {
                 pressed = true
             } else {
                 dismissOpenMenus()
@@ -1089,9 +1136,14 @@ func closeProjectTab(_ app: NSRunningApplication, appElement: AXUIElement, proje
         }
     }
     if !pressed {
-        guard focusWindow(app, appElement: appElement, project: project, window: window, timeout: timeout),
-              let file = menuBarItem(appElement, named: "File"), press(file) else {
+        guard focusWindow(app, appElement: appElement, project: project, window: window, timeout: timeout) else {
             return .failed(step: "close_tab_unreachable", detail: "Could not make this window key to close the file's tab")
+        }
+        guard closeTabTargetsProject(app, window: window, project: project) else {
+            return .failed(step: "close_tab_unreachable", detail: "The tab's context menu did not open and this window is not provably Figma's front window showing the file, so File > Close Tab was not pressed — it would close another file's tab")
+        }
+        guard let file = menuBarItem(appElement, named: "File"), press(file) else {
+            return .failed(step: "close_tab_unreachable", detail: "Could not open the File menu to close the file's tab")
         }
         _ = waitUntil(timeout: 2) { closeTabTitles.contains { submenuItem(file, named: $0) != nil } }
         guard let item = closeTabTitles.lazy.compactMap({ submenuItem(file, named: $0) }).first, press(item) else {
