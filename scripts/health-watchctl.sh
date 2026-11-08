@@ -16,10 +16,20 @@ log_dir="$project_dir/.health"
 token_file="$HOME/.talk-to-figma/slack-bot-token"
 bun_bin="$(command -v bun || echo "$HOME/.bun/bin/bun")"
 domain="gui/$(id -u)"
+# The launcher's link repair. The watcher defaults to this path too; writing it
+# into the plist makes the setting visible in `launchctl print` and lets an
+# operator turn it off there (HEALTH_LINK_REPAIR_CMD=off) without a code change.
+# HEALTH_LINK_REPAIR_CMD in the installing shell overrides it.
+link_repair_cmd="${HEALTH_LINK_REPAIR_CMD-$HOME/.codex/skills/figma-product-mcp/scripts/run-broker.sh}"
 
 case "${1:-status}" in
   install)
     mkdir -p "$log_dir" "$(dirname "$plist")" "$(dirname "$token_file")"
+    # Always written: an empty value would fall back to the code default and
+    # quietly turn the repair back on.
+    [[ -n "$link_repair_cmd" ]] || link_repair_cmd="off"
+    [[ "$link_repair_cmd" == /* && ! -x "$link_repair_cmd" ]] \
+      && echo "⚠️  link repair command not installed yet: $link_repair_cmd (skills/figma-product-mcp/scripts/install.sh)"
     cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37,6 +47,7 @@ case "${1:-status}" in
   <dict>
     <key>PATH</key><string>$(dirname "$bun_bin"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HEALTH_PORT</key><string>3057</string>
+    <key>HEALTH_LINK_REPAIR_CMD</key><string>$link_repair_cmd</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
