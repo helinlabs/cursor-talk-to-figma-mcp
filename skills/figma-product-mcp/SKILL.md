@@ -65,7 +65,7 @@ Tabs are repaired **one at a time, each proven before the next**: when every tab
 
 Only the target window is raised; the other windows keep their channels. `--link-check` is the read-only view of the same decision (no lock, no UI): per project the probes, the load and `linked` / `inconclusive` / `busy` / `repair`. A slow probe (`no answer in 15s`) is inconclusive and never triggers a reload. `--no-link-repair` reports link-down tabs without reloading them.
 
-The health watch (`src/health_watch`) shows the same recovery on its card once a project has been link-down for 15 minutes (`HEALTH_LINK_REPAIR_MS`), and runs it once per incident when `HEALTH_LINK_REPAIR_CMD` is set (e.g. to this skill's `scripts/run-broker.sh`; output in `~/.talk-to-figma/link-repair.log`).
+The health watch (`src/health_watch`) shows the same recovery on its card once a project has been link-down for 15 minutes (`HEALTH_LINK_REPAIR_MS`), and runs it by itself: by default this skill's installed `scripts/run-broker.sh` (when present), overridable — or switched off with `off` — via `HEALTH_LINK_REPAIR_CMD`. The first run goes as soon as an incident has an idle link-down tab; while the incident lasts it retries hourly (`HEALTH_LINK_REPAIR_RETRY_MS`), or after 10 minutes when the run met another launcher's lock (exit 75). Runs are appended to `~/.talk-to-figma/link-repair.log`; the watcher's `/status` shows them under `linkRepair`.
 
 ## Fallback
 

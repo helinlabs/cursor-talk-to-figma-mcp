@@ -7,7 +7,8 @@
 // cannot fix it — because nothing told link-down apart from a missing plugin.
 import assert from 'node:assert/strict';
 import {LINK_REPAIR_AFTER_MS, isLinkDownDetail, linkFailureDetail, trackLinkDown, linkRepairPlan,
-  linkRepairLine, shouldTriggerLinkRepair} from '../src/health_watch/report-policy.mjs';
+  linkRepairLine, shouldTriggerLinkRepair, nextLinkRepairAt, resolveLinkRepairCmd,
+  LINK_REPAIR_RETRY_MS, LINK_REPAIR_BUSY_RETRY_MS} from '../src/health_watch/report-policy.mjs';
 
 const down = `2회 연속 실패 — 1차: ${linkFailureDetail({error: 'Unable to establish connection to Figma after 10 seconds'})} · pages 936ms · link 12056ms`;
 const slow = `2회 연속 실패 — 1차: ${linkFailureDetail({error: 'no answer in 15000ms'})}`;
@@ -48,16 +49,54 @@ assert.match(line, /작업 중이라 보류: CAPRODUCT/);
 assert.match(line, /--link-check/);
 assert.doesNotMatch(line, /GWPRODUCT/);
 
-// The automatic run is opt-in, needs something ready, and happens once per incident.
+// The automatic run needs a command and something ready; the first one in an
+// incident goes at once.
 const incidentSince = t0 - 5;
-assert.equal(shouldTriggerLinkRepair(plan, {configured: false, triggeredAt: 0, incidentSince}), false);
-assert.equal(shouldTriggerLinkRepair(plan, {configured: true, triggeredAt: 0, incidentSince}), true);
-assert.equal(shouldTriggerLinkRepair(plan, {configured: true, triggeredAt: t0, incidentSince}), false);
+const now = t0 + LINK_REPAIR_AFTER_MS;
+assert.equal(shouldTriggerLinkRepair(plan, {configured: false, triggeredAt: 0, incidentSince, now}), false);
+assert.equal(shouldTriggerLinkRepair(plan, {configured: true, triggeredAt: 0, incidentSince, now}), true);
 // A run from an earlier incident does not block this one.
-assert.equal(shouldTriggerLinkRepair(plan, {configured: true, triggeredAt: incidentSince - 1, incidentSince}), true);
+assert.equal(shouldTriggerLinkRepair(plan, {configured: true, triggeredAt: incidentSince - 1, incidentSince, now}), true);
 // Busy-only never triggers: nobody's requests get a reload under them.
 const busyOnly = linkRepairPlan({caproduct: t0}, {caproduct: 1}, t0 + LINK_REPAIR_AFTER_MS);
-assert.equal(shouldTriggerLinkRepair(busyOnly, {configured: true, triggeredAt: 0, incidentSince}), false);
+assert.equal(shouldTriggerLinkRepair(busyOnly, {configured: true, triggeredAt: 0, incidentSince, now}), false);
+
+// Inside an incident it retries — hourly after a run that finished, sooner
+// after one that met another launcher's lock (exit 75), never on top of a run
+// still going. 2026-11-05 was 15 hours behind a locked screen: one shot at the
+// start of that could only fail, and nothing would have tried again.
+const ran = now;
+const done = {at: ran + 90_000, code: 1};
+const opts = (extra) => ({configured: true, triggeredAt: ran, incidentSince, ...extra});
+assert.equal(shouldTriggerLinkRepair(plan, opts({running: true, now: ran + 5 * LINK_REPAIR_RETRY_MS})), false);
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: done, now: ran + LINK_REPAIR_RETRY_MS - 1})), false);
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: done, now: ran + LINK_REPAIR_RETRY_MS})), true);
+// A watcher restart forgets the child but not the clock: no result, still hourly.
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: null, now: ran + LINK_REPAIR_BUSY_RETRY_MS})), false);
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: null, now: ran + LINK_REPAIR_RETRY_MS})), true);
+const locked = {at: ran + 25_000, code: 75};
+assert.ok(LINK_REPAIR_BUSY_RETRY_MS < LINK_REPAIR_RETRY_MS);
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: locked, now: ran + LINK_REPAIR_BUSY_RETRY_MS - 1})), false);
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: locked, now: ran + LINK_REPAIR_BUSY_RETRY_MS})), true);
+// A result older than the run it is compared with is not that run's result.
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: {at: ran - 1, code: 75}, now: ran + LINK_REPAIR_BUSY_RETRY_MS})), false);
+// Custom cadence.
+assert.equal(shouldTriggerLinkRepair(plan, opts({result: done, retryMs: 1000, now: ran + 1000})), true);
+assert.equal(nextLinkRepairAt({triggeredAt: ran, result: done}), ran + LINK_REPAIR_RETRY_MS);
+assert.equal(nextLinkRepairAt({triggeredAt: ran, result: locked}), ran + LINK_REPAIR_BUSY_RETRY_MS);
+assert.equal(nextLinkRepairAt({triggeredAt: 0, result: null}), null);
+
+// On by default where the launcher is installed; the env var overrides, and
+// an empty / "off" value switches it off on purpose.
+const home = '/Users/someone';
+const launcher = `${home}/.codex/skills/figma-product-mcp/scripts/run-broker.sh`;
+const installed = (path) => path === launcher;
+assert.equal(resolveLinkRepairCmd({}, home, installed), launcher);
+assert.equal(resolveLinkRepairCmd({}, home, () => false), '');
+assert.equal(resolveLinkRepairCmd({HEALTH_LINK_REPAIR_CMD: '/opt/x/repair.sh --all'}, home, installed), '/opt/x/repair.sh --all');
+for (const off of ['', ' ', 'off', 'OFF', '0', 'false', 'no']) {
+  assert.equal(resolveLinkRepairCmd({HEALTH_LINK_REPAIR_CMD: off}, home, installed), '', `"${off}" must disable`);
+}
 assert.match(linkRepairLine(busyOnly), /작업 중이라 보류/);
 
 console.log('health link-repair policy: ok');

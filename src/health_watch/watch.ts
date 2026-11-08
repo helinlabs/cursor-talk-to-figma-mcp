@@ -21,14 +21,15 @@
 // windows all day, and a monitor that changed the active page would be a worse
 // problem than the one it reports.
 // ---------------------------------------------------------------------------
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, statSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import WebSocket from "ws";
 import { PROTOCOL_VERSION } from "../shared/version";
 import {
-  LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, boundedSlackText, replaceableSlackMessage, deliverSlack,
-  LINK_REPAIR_AFTER_MS, trackLinkDown, linkRepairPlan, linkRepairLine, shouldTriggerLinkRepair,
+  LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, cardDetail, fitSlackCard, replaceableSlackMessage, deliverSlack,
+  tickScopedSlack, LINK_REPAIR_AFTER_MS, trackLinkDown, linkRepairPlan, linkRepairLine, shouldTriggerLinkRepair,
+  nextLinkRepairAt, resolveLinkRepairCmd, LINK_REPAIR_RETRY_MS,
 } from "./report-policy.mjs";
 
 const RELAY_HTTP = process.env.HEALTH_RELAY_HTTP || "http://127.0.0.1:3055";
@@ -95,14 +96,21 @@ const DEGRADED_UPDATE_MS = Number(process.env.HEALTH_DEGRADED_UPDATE_MS || 60_00
 // minute-long poll. Two in a row means it did not come back on its own.
 const FAIL_STREAK = Number(process.env.HEALTH_FAIL_STREAK || 2);
 // How long a document must stay link-down before the card names the recovery
-// that works (and, if configured, runs it once).
+// that works (and runs it, when the repair command is available).
 const LINK_REPAIR_MS = Number(process.env.HEALTH_LINK_REPAIR_MS || LINK_REPAIR_AFTER_MS);
-// Opt-in: a shell command that runs the launcher's repair, e.g. the device's
-// `~/.codex/skills/figma-product-mcp/scripts/run-broker.sh`. Empty means the
-// card only says what to run. The launcher holds its own lock (exit 75 when a
-// repair is already running), touches only idle link-down tabs, and stops on
-// an unsaved-changes prompt, so one run per incident is safe to automate.
-const LINK_REPAIR_CMD = process.env.HEALTH_LINK_REPAIR_CMD || "";
+// The shell command that runs the launcher's repair. Defaults to the device's
+// `~/.codex/skills/figma-product-mcp/scripts/run-broker.sh` when it is
+// installed; HEALTH_LINK_REPAIR_CMD overrides it, and "" / off turns it off
+// (the card then only says what to run). The launcher holds its own lock (exit
+// 75 when a repair is already running), touches only idle link-down tabs, and
+// stops on an unsaved-changes prompt, so retrying it inside an incident is safe
+// to automate — see shouldTriggerLinkRepair for the cadence.
+const LINK_REPAIR_CMD = resolveLinkRepairCmd(process.env, homedir(), existsSync);
+const LINK_REPAIR_RETRY = Number(process.env.HEALTH_LINK_REPAIR_RETRY_MS || LINK_REPAIR_RETRY_MS);
+// A run longer than this no longer blocks the next attempt. It is never killed
+// (a launcher stopped between closing a tab and reopening it is worse than a
+// slow one); a second run just meets its lock and exits 75.
+const LINK_REPAIR_STUCK_MS = 30 * 60_000;
 const LINK_REPAIR_LOG = `${homedir()}/.talk-to-figma/link-repair.log`;
 
 const STATE_PATH = process.env.HEALTH_STATE_PATH
@@ -176,6 +184,7 @@ type State = {
   // the plugin is fine here, and the fix is a different one.
   linkDownSince: Record<string, number>;
   linkRepairTriggeredAt: number;  // last automatic repair run, 0 = never
+  linkRepairAttempts: number;     // runs inside the current incident
   linkRepairResult: { at: number; code: number } | null;
 };
 
@@ -203,6 +212,7 @@ function loadState(): State {
       slowAlertedAt: loaded.slowAlertedAt && typeof loaded.slowAlertedAt === "object" ? loaded.slowAlertedAt : {},
       linkDownSince: loaded.linkDownSince && typeof loaded.linkDownSince === "object" ? loaded.linkDownSince : {},
       linkRepairTriggeredAt: Number(loaded.linkRepairTriggeredAt) || 0,
+      linkRepairAttempts: Number(loaded.linkRepairAttempts) || 0,
       linkRepairResult: loaded.linkRepairResult ?? null,
     };
   } catch {
@@ -220,7 +230,7 @@ function durationsFromHistory(history: Array<{ project?: string; ok?: boolean; m
   return out;
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {}, linkDownSince: {}, linkRepairTriggeredAt: 0, linkRepairResult: null };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {}, linkDownSince: {}, linkRepairTriggeredAt: 0, linkRepairAttempts: 0, linkRepairResult: null };
 }
 function saveState(state: State): void {
   try {
@@ -750,8 +760,9 @@ const SLACK_TIMEOUT_MS = Number(process.env.HEALTH_SLACK_TIMEOUT_MS || 15_000);
 // failure keep the ts and try the edit again next round.
 const replaceable = replaceableSlackMessage;
 
+const slackGate = tickScopedSlack(slackRequest);
 async function slack(method: string, body: any): Promise<any> {
-  return deliverSlack(method, body, slackRequest);
+  return deliverSlack(method, body, slackGate.send);
 }
 
 async function slackRequest(method: string, body: any): Promise<any> {
@@ -1051,7 +1062,7 @@ function verdictFor(title: string, health: Health, state?: State): Verdict {
   // A failure is reported however old it is: nothing has come along to say it
   // was fixed, and going quiet about it would be worse than showing its age.
   if (!deep.ok) {
-    return { icon: ":red_circle:", label: `${load} · 심층 점검 미통과 (${age} 전) — ${detailSummary(deep.detail)}`, broken: true, busy: busy > 0 };
+    return { icon: ":red_circle:", label: `${load} · 심층 점검 미통과 (${age} 전) — ${cardDetail(deep.detail)}`, broken: true, busy: busy > 0 };
   }
   // Yellow, not blue: a verdict this old means the rotation is not reaching
   // this project, which is a finding about the watcher rather than a project
@@ -1110,7 +1121,7 @@ function projectStrip(health: Health, state?: State): string {
 
 function healthyText(state: State, health: Health): string {
   const deep = health.deep ? `\n• 심층 점검: ${displayName(health.deep.project)} — ${detailSummary(health.deep.detail)}` : "";
-  return `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
+  const head = `:large_green_circle: *Figma 헬스체크 · 이상 없음*\n`
     + `${projectStrip(health, state)}\n`
     + `• 연결: ${coverage(health)}\n`
     + `• 마지막 확인: ${clock()} · 점검 ${state.checks}회 · 연속 정상 ${humanSince(state.since)}${deep}\n`
@@ -1119,8 +1130,12 @@ function healthyText(state: State, health: Health): string {
     // rewrite is due makes that silence legible instead of ambiguous: a card
     // whose promised time has passed is itself the alert.
     + `• 다음 갱신 예정: ${clock(Date.now() + HEALTHY_UPDATE_MS)} (이 시각이 지나도 그대로면 워처나 macmini-1 자체를 의심하세요)\n`
-    + `• 프로젝트별 상태:\n${projectLines(health, state)}\n`
-    + `:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`;
+    + `• 프로젝트별 상태:`;
+  return fitSlackCard({
+    head: [head],
+    body: projectLines(health, state).split("\n").filter(Boolean),
+    tail: [`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`],
+  });
 }
 
 function degradedText(state: State, health: Health): string {
@@ -1141,21 +1156,33 @@ function degradedText(state: State, health: Health): string {
   // rest is fine — which is the first thing anyone wants to know when they are
   // pulled in. The all-clear card already lists every project; the alert needs
   // it more.
+  // The project list is the only part that grows with the outage, so it is the
+  // part that gives way when the card would not fit Slack's limit — the repair
+  // action and the console link below it are what the reader acts on.
+  const body: string[] = [];
   if (health.relayUp && health.expected.length) {
-    lines.push(`• 프로젝트별 상태:\n${projectLines(health, state)}`);
+    lines.push(`• 프로젝트별 상태:`);
+    body.push(...projectLines(health, state).split("\n").filter(Boolean));
   }
-  lines.push(`• 연결 표시와 문서 조회 결과는 별도입니다. 응답 지연만으로 탭을 닫지 마세요.`);
+  const tail: string[] = [`• 연결 표시와 문서 조회 결과는 별도입니다. 응답 지연만으로 탭을 닫지 마세요.`];
   const repairLine = linkRepairLine(linkPlan(state, health), displayName);
-  if (repairLine) lines.push(repairLine);
+  if (repairLine) tail.push(repairLine);
   if (state.linkRepairTriggeredAt && state.linkRepairTriggeredAt >= state.since) {
-    const result = state.linkRepairResult && state.linkRepairResult.at >= state.linkRepairTriggeredAt
-      ? `exit ${state.linkRepairResult.code} · 로그 ~/.talk-to-figma/link-repair.log`
+    const finished = state.linkRepairResult && state.linkRepairResult.at >= state.linkRepairTriggeredAt;
+    const result = finished
+      ? `exit ${state.linkRepairResult!.code} · 로그 ~/.talk-to-figma/link-repair.log`
       : "실행 중";
-    lines.push(`• 자동 복구: ${clock(state.linkRepairTriggeredAt)} 실행 (${result})`);
+    const attempts = state.linkRepairAttempts > 1 ? ` · 이번 이상 ${state.linkRepairAttempts}회째` : "";
+    const next = finished && repairLine
+      ? ` · 계속 끊겨 있으면 ${clock(nextLinkRepairAt({ triggeredAt: state.linkRepairTriggeredAt, result: state.linkRepairResult, retryMs: LINK_REPAIR_RETRY }) ?? Date.now())} 재시도`
+      : "";
+    tail.push(`• 자동 복구: ${clock(state.linkRepairTriggeredAt)} 실행 (${result})${attempts}${next}`);
+  } else if (repairLine && !LINK_REPAIR_CMD) {
+    tail.push(`• 자동 복구 꺼짐 (HEALTH_LINK_REPAIR_CMD 비어 있음 또는 런처 미설치) — 위 액션을 직접 실행하세요.`);
   }
-  lines.push(`• 플러그인 재연결: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
-  lines.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
-  return boundedSlackText(lines.join("\n"));
+  tail.push(`• 플러그인 재연결: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
+  tail.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
+  return fitSlackCard({ head: lines, body, tail });
 }
 
 function linkPlan(state: State, health: Health) {
@@ -1167,14 +1194,22 @@ function linkPlan(state: State, health: Health) {
 // Fire-and-forget: the launcher can take minutes, and the tick must not wait
 // on it (the tick watchdog would kill the watcher). Its outcome lands in the
 // incident thread, and the next deep turns re-probe the repaired projects.
+let linkRepairStartedAt = 0;   // in-memory: a run of THIS process still going
+const linkRepairRunning = () => linkRepairStartedAt > 0 && Date.now() - linkRepairStartedAt < LINK_REPAIR_STUCK_MS;
+
 function runLinkRepair(targets: string[]): void {
+  const newIncident = !(state.linkRepairTriggeredAt && state.linkRepairTriggeredAt >= state.since);
+  state.linkRepairAttempts = newIncident ? 1 : (state.linkRepairAttempts || 0) + 1;
   state.linkRepairTriggeredAt = Date.now();
   state.linkRepairResult = null;
-  pendingChanges.push(`:wrench: ${clock()} · 문서 서버 연결 끊김 자동 복구 시작 — ${targets.map(displayName).join(", ")}`);
+  linkRepairStartedAt = state.linkRepairTriggeredAt;
+  const attempt = state.linkRepairAttempts > 1 ? ` (${state.linkRepairAttempts}회째)` : "";
+  pendingChanges.push(`:wrench: ${clock()} · 문서 서버 연결 끊김 자동 복구 시작${attempt} — ${targets.map(displayName).join(", ")}`);
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(["/bin/zsh", "-c", LINK_REPAIR_CMD], { stdout: "pipe", stderr: "pipe" });
   } catch (error) {
+    linkRepairStartedAt = 0;
     state.linkRepairResult = { at: Date.now(), code: -1 };
     pendingChanges.push(`:warning: ${clock()} · 자동 복구를 시작하지 못함: ${String(error).slice(0, 200)}`);
     return;
@@ -1186,9 +1221,16 @@ function runLinkRepair(targets: string[]): void {
     ]);
     const code = await proc.exited;
     try {
-      writeFileSync(LINK_REPAIR_LOG, `${new Date().toISOString()} exit ${code}\n${out}\n${err}`);
+      // Appended: with retries, the earlier attempts are the evidence for why
+      // the later ones ran. Started over once it passes 512KB.
+      const entry = `${new Date(linkRepairStartedAt || Date.now()).toISOString()} → ${new Date().toISOString()} exit ${code}\n`
+        + `${out.slice(-20_000)}\n${err.slice(-20_000)}\n`;
+      const size = existsSync(LINK_REPAIR_LOG) ? statSync(LINK_REPAIR_LOG).size : 0;
+      if (size > 512 * 1024) writeFileSync(LINK_REPAIR_LOG, entry);
+      else appendFileSync(LINK_REPAIR_LOG, entry);
     } catch {}
     state.linkRepairResult = { at: Date.now(), code };
+    linkRepairStartedAt = 0;
     pendingChanges.push(`${code === 0 ? ":white_check_mark:" : ":warning:"} ${clock()} · 자동 복구 끝 (exit ${code}`
       + `${code === 75 ? " — 다른 복구가 이미 진행 중" : ""}) · 로그 ~/.talk-to-figma/link-repair.log`);
     lastDeepAt = 0;   // re-probe now rather than after a full interval
@@ -1394,6 +1436,7 @@ setInterval(() => {
 }, 60_000);
 
 async function runTick(): Promise<void> {
+  slackGate.reset();
   const health = await shallowCheck();
   state.checks += 1;
   state.shallowHistory.push(health.shallowMs);
@@ -1505,6 +1548,9 @@ async function runTick(): Promise<void> {
       configured: Boolean(LINK_REPAIR_CMD),
       triggeredAt: state.linkRepairTriggeredAt,
       incidentSince: state.since,
+      running: linkRepairRunning(),
+      result: state.linkRepairResult,
+      retryMs: LINK_REPAIR_RETRY,
     })) runLinkRepair(plan.ready);
   }
 
@@ -1563,6 +1609,15 @@ Bun.serve({
     return new Response(JSON.stringify({
       status: state.status, since: state.since, checks: state.checks,
       slackConfigured: Boolean(SLACK_TOKEN && SLACK_CHANNEL),
+      linkRepair: {
+        command: LINK_REPAIR_CMD || null,
+        retryMs: LINK_REPAIR_RETRY,
+        running: linkRepairRunning(),
+        triggeredAt: state.linkRepairTriggeredAt || null,
+        attempts: state.linkRepairAttempts,
+        result: state.linkRepairResult,
+        linkDownSince: state.linkDownSince,
+      },
       intervals: { shallowMs: SHALLOW_MS, deepMs: DEEP_MS, healthyUpdateMs: HEALTHY_UPDATE_MS },
       speed: {
         window: SPEED_WINDOW,

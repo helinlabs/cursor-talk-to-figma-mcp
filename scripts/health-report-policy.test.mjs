@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {runInNewContext} from 'node:vm';
 import {LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, boundedSlackText,
-  replaceableSlackMessage, deliverSlack} from '../src/health_watch/report-policy.mjs';
+  replaceableSlackMessage, deliverSlack, slackBytes, SLACK_TEXT_MAX_BYTES, SLACK_RETRY_MAX_BYTES,
+  fitSlackCard, cardDetail, tickScopedSlack} from '../src/health_watch/report-policy.mjs';
 
 assert.match(linkFailureDetail({error:'no answer in 15000ms'}), /단절 여부 미확인/);
 assert.match(linkFailureDetail({error:'Unable to establish connection to Figma after 10 seconds'}), /API가 연결 오류/);
@@ -24,11 +25,80 @@ await deliverSlack('chat.update',{ts:'123.456',text:long},async(method,body)=>{
 });
 assert.equal(sent.length,2);
 assert.ok(sent.every(x=>x.method==='chat.update' && x.ts==='123.456'));
-assert.ok(Array.from(sent[0].text).length<=3500);
-assert.ok(Array.from(sent[1].text).length<=1500);
+assert.ok(slackBytes(sent[0].text)<=SLACK_TEXT_MAX_BYTES);
+assert.ok(slackBytes(sent[1].text)<=SLACK_RETRY_MAX_BYTES);
 let attempts=0;
 await deliverSlack('chat.update',{ts:'123',text:long},async()=>{attempts++;return {ok:false,transient:true}});
 assert.equal(attempts,1);
+
+// --- Slack's limit is bytes -------------------------------------------------
+// chat.update rejected 4,008 bytes and took 3,990 (2026-11-08, #dev_noti_figma).
+// The degraded card that hit msg_too_long 10,517 times was 2,400 characters of
+// mostly hangul — 4,205 bytes — so a character bound let it straight through.
+assert.ok(SLACK_TEXT_MAX_BYTES < 4000);
+assert.equal(slackBytes('가'), 3);
+assert.equal(slackBytes('😀'), 4);
+const hangulCard = Array.from({length: 40}, (_, i) => `• ${i}번 줄 — 문서 서버 조회 실패 — Figma API가 연결 오류를 반환함 · 플러그인 연결`).join('\n');
+assert.ok(Array.from(hangulCard).length < 3500 && slackBytes(hangulCard) > 4000, 'fixture must be under the old char bound but over the byte limit');
+const cut = boundedSlackText(hangulCard);
+assert.ok(slackBytes(cut) <= SLACK_TEXT_MAX_BYTES);
+assert.match(cut, /\/preview/);
+assert.ok(!cut.includes('\uFFFD'));
+// Code points are never split, even with no line break to cut at.
+for (const unit of ['가', '😀', 'x']) {
+  const out = boundedSlackText(unit.repeat(5000), 1000);
+  assert.ok(slackBytes(out) <= 1000);
+  assert.ok(!out.includes('\uFFFD'));
+}
+
+// The card keeps its head and tail (repair action, console link) and gives up
+// project lines instead, saying how many.
+const head = [':red_circle: *Figma 헬스체크 · 이상 감지*', '• 프로젝트별 상태:'];
+const body = Array.from({length: 30}, (_, i) => `   :red_circle: P${i}_Product — 플러그인 연결 · 유휴 · ${'문서 서버 연결 끊김 '.repeat(4)}`);
+const tail = ['• 복구 액션: 브로커 액션 `figma-open-projects`', ':link: <https://example.test/|웹 릴레이 콘솔 열기>'];
+const card = fitSlackCard({head, body, tail});
+assert.ok(slackBytes(card) <= SLACK_TEXT_MAX_BYTES);
+assert.ok(card.startsWith(head[0]));
+assert.ok(card.endsWith(tail[1]));
+assert.match(card, /figma-open-projects/);
+const omitted = Number(card.match(/… (\d+)줄 생략/)[1]);
+assert.equal(card.split('\n').filter((line) => line.includes('_Product —')).length, body.length - omitted);
+// Small cards are left exactly as they are.
+assert.equal(fitSlackCard({head: ['a'], body: ['b'], tail: ['c']}), 'a\nb\nc');
+
+// The per-project line for a link-down tab is short and still says what it is.
+const doubleDown = `2회 연속 실패 — 1차: ${linkFailureDetail({error: 'Unable to establish connection to Figma after 10 seconds'})} · pages 194ms · link 11328ms · 2차: ${linkFailureDetail({error: 'Unable to establish connection to Figma after 10 seconds'})} · pages 200ms · link 11002ms`;
+assert.equal(cardDetail(doubleDown), '2회 연속 · 문서 서버 연결 끊김(Figma API 연결 오류) · link 11.3s');
+assert.ok(Array.from(cardDetail('x'.repeat(5000))).length <= 120);
+assert.match(cardDetail(`2회 연속 실패 — 1차: ${linkFailureDetail({error: 'no answer in 15000ms'})}`), /응답 지연/);
+// Five link-down tabs, as on 2026-11-08, now fit with room to spare.
+const fiveDown = Array.from({length: 9}, (_, i) => `   :red_circle: Project${i} — 플러그인 연결 · 유휴 · 심층 점검 미통과 (34분 전) — ${cardDetail(doubleDown)}`).join('\n');
+assert.ok(slackBytes(fiveDown) < 2000);
+
+// One transient Slack failure skips the rest of the tick instead of paying a
+// timeout per call; the next tick starts fresh. Definitive answers do not trip it.
+const calls = [];
+const gate = tickScopedSlack(async (method) => {
+  calls.push(method);
+  return method === 'chat.update' ? {ok: false, error: 'timed out after 15000ms', transient: true} : {ok: true, ts: '1'};
+});
+assert.equal((await gate.send('chat.update', {})).transient, true);
+const skipped = await gate.send('chat.postMessage', {});
+assert.equal(skipped.ok, false);
+assert.equal(skipped.transient, true);   // callers keep their retry-next-round path
+assert.equal(replaceableSlackMessage(skipped), false);   // and never post a duplicate card
+assert.deepEqual(calls, ['chat.update']);
+gate.reset();
+assert.equal((await gate.send('chat.postMessage', {})).ok, true);
+assert.deepEqual(calls, ['chat.update', 'chat.postMessage']);
+const definitive = tickScopedSlack(async () => ({ok: false, error: 'msg_too_long'}));
+await definitive.send('chat.update', {});
+assert.equal(definitive.tripped, null);
+// deliverSlack's msg_too_long retry goes through the gate unharmed.
+let gated = 0;
+const retryGate = tickScopedSlack(async () => (++gated === 1 ? {ok: false, error: 'msg_too_long'} : {ok: true}));
+assert.equal((await deliverSlack('chat.update', {ts: '1', text: hangulCard}, retryGate.send)).ok, true);
+assert.equal(gated, 2);
 
 // Exercise the actual existing plugin probe with a deterministic clock: a
 // server response at 4s used to fail at 3s; the watcher now allows it to answer.
