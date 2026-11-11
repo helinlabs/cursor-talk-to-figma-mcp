@@ -1715,10 +1715,34 @@ do {
         }
     }
     for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
-        if !accessibilityReady {
+        // The window title is the ACTIVE tab's file name even when no tab can be
+        // walked (macmini_m1, 2026-11-11: with every renderer gone the windows
+        // still answered AXTitle with their file, and after Reload All Tabs the
+        // document web areas came back while the tab strip exposed no AXTab at
+        // all). A window titled after this file that no other configured
+        // project resolves to is this file's own window as far as a run needs:
+        // the plugin runs in the active tab, and the relay's document check
+        // afterwards catches a wrong file.
+        func ownWindowByTitle() -> Bool {
+            guard let window = projectWindow(root, project: project) else { return false }
+            return !config.projects.contains { other in
+                other.id != project.id
+                    && projectWindow(root, project: other).map { CFEqual($0, window) } == true
+            }
+        }
+        if !accessibilityReady || projectTab(root, project: project) == nil {
+            if ownWindowByTitle() {
+                results[index].status = options.openOnly ? "opened" : "separated"
+                results[index].detail = "Project window matched by title (tabs not exposed to accessibility, so not inspected)"
+                continue
+            }
             results[index].status = "separation_failed"
-            results[index].step = "renderer_accessibility"
-            results[index].detail = "Figma's renderer accessibility tree never populated, so no tab is visible to the launcher"
+            if !accessibilityReady {
+                results[index].step = "renderer_accessibility"
+                results[index].detail = "Figma's renderer accessibility tree never populated, so no tab is visible to the launcher"
+            } else {
+                results[index].detail = "No tab for this file is exposed to accessibility and its window could not be told apart by title"
+            }
             continue
         }
         if splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
@@ -1740,7 +1764,9 @@ do {
             // Put a crashed renderer back before judging anything else, or the
             // run reports a plugin timeout for a window that never had a
             // document to begin with.
-            if !rendererIsUp(window) {
+            // Without the renderer tree there is no web area to judge a crash
+            // by; the relay handshake below is the proof either way.
+            if accessibilityReady, !rendererIsUp(window) {
                 if reloadCrashedRenderer(app, appElement: root, window: window, timeout: options.timeout) {
                     // The reload replaces the renderer, so any channel this
                     // project held is gone — re-read before deciding.

@@ -1,0 +1,1831 @@
+import AppKit
+import ApplicationServices
+import Foundation
+
+struct Project: Codable {
+    let id: String
+    let title: String
+    let displayTitle: String
+    let url: String
+}
+
+struct Config: Codable {
+    let pluginMenuTitle: String
+    let defaultProjectIDs: [String]
+    let projects: [Project]
+}
+
+struct ProjectResult: Codable {
+    let id: String
+    let title: String
+    let url: String
+    var status: String
+    var detail: String
+    var channel: String?
+    // Which step of the plugin handshake gave up. "did not reach connected
+    // state" alone is unactionable — the step name is what makes a failed run
+    // diagnosable without re-running it by hand.
+    var step: String?
+    // Protocol version the relay sees this window's plugin speaking. Differing
+    // from relayProtocolVersion means Figma is still running stale plugin code.
+    var pluginVersion: String?
+}
+
+struct Report: Codable {
+    let ok: Bool
+    let dryRun: Bool
+    let timestamp: String
+    let results: [ProjectResult]
+    // Relay ground truth: which plugins are actually connected, and at what
+    // version. Absent when the relay could not be reached (then the launcher
+    // falls back to reading the plugin panel's banner text).
+    var relayReachable: Bool?
+    var relayProtocolVersion: String?
+    // Figma's menu bar titles at the moment a Plugins-menu lookup failed.
+    var menuBar: [String]?
+}
+
+enum LauncherError: Error, CustomStringConvertible {
+    case usage(String)
+    case config(String)
+    case accessibility
+    case figma(String)
+
+    var description: String {
+        switch self {
+        case .usage(let text), .config(let text), .figma(let text): return text
+        case .accessibility: return "macOS Accessibility access is required"
+        }
+    }
+}
+
+struct Options {
+    var configPath = ""
+    var dryRun = false
+    var openOnly = false
+    var promptAccessibility = false
+    var allProjects = false
+    var forceReconnect = false
+    var doctor = false
+    // Read-only: probe each connected tab's server link and print what a run
+    // would do about it. Never locked, never touches the UI.
+    var linkCheck = false
+    // A normal run reloads tabs whose document lost Figma's servers. This turns
+    // that branch off (report only), for a run that must not reload anything.
+    var linkRepair = true
+    // Consecutive failed link probes before a tab counts as down.
+    var linkProbes = 2
+    var timeout: TimeInterval = 25
+    var relayURL = ProcessInfo.processInfo.environment["TALK_TO_FIGMA_RELAY_URL"] ?? "http://127.0.0.1:3055"
+    var selectedIDs = Set<String>()
+}
+
+func parseOptions() throws -> Options {
+    var options = Options()
+    var args = Array(CommandLine.arguments.dropFirst())
+    while !args.isEmpty {
+        let arg = args.removeFirst()
+        switch arg {
+        case "--config":
+            guard !args.isEmpty else { throw LauncherError.usage("--config requires a path") }
+            options.configPath = args.removeFirst()
+        case "--project":
+            guard !args.isEmpty else { throw LauncherError.usage("--project requires an id") }
+            options.selectedIDs.insert(args.removeFirst())
+        case "--timeout":
+            guard !args.isEmpty, let value = Double(args.removeFirst()), value > 0 else {
+                throw LauncherError.usage("--timeout requires a positive number")
+            }
+            options.timeout = value
+        case "--relay-url":
+            guard !args.isEmpty else { throw LauncherError.usage("--relay-url requires a URL") }
+            options.relayURL = args.removeFirst()
+        case "--dry-run": options.dryRun = true
+        case "--open-only": options.openOnly = true
+        case "--all": options.allProjects = true
+        case "--force-reconnect": options.forceReconnect = true
+        case "--doctor": options.doctor = true
+        case "--link-check": options.linkCheck = true
+        case "--no-link-repair": options.linkRepair = false
+        case "--link-probes":
+            guard !args.isEmpty, let value = Int(args.removeFirst()), value > 0 else {
+                throw LauncherError.usage("--link-probes requires a positive integer")
+            }
+            options.linkProbes = value
+        case "--prompt-accessibility": options.promptAccessibility = true
+        case "--help", "-h":
+            print("""
+            Usage: run.sh [--dry-run] [--open-only] [--all | --project ID]
+                          [--force-reconnect] [--timeout SECONDS] [--relay-url URL]
+                          [--prompt-accessibility] [--link-check]
+                          [--no-link-repair] [--link-probes N]
+
+            --force-reconnect  Re-run the plugin even in windows that are already
+                               connected. Needed after a plugin code deploy: Figma
+                               only re-reads code.js when the plugin is run again.
+                               (A plugin whose version differs from the relay's is
+                               re-run anyway, without this flag.)
+            --link-check       Read-only. Probe every connected tab's link to
+                               Figma's servers and print what a run would do.
+            --no-link-repair   Report tabs whose document lost Figma's servers
+                               instead of reloading them.
+            --link-probes N    Consecutive failed probes before a tab counts as
+                               link-down (default 2).
+
+            Exit codes: 0 all target projects connected · 1 one or more projects
+            failed (see each result's status/step) · 2 usage/config/accessibility
+            problem · 70 unexpected error.
+            """)
+            exit(0)
+        default: throw LauncherError.usage("Unknown argument: \(arg)")
+        }
+    }
+    guard !options.configPath.isEmpty else { throw LauncherError.usage("--config is required") }
+    return options
+}
+
+func loadConfig(path: String, selectedIDs: Set<String>, allProjects: Bool) throws -> Config {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let decoded = try JSONDecoder().decode(Config.self, from: data)
+    let targetIDs = !selectedIDs.isEmpty
+        ? selectedIDs
+        : (allProjects ? Set(decoded.projects.map(\.id)) : Set(decoded.defaultProjectIDs))
+    let projects = decoded.projects.filter { targetIDs.contains($0.id) }
+    guard !projects.isEmpty else { throw LauncherError.config("No configured projects matched the request") }
+    guard Dictionary(grouping: projects, by: \.id).allSatisfy({ $0.value.count == 1 }) else {
+        throw LauncherError.config("Duplicate project ids in config")
+    }
+    for project in projects {
+        guard let url = URL(string: project.url), url.scheme == "https", url.host?.contains("figma.com") == true else {
+            throw LauncherError.config("Invalid Figma URL for \(project.id)")
+        }
+    }
+    guard Set(projects.map(\.id)) == targetIDs else {
+        throw LauncherError.config("One or more requested project ids are missing from config")
+    }
+    return Config(pluginMenuTitle: decoded.pluginMenuTitle, defaultProjectIDs: decoded.defaultProjectIDs, projects: projects)
+}
+
+func axValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
+    return value
+}
+
+func axString(_ element: AXUIElement, _ attribute: CFString) -> String? {
+    axValue(element, attribute) as? String
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    axValue(element, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
+}
+
+func axText(_ element: AXUIElement) -> String {
+    [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
+        .compactMap { axString(element, $0 as CFString) }
+        .joined(separator: " ")
+}
+
+// Identity for an AXUIElement. `CFHash` alone is NOT one: on this Figma build
+// the values are dense enough that unrelated elements collide, so a raw
+// `Set<CFHashCode>` visited-set drops the colliding element AND its whole
+// subtree. Measured with all seven product files open, a CA_Product AXButton
+// and the menu bar's `Plugins` AXMenu both hash to 1768949919 — the Plugins
+// submenu was popped as "already seen", `Development > Cursor MCP Plugin`
+// never entered the traversal, and every activation failed
+// `plugin_menu_item_missing` while the item was plainly in the menu. Hash the
+// same way but settle ties with `CFEqual`: the cycle guard still holds and the
+// false drops stop.
+struct ElementKey: Hashable {
+    let element: AXUIElement
+    static func == (lhs: ElementKey, rhs: ElementKey) -> Bool { CFEqual(lhs.element, rhs.element) }
+    func hash(into hasher: inout Hasher) { hasher.combine(CFHash(element)) }
+}
+
+func descendants(_ root: AXUIElement, maxDepth: Int = 22) -> [AXUIElement] {
+    var output: [AXUIElement] = []
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    var seen = Set<ElementKey>()
+    while !queue.isEmpty {
+        let (element, depth) = queue.removeFirst()
+        if !seen.insert(ElementKey(element: element)).inserted { continue }
+        output.append(element)
+        if depth < maxDepth {
+            queue.append(contentsOf: axChildren(element).map { ($0, depth + 1) })
+        }
+    }
+    return output
+}
+
+func role(_ element: AXUIElement) -> String {
+    axString(element, kAXRoleAttribute as CFString) ?? ""
+}
+
+func press(_ element: AXUIElement) -> Bool {
+    AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+}
+
+func waitUntil(timeout: TimeInterval, interval: TimeInterval = 0.25, _ test: () -> Bool) -> Bool {
+    let end = Date().addingTimeInterval(timeout)
+    repeat {
+        if test() { return true }
+        RunLoop.current.run(until: Date().addingTimeInterval(interval))
+    } while Date() < end
+    return false
+}
+
+func runningFigma() -> NSRunningApplication? {
+    NSWorkspace.shared.runningApplications.first {
+        $0.bundleIdentifier == "com.figma.Desktop" || $0.localizedName == "Figma"
+    }
+}
+
+func launchFigmaIfNeeded(timeout: TimeInterval) throws -> NSRunningApplication {
+    if let app = runningFigma() { return app }
+    guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.figma.Desktop") else {
+        throw LauncherError.figma("Figma.app was not found")
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    NSWorkspace.shared.openApplication(at: appURL, configuration: configuration)
+    guard waitUntil(timeout: timeout, { runningFigma() != nil }), let app = runningFigma() else {
+        throw LauncherError.figma("Figma did not launch before timeout")
+    }
+    return app
+}
+
+// ---------------------------------------------------------------------------
+// Electron renderer accessibility.
+//
+// Figma is Electron, and Chromium leaves its renderer accessibility tree empty
+// until an assistive client asks for it. Unasked, the Figma app element exposes
+// only the native shell — the window plus a dozen AXGroups — with no tab strip
+// and no web area, so projectTab() finds no tab for any project and every
+// project is reported "separation_failed". Chromium resets this per process, so
+// a plain Figma restart is enough to silently break an otherwise healthy
+// launcher. AXManualAccessibility is Chromium's documented opt-in switch:
+// setting it is idempotent and it stays on for the life of the Figma process.
+// The tree then populates asynchronously, so wait for a web area before
+// walking anything that depends on it.
+// ---------------------------------------------------------------------------
+func appAX(_ app: NSRunningApplication) -> AXUIElement {
+    let element = AXUIElementCreateApplication(app.processIdentifier)
+    _ = AXUIElementSetAttributeValue(element, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    return element
+}
+
+func rendererAccessibilityReady(_ appElement: AXUIElement) -> Bool {
+    windows(appElement).contains { window in
+        descendants(window).contains { role($0) == "AXWebArea" }
+    }
+}
+
+func enableRendererAccessibility(_ appElement: AXUIElement, timeout: TimeInterval) -> Bool {
+    if rendererAccessibilityReady(appElement) { return true }
+    _ = AXUIElementSetAttributeValue(appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    return waitUntil(timeout: timeout) { rendererAccessibilityReady(appElement) }
+}
+
+func windows(_ appElement: AXUIElement) -> [AXUIElement] {
+    axValue(appElement, kAXWindowsAttribute as CFString) as? [AXUIElement] ?? []
+}
+
+func projectKey(_ project: Project) -> String {
+    URL(string: project.url)?.pathComponents.dropFirst(2).first ?? ""
+}
+
+func projectMatch(_ element: AXUIElement, project: Project) -> Bool {
+    let text = axText(element)
+    return text.localizedCaseInsensitiveContains(project.title)
+        || text.localizedCaseInsensitiveContains(project.displayTitle)
+        || (!projectKey(project).isEmpty && text.contains(projectKey(project)))
+}
+
+// A window that merely MENTIONS the file is not a window showing it.
+//
+// Figma's file-browser ("Recents") window lists every recently viewed file as a
+// card, so matching any descendant's text let one impersonate all seven
+// projects. openProject then reported a file it had never opened as already
+// open, and the run failed downstream as separation_failed — "Could not move
+// the design tab to a distinct window" for a file that was not open at all,
+// which reads as a tab problem and sent repair at the wrong thing entirely.
+//
+// A window actually showing the file proves it one of two ways: its title is
+// the file (Figma titles a window after its ACTIVE tab), or it carries the
+// file's TAB, which is how a file open in the background is still found. A
+// Recents window has neither — its tabs are Home, Recently viewed, Shared
+// files and Shared folders, and the file names are only card labels.
+func projectWindow(_ appElement: AXUIElement, project: Project) -> AXUIElement? {
+    if let viaAX = windows(appElement).first(where: { window in
+        projectMatch(window, project: project)
+            || descendants(window).contains { isTab($0) && projectMatch($0, project: project) }
+    }) {
+        return viaAX
+    }
+    return windowServerWindow(appElement, project: project)
+}
+
+// ---------------------------------------------------------------------------
+// Identify a window through the window server when accessibility cannot.
+//
+// Both AX signals above come from the renderer, and on Figma 126.8.16 the
+// renderer tree never populates: `AXManualAccessibility` is accepted and
+// ignored, every window answers `AXTitle` "Figma", and no tabs exist to walk.
+// Then `projectWindow` finds nothing for any file, every project is reported
+// `open_failed` on a file that is open, and a run re-opens all seven URLs.
+//
+// The window server knows the titles anyway. `CGWindowListCopyWindowInfo`
+// carries `kCGWindowName` per window, which for Figma is the active tab's file
+// name — the same string the AX title would have been. It is empty for
+// background processes until Screen Recording is granted; measured 2026-08-31,
+// granting it to the relay turned every Figma window name from nil into the
+// real file name, which is what makes this path worth having.
+//
+// Going from a window-server id back to an AXUIElement needs
+// `_AXUIElementGetWindow`. It is private, and this is the one place worth
+// spending that on: it is the only bridge between the two, it has been stable
+// across macOS releases for a decade, and a failure here is a nil, not a crash.
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func axWindowID(_ window: AXUIElement) -> CGWindowID? {
+    var identifier: CGWindowID = 0
+    guard _AXUIElementGetWindow(window, &identifier) == .success, identifier != 0 else { return nil }
+    return identifier
+}
+
+func windowServerWindow(_ appElement: AXUIElement, project: Project) -> AXUIElement? {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let rows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
+    let named = rows.filter { row in
+        (row[kCGWindowOwnerName as String] as? String) == "Figma"
+            && (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+            && !((row[kCGWindowName as String] as? String) ?? "").isEmpty
+    }
+    // Same rule as the AX path: a window that merely mentions the file is not
+    // the window showing it. Match against the title only, never card labels.
+    let wanted = named.filter { row in
+        let name = (row[kCGWindowName as String] as? String) ?? ""
+        return name.localizedCaseInsensitiveContains(project.title)
+            || name.localizedCaseInsensitiveContains(project.displayTitle)
+    }
+    guard wanted.count == 1,
+          let identifier = (wanted[0][kCGWindowNumber as String] as? NSNumber)?.uint32Value else { return nil }
+    return windows(appElement).first { axWindowID($0) == identifier }
+}
+
+func isTab(_ element: AXUIElement) -> Bool {
+    role(element) == "AXTab" || role(element) == (kAXRadioButtonRole as String)
+}
+
+func projectTab(_ appElement: AXUIElement, project: Project) -> (AXUIElement, AXUIElement)? {
+    for window in windows(appElement) {
+        if let tab = descendants(window).first(where: { isTab($0) && projectMatch($0, project: project) }) {
+            return (window, tab)
+        }
+    }
+    return nil
+}
+
+func openProject(_ project: Project, app: NSRunningApplication, appElement: AXUIElement, timeout: TimeInterval) -> Bool {
+    if projectWindow(appElement, project: project) != nil { return true }
+    guard let url = URL(string: project.url),
+          let appURL = app.bundleURL ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.figma.Desktop") else { return false }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    configuration.addsToRecentItems = false
+    NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: configuration)
+    return waitUntil(timeout: timeout) { projectWindow(appElement, project: project) != nil }
+}
+
+func pointAndSize(_ element: AXUIElement) -> (CGPoint, CGSize)? {
+    guard let positionValue = axValue(element, kAXPositionAttribute as CFString),
+          let sizeValue = axValue(element, kAXSizeAttribute as CFString),
+          CFGetTypeID(positionValue) == AXValueGetTypeID(),
+          CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &point),
+          AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else { return nil }
+    return (point, size)
+}
+
+func leftClick(_ element: AXUIElement) -> Bool {
+    guard let (point, size) = pointAndSize(element) else { return false }
+    let center = CGPoint(x: point.x + size.width / 2, y: point.y + size.height / 2)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: center, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: center, mouseButton: .left) else { return false }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    return true
+}
+
+func rightClick(_ element: AXUIElement) -> Bool {
+    guard let (point, size) = pointAndSize(element) else { return false }
+    let center = CGPoint(x: point.x + size.width / 2, y: point.y + size.height / 2)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: center, mouseButton: .right),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: center, mouseButton: .right) else { return false }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    return true
+}
+
+func menuItem(_ appElement: AXUIElement, named title: String) -> AXUIElement? {
+    menuItem(appElement) { axText($0) == title }
+}
+
+func menuItem(_ appElement: AXUIElement, where matches: (AXUIElement) -> Bool) -> AXUIElement? {
+    descendants(appElement, maxDepth: 16).first {
+        role($0) == (kAXMenuItemRole as String) && matches($0)
+    }
+}
+
+// Look inside ONE menu item's own submenu instead of the whole app.
+//
+// Menu item titles are not unique across Figma's menu tree, so an app-wide
+// lookup silently resolves to the wrong item. "New Window" is the case that
+// bites: the tab context menu's "Move to Another Window >" submenu has one,
+// and so does the menu bar's File menu. The app-wide search finds the File
+// one first — it exists whether or not any menu is open — so the launcher
+// pressed File > New Window, which opens an empty window and leaves the tab
+// exactly where it was. That reads downstream as "separation_failed" and
+// litters a stray "Recents" window on every attempt.
+func submenuItem(_ parent: AXUIElement, named title: String) -> AXUIElement? {
+    axChildren(parent)
+        .filter { role($0) == (kAXMenuRole as String) }
+        .flatMap { axChildren($0) }
+        .first { role($0) == (kAXMenuItemRole as String) && axText($0) == title }
+}
+
+func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
+    guard let (originalWindow, tab) = projectTab(appElement, project: project) else { return false }
+    let productTabs = descendants(originalWindow).filter { tabElement in
+        isTab(tabElement) && configuredProjects.contains { projectMatch(tabElement, project: $0) }
+    }
+    if productTabs.count <= 1 { return true }
+    _ = AXUIElementPerformAction(originalWindow, kAXRaiseAction as CFString)
+    guard rightClick(tab) else { return false }
+    _ = waitUntil(timeout: 2) {
+        menuItem(appElement, named: "Move to New Window") != nil || menuItem(appElement, named: "Move to Another Window") != nil
+    }
+    if let direct = menuItem(appElement, named: "Move to New Window") {
+        guard press(direct) else { dismissOpenMenus(); return false }
+    } else if let submenu = menuItem(appElement, named: "Move to Another Window") {
+        guard press(submenu),
+              waitUntil(timeout: 2, { submenuItem(submenu, named: "New Window") != nil }),
+              let newWindow = submenuItem(submenu, named: "New Window"),
+              press(newWindow) else { dismissOpenMenus(); return false }
+    } else {
+        dismissOpenMenus()
+        return false
+    }
+    return waitUntil(timeout: timeout) {
+        guard let newProjectWindow = projectWindow(appElement, project: project) else { return false }
+        return !CFEqual(newProjectWindow, originalWindow)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Relay ground truth.
+//
+// The plugin panel's "Connected to server in channel" banner is a label, not a
+// fact: it survives a relay restart that already dropped the socket, it says
+// nothing about WHICH code.js Figma loaded, and since the compact plugin UI it
+// may not even live inside the project window's accessibility tree. The relay
+// knows all three, so ask it: GET /channels lists every live plugin with the
+// document it announced and the protocol version it speaks.
+// ---------------------------------------------------------------------------
+struct RelayConnection {
+    let channel: String
+    let pluginVersion: String?
+}
+
+struct RelaySnapshot {
+    let protocolVersion: String?
+    let connectionsByDocument: [String: [RelayConnection]]
+    // Requests running or queued on each document right now. A tab someone is
+    // driving must not be reloaded under them, whatever its link says.
+    var loadByDocument: [String: Int] = [:]
+}
+
+func fetchRelaySnapshot(baseURL: String, timeout: TimeInterval = 3) -> RelaySnapshot? {
+    guard let url = URL(string: baseURL.hasSuffix("/") ? baseURL + "channels" : baseURL + "/channels") else { return nil }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = timeout
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    guard semaphore.wait(timeout: .now() + timeout + 1) == .success,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+
+    var byDocument: [String: [RelayConnection]] = [:]
+    var load: [String: Int] = [:]
+    for project in root["projects"] as? [[String: Any]] ?? [] {
+        guard let name = project["name"] as? String else { continue }
+        load[name] = ((project["runningRequests"] as? NSNumber)?.intValue ?? 0)
+            + ((project["pendingRequests"] as? NSNumber)?.intValue ?? 0)
+        var live: [RelayConnection] = []
+        for connection in project["connections"] as? [[String: Any]] ?? [] {
+            let channel = connection["channel"] as? String ?? ""
+            for client in connection["clients"] as? [[String: Any]] ?? [] {
+                guard (client["role"] as? String) == "figma" else { continue }
+                live.append(RelayConnection(channel: channel, pluginVersion: client["protocolVersion"] as? String))
+            }
+        }
+        if !live.isEmpty { byDocument[name] = live }
+    }
+    return RelaySnapshot(protocolVersion: root["protocolVersion"] as? String, connectionsByDocument: byDocument, loadByDocument: load)
+}
+
+// A slow relay is not an absent relay. The decisions that hinge on "did the
+// relay answer" — dry-run status, and above all the pre-UI ground truth that
+// lets a run leave connected projects alone — must not be settled by one 3s
+// request. Measured 2026-10-12 on a swapping host (load 10.8, 175MB free): the
+// relay had been up for ten days and answered /channels in 2ms a minute later,
+// but the single probe missed, every project fell through to openProject, and
+// all eight failed `renderer_accessibility` after 250s while the relay itself
+// still showed all eight connected.
+func fetchRelaySnapshotPatiently(baseURL: String, attempts: Int = 4, timeout: TimeInterval = 8) -> RelaySnapshot? {
+    for attempt in 1...max(1, attempts) {
+        if let snapshot = fetchRelaySnapshot(baseURL: baseURL, timeout: timeout) { return snapshot }
+        if attempt < attempts { Thread.sleep(forTimeInterval: 2) }
+    }
+    return nil
+}
+
+// The plugin announces the Figma document name, which is the config's
+// displayTitle (emoji included). Exact match first so near-identical titles
+// (CO_Product / C_Product) cannot swap places.
+func relayConnection(_ snapshot: RelaySnapshot, for project: Project) -> RelayConnection? {
+    if let exact = snapshot.connectionsByDocument[project.displayTitle] { return exact.first }
+    for (name, connections) in snapshot.connectionsByDocument
+    where name == project.title || name.localizedCaseInsensitiveContains(project.title) {
+        return connections.first
+    }
+    return nil
+}
+
+// ---------------------------------------------------------------------------
+// The announced document name goes stale, so ask the plugin where it is now.
+//
+// The relay records the document a plugin announced when it connected, and
+// never revisits it. That is fine while one window holds one file, but when two
+// configured files share a window the tab switch swaps the document under a
+// running plugin without a fresh announce. The relay then reports a channel as
+// "GW_Product" while the plugin answering on it is in GW_Apple Watch, and the
+// launcher reports the project connected. Measured 2026-08-31: the channel the
+// relay labelled GW_Product answered `figma.root.name` as GW_Apple Watch.
+//
+// Reporting that as connected is worse than reporting nothing. Callers write to
+// whatever answers, so a wrong document is a wrong-file write waiting to
+// happen. One round trip through the relay's own script endpoint settles it.
+func liveDocumentName(baseURL: String, project: Project, timeout: TimeInterval = 8) -> String? {
+    var components = URLComponents(string: baseURL.hasSuffix("/") ? baseURL + "script/run" : baseURL + "/script/run")
+    components?.queryItems = [URLQueryItem(name: "project", value: project.displayTitle)]
+    guard let url = components?.url else { return nil }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = timeout
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["code": "return figma.root.name"])
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    guard semaphore.wait(timeout: .now() + timeout + 1) == .success,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          root["ok"] as? Bool == true,
+          // `result` is the script's return value re-encoded as JSON, so a
+          // string arrives quoted.
+          let encoded = root["result"] as? String,
+          let name = try? JSONSerialization.jsonObject(
+              with: Data(encoded.utf8), options: [.fragmentsAllowed]
+          ) as? String
+    else { return nil }
+    return name
+}
+
+// A relay that cannot answer is not evidence of a wrong document: an
+// unreachable relay, a busy plugin, or a timeout all return nil, and treating
+// those as failures would make the launcher flap. Only a name that came back
+// and disagrees counts.
+func documentMismatch(baseURL: String, project: Project) -> String? {
+    guard let live = liveDocumentName(baseURL: baseURL, project: project) else { return nil }
+    if live == project.displayTitle { return nil }
+    if live.localizedCaseInsensitiveContains(project.title) { return nil }
+    return live
+}
+
+// ---------------------------------------------------------------------------
+// Is the tab's document still linked to Figma's servers?
+//
+// A connected plugin proves the tab runs and answers. It does not prove the
+// document behind it still talks to Figma. From 2026-10-30 20:07 KST all eight
+// product tabs on macmini-1 kept a live, current plugin and listed their pages,
+// while every server lookup failed after 10s with "Unable to establish
+// connection to Figma" — for 38 hours, because this launcher only ever asked
+// the relay whether a plugin was connected and so reported all eight as fine.
+// The plugin's own note (2026-10-08, GW_Product) is the fix: reload the file
+// from the server. Re-running the plugin re-attaches to the same frozen
+// document and changes nothing.
+//
+// The probe is the one the health watch uses: look up an id that cannot exist.
+// A linked document answers null in a few hundred ms; an unlinked one throws
+// Figma's own connection error after 10s. A local deadline alone proves
+// nothing (a busy or swapping host is slow, not disconnected), so only Figma's
+// error counts as down.
+// ---------------------------------------------------------------------------
+// >>> link-policy (pure; scripts/launcher-link-policy.test.mjs compiles this block)
+enum LinkState {
+    case up(ms: Int)
+    case down(ms: Int, error: String)
+    case unknown(String)   // timeout, relay error, old plugin — not a verdict
+
+    var isDown: Bool { if case .down = self { return true } else { return false } }
+    var summary: String {
+        switch self {
+        case .up(let ms): return "link ok (\(ms)ms)"
+        case .down(let ms, let error): return "link down after \(ms)ms: \(error)"
+        case .unknown(let why): return "link unknown: \(why)"
+        }
+    }
+}
+
+func classifyLinkVerdict(_ verdict: [String: Any]) -> LinkState {
+    let ms = (verdict["ms"] as? NSNumber)?.intValue ?? 0
+    if verdict["ok"] as? Bool == true { return .up(ms: ms) }
+    let error = verdict["error"] as? String ?? "no error text"
+    if verdict["timeout"] as? Bool == true { return .unknown("no answer in 15s") }
+    if error.localizedCaseInsensitiveContains("Unable to establish connection to Figma") {
+        return .down(ms: ms, error: error)
+    }
+    return .unknown(error)
+}
+
+enum LinkDecision: String {
+    case linked        // nothing to do
+    case inconclusive  // no verdict — leave the tab alone
+    case busy          // down, but someone's requests are on it — never reload under them
+    case repair        // down on every probe and idle: reload this tab only
+}
+
+func linkRepairDecision(_ probes: [LinkState], required: Int, load: Int) -> LinkDecision {
+    if probes.contains(where: { if case .up = $0 { return true } else { return false } }) { return .linked }
+    guard probes.count >= max(1, required), probes.allSatisfy(\.isDown) else { return .inconclusive }
+    return load > 0 ? .busy : .repair
+}
+
+// Is this a prompt about unsaved work? Either sign is enough: a false alarm
+// costs one skipped repair, a missed prompt could cost someone's work.
+let discardWords = ["Don't save", "Don’t save", "Discard", "Close without saving", "Delete changes", "저장 안 함", "저장하지 않음", "변경 사항 삭제", "버리기"]
+let unsavedWords = ["unsaved", "not been saved", "haven't been saved", "haven’t been saved", "저장되지 않", "저장하지 않은"]
+let cancelWords = ["Cancel", "Keep editing", "Stay", "취소"]
+
+func asksAboutUnsavedWork(texts: [String], buttons: [String]) -> Bool {
+    texts.contains { text in unsavedWords.contains { text.localizedCaseInsensitiveContains($0) } }
+        || buttons.contains { title in discardWords.contains { title.localizedCaseInsensitiveContains($0) } }
+}
+
+func cancelButtonIndex(_ buttons: [String]) -> Int? {
+    buttons.firstIndex { title in cancelWords.contains { title.caseInsensitiveCompare($0) == .orderedSame } }
+}
+
+// <<< link-policy
+
+let linkProbeCode = """
+const started = Date.now();
+let timer = null;
+const verdict = await Promise.race([
+  figma.getNodeByIdAsync("999999999:999999999").then(
+    () => ({ ok: true }),
+    (e) => ({ ok: false, error: String((e && e.message) || e) })),
+  new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, timeout: true, error: "no answer in 15000ms" }), 15000); }),
+]);
+if (timer) clearTimeout(timer);
+verdict.ms = Date.now() - started;
+return verdict;
+"""
+
+func linkProbe(baseURL: String, project: Project) -> LinkState {
+    var components = URLComponents(string: baseURL.hasSuffix("/") ? baseURL + "script/run" : baseURL + "/script/run")
+    components?.queryItems = [URLQueryItem(name: "project", value: project.displayTitle)]
+    guard let url = components?.url else { return .unknown("bad relay URL") }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 30
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["code": linkProbeCode])
+    var payload: Data?
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    guard semaphore.wait(timeout: .now() + 31) == .success,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return .unknown("relay did not answer")
+    }
+    guard root["ok"] as? Bool == true,
+          let encoded = root["result"] as? String,
+          let verdict = try? JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String: Any] else {
+        return .unknown((root["error"] as? String) ?? "script did not run")
+    }
+    return classifyLinkVerdict(verdict)
+}
+
+// Probe up to `attempts` times, stopping at the first answer that is not
+// "down". One failed lookup can be a blip on Figma's side; a tab is only
+// reloaded when every probe in a row came back with Figma's connection error.
+func linkProbes(baseURL: String, project: Project, attempts: Int, gap: TimeInterval = 3) -> [LinkState] {
+    var seen: [LinkState] = []
+    for attempt in 1...max(1, attempts) {
+        let state = linkProbe(baseURL: baseURL, project: project)
+        seen.append(state)
+        if !state.isDown { break }
+        if attempt < attempts { Thread.sleep(forTimeInterval: gap) }
+    }
+    return seen
+}
+
+// After a reload the document needs a moment to finish syncing; give it a few
+// probes and take the first that answers.
+func linkRecovery(baseURL: String, project: Project, attempts: Int = 4, gap: TimeInterval = 5) -> LinkState {
+    var last: LinkState = .unknown("not probed")
+    for attempt in 1...attempts {
+        last = linkProbe(baseURL: baseURL, project: project)
+        if case .up = last { return last }
+        if attempt < attempts { Thread.sleep(forTimeInterval: gap) }
+    }
+    return last
+}
+
+func relayLoad(_ snapshot: RelaySnapshot?, project: Project) -> Int {
+    guard let snapshot else { return 0 }
+    if let exact = snapshot.loadByDocument[project.displayTitle] { return exact }
+    return snapshot.loadByDocument.first { $0.key.localizedCaseInsensitiveContains(project.title) }?.value ?? 0
+}
+
+enum PluginState {
+    case missing
+    case stale(String?)              // connected, but running other code than the relay
+    case current(String?, String?)   // version, channel
+}
+
+func pluginState(_ snapshot: RelaySnapshot?, project: Project, window: AXUIElement?) -> PluginState {
+    guard let snapshot else {
+        // No relay: the banner text is all we have. It cannot distinguish a
+        // stale plugin from a current one, so never report "stale" from here.
+        guard let window, windowContains(window, text: "Connected to server in channel") else { return .missing }
+        return .current(nil, nil)
+    }
+    guard let connection = relayConnection(snapshot, for: project) else { return .missing }
+    guard let expected = snapshot.protocolVersion, connection.pluginVersion != expected else {
+        return .current(connection.pluginVersion, connection.channel)
+    }
+    return .stale(connection.pluginVersion)
+}
+
+// ---------------------------------------------------------------------------
+// Menu bar access.
+//
+// The menu bar hangs off the application element's AXMenuBar attribute, not its
+// children, and Figma rewrites it per key window: with a file-browser (Recents)
+// window key the bar is Figma/File/Edit/View/Window/Help — no Plugins menu at
+// all. Reading AXMenuBar directly is both correct and cheap; the old walk
+// searched every open document window to depth 8 to find the same item.
+// ---------------------------------------------------------------------------
+func menuBar(_ appElement: AXUIElement) -> AXUIElement? {
+    guard let value = axValue(appElement, kAXMenuBarAttribute as CFString), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return (value as! AXUIElement)
+}
+
+func menuBarTitles(_ appElement: AXUIElement) -> [String] {
+    guard let bar = menuBar(appElement) else { return [] }
+    return axChildren(bar).map(axText).filter { !$0.isEmpty }
+}
+
+func menuBarItem(_ appElement: AXUIElement, named title: String) -> AXUIElement? {
+    guard let bar = menuBar(appElement) else { return nil }
+    return axChildren(bar).first { axText($0) == title }
+}
+
+// A menu left open by a failed step swallows every later click, so each failure
+// path closes it before returning.
+func dismissOpenMenus() {
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: false) else { return }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+}
+
+// Make a design window key. The success test is "Figma's menu bar now has a
+// Plugins menu", not "AXFocusedWindow points at the window": measured on
+// macmini-1, AXRaise plus setting AXMain/AXFocusedWindow makes AX report the
+// design window as focused while Figma keeps its file-browser (Recents) window
+// key and keeps publishing the browser menu bar (Apple/Figma/File/Edit/View/
+// Window/Help — no Plugins). Only Figma's own activation paths move it, so
+// escalate through them until the menu proves it worked.
+func pluginsMenuIsUp(_ appElement: AXUIElement) -> Bool {
+    menuBarItem(appElement, named: "Plugins") != nil
+}
+
+// A Figma window whose renderer has crashed keeps its title, its position and
+// its shell web area, so every check the launcher makes looks reasonable right
+// up to the plugin handshake — which then times out. That is exactly how two
+// projects sat offline for hours today: `connect_timeout` was reported and the
+// run stopped, because re-running the plugin cannot help a window that has no
+// document to run it in. What is actually on screen is Figma's "Something went
+// wrong" page with a Reload button, and pressing it brings the document back.
+func rendererIsUp(_ window: AXUIElement) -> Bool {
+    descendants(window).contains { element in
+        role(element) == "AXWebArea" && axText(element).localizedCaseInsensitiveContains("\u{2013} Figma")
+    }
+}
+
+func reloadCrashedRenderer(
+    _ app: NSRunningApplication,
+    appElement: AXUIElement,
+    window: AXUIElement,
+    timeout: TimeInterval
+) -> Bool {
+    if rendererIsUp(window) { return true }
+    guard let reload = descendants(window).first(where: {
+        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
+    }) else { return false }
+    // Raise only this window. The other projects hold live plugin channels and
+    // a repair of one of them must not disturb the rest.
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+    app.activate(options: [.activateAllWindows])
+    _ = waitUntil(timeout: 2) { (axValue(window, kAXMainAttribute as CFString) as? Bool) ?? false }
+    if !press(reload), !leftClick(reload) { return false }
+    return waitUntil(timeout: timeout) { rendererIsUp(window) }
+}
+
+func focusWindow(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> Bool {
+    // 1. The cheap way: ask AX and the workspace.
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+    app.activate(options: [.activateAllWindows])
+    if waitUntil(timeout: 3, { pluginsMenuIsUp(appElement) }) { return true }
+
+    // 2. Figma's own Window menu: picking the document there is the activation
+    //    path Figma implements itself, so its menu bar follows.
+    if let windowMenu = menuBarItem(appElement, named: "Window"), press(windowMenu) {
+        if waitUntil(timeout: 2, { menuItem(appElement, where: { projectMatch($0, project: project) }) != nil }),
+           let entry = menuItem(appElement, where: { projectMatch($0, project: project) }), press(entry) {
+            if waitUntil(timeout: min(timeout, 6), { pluginsMenuIsUp(appElement) }) { return true }
+        } else {
+            dismissOpenMenus()
+        }
+    }
+
+    // 3. Click the project's own tab inside that window — a real mouse event,
+    //    which Figma cannot ignore. Selecting a tab it already shows is a no-op
+    //    for the document.
+    if let (tabWindow, tab) = projectTab(appElement, project: project), CFEqual(tabWindow, window), leftClick(tab) {
+        if waitUntil(timeout: min(timeout, 6), { pluginsMenuIsUp(appElement) }) { return true }
+    }
+    return false
+}
+
+func windowContains(_ window: AXUIElement, text: String) -> Bool {
+    descendants(window).contains { axText($0).localizedCaseInsensitiveContains(text) }
+}
+
+func channel(in window: AXUIElement) -> String? {
+    let texts = descendants(window).map(axText)
+    if let index = texts.firstIndex(where: { $0.localizedCaseInsensitiveContains("Connected to server in channel") }) {
+        let suffix = texts[index].split(separator: ":").last.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let suffix, !suffix.isEmpty { return suffix }
+        if index + 1 < texts.count {
+            let next = texts[index + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !next.isEmpty { return next }
+        }
+    }
+    return nil
+}
+
+enum ActivationOutcome {
+    case connected(version: String?, channel: String?)
+    case failed(step: String, detail: String, menuBar: [String]?)
+}
+
+// Run `Plugins > Development > <plugin>` in this window and wait for the RELAY
+// to report the window's plugin connected at the relay's own protocol version.
+// Waiting on the relay rather than on the panel's banner text is what makes a
+// plugin-code deploy verifiable: re-running stale code would still print the
+// banner, but it would keep reporting the old version.
+func activatePlugin(
+    _ app: NSRunningApplication,
+    appElement: AXUIElement,
+    window: AXUIElement,
+    project: Project,
+    pluginTitle: String,
+    relayURL: String,
+    relayReachable: Bool,
+    timeout: TimeInterval
+) -> ActivationOutcome {
+    // Figma publishes a different menu bar per key window and the file-browser
+    // one has no Plugins menu at all, so getting the design window key IS the
+    // precondition; focusWindow escalates until the Plugins menu proves it.
+    guard focusWindow(app, appElement: appElement, project: project, window: window, timeout: timeout) else {
+        let titles = menuBarTitles(appElement)
+        return .failed(
+            step: "plugins_menu_missing",
+            detail: "Could not make this design window key — Figma's menu bar still has no Plugins menu (\(titles.joined(separator: ", ")))",
+            menuBar: titles
+        )
+    }
+    // A file the launcher just opened has not finished registering its
+    // development plugins yet, and 3s was not enough for one: `--project
+    // f-product` failed with this step, yet a dump showed the item present and
+    // an immediate retry against the now-warm document connected. Nothing on
+    // the healthy path waits longer — the item is already there — so this only
+    // stops a cold open from being called a missing plugin.
+    //
+    // Waiting with the menu held open is not enough on its own: Figma builds
+    // the Plugins menu when it opens, so a menu opened before the document
+    // registered its plugins never grows the item. macmini_m1, 2026-11-03: the
+    // link repair closed and reopened CO_Product, the item stayed missing for
+    // the whole 12s, and a rerun seconds later connected at once. So close the
+    // menu and open it again, a few times, before calling the plugin missing.
+    let menuItemWait = max(3, min(timeout, 12))
+    var found: AXUIElement?
+    for attempt in 0..<3 {
+        if attempt > 0 {
+            dismissOpenMenus()
+            Thread.sleep(forTimeInterval: 3)
+        }
+        guard let plugins = menuBarItem(appElement, named: "Plugins"), press(plugins) else {
+            return .failed(step: "plugins_menu_press", detail: "Could not open Figma's Plugins menu", menuBar: menuBarTitles(appElement))
+        }
+        if waitUntil(timeout: menuItemWait, { menuItem(appElement, named: pluginTitle) != nil }) {
+            found = menuItem(appElement, named: pluginTitle)
+            if found != nil { break }
+        }
+    }
+    guard let plugin = found else {
+        dismissOpenMenus()
+        return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window (Plugins menu opened 3 times)", menuBar: nil)
+    }
+    guard press(plugin) else {
+        dismissOpenMenus()
+        return .failed(step: "plugin_menu_item_press", detail: "Could not run \(pluginTitle)", menuBar: nil)
+    }
+    guard relayReachable else {
+        // No relay to ask — fall back to the banner, which at least proves the
+        // plugin started, and let the report say the version is unverified.
+        if waitUntil(timeout: timeout, { windowContains(window, text: "Connected to server in channel") }) {
+            return .connected(version: nil, channel: channel(in: window))
+        }
+        return .failed(step: "connect_timeout", detail: "Plugin ran but the panel never showed a connected banner", menuBar: nil)
+    }
+    var lastSeen: String?
+    let settled = waitUntil(timeout: timeout, interval: 0.5) {
+        guard let snapshot = fetchRelaySnapshot(baseURL: relayURL) else { return false }
+        if case .current = pluginState(snapshot, project: project, window: window) { return true }
+        if case .stale(let version) = pluginState(snapshot, project: project, window: window) { lastSeen = version }
+        return false
+    }
+    guard settled, let snapshot = fetchRelaySnapshot(baseURL: relayURL),
+          case .current(let version, let channelName) = pluginState(snapshot, project: project, window: window) else {
+        let expected = fetchRelaySnapshot(baseURL: relayURL)?.protocolVersion ?? "?"
+        return .failed(
+            step: "connect_timeout",
+            detail: lastSeen == nil
+                ? "Plugin ran but the relay never saw \(project.displayTitle) connect"
+                : "Plugin reconnected still speaking v\(lastSeen!) (relay v\(expected)) — Figma reloaded the old code.js",
+            menuBar: nil
+        )
+    }
+    return .connected(version: version, channel: channelName)
+}
+
+// ---------------------------------------------------------------------------
+// Reload one link-down tab from Figma's servers.
+//
+// Two ways back, in order:
+//   1. Figma's own "A new version of Figma Design is available … [Save and
+//      reload]" banner. A tab that shows it has stopped taking server edits;
+//      the button saves and reloads that tab and nothing else (macmini-1,
+//      2026-10-01: D_Product top-level 14→42, pages 4→5).
+//   2. No banner: close the file's tab and open its URL again, which loads the
+//      document from the server (the plugin note's fix, 2026-10-08).
+//
+// Only the target window is raised; the others keep their plugin channels.
+// Closing a tab is the one step that could lose work, so a dialog about
+// unsaved changes stops the repair: Cancel is pressed, never a discard button,
+// and the run reports it for a person to look at.
+// ---------------------------------------------------------------------------
+enum LinkRepairOutcome {
+    case reloaded(String)                    // how; the window stays
+    case reopen                              // tab closed — open the URL again
+    case failed(step: String, detail: String)
+}
+
+let closeTabTitles = ["Close Tab", "Close tab", "탭 닫기"]
+
+func saveAndReloadButton(_ window: AXUIElement) -> AXUIElement? {
+    descendants(window).first {
+        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("Save and reload")
+    }
+}
+
+func raiseOnly(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement) {
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
+    app.activate(options: [.activateAllWindows])
+    _ = waitUntil(timeout: 2) { (axValue(window, kAXMainAttribute as CFString) as? Bool) ?? false }
+}
+
+// Whatever Figma put up after a close was asked for: a native sheet/dialog or
+// a modal inside the web content. Returns its text when it is about unsaved
+// work, so the caller can stop.
+func unsavedChangesPrompt(_ appElement: AXUIElement, window: AXUIElement?) -> (text: String, cancel: AXUIElement?)? {
+    var roots = windows(appElement).filter {
+        let subrole = axString($0, kAXSubroleAttribute as CFString) ?? ""
+        return subrole == "AXDialog" || subrole == "AXSystemDialog"
+    }
+    if let window { roots.append(window) }
+    for root in roots {
+        let elements = descendants(root)
+        let texts = elements.map(axText)
+        let buttons = elements.filter { role($0) == "AXButton" }
+        let titles = buttons.map(axText)
+        guard asksAboutUnsavedWork(texts: texts, buttons: titles) else { continue }
+        let cancel = cancelButtonIndex(titles).map { buttons[$0] }
+        let summary = texts.filter { !$0.isEmpty }.prefix(6).joined(separator: " / ")
+        return (String(summary.prefix(300)), cancel)
+    }
+    return nil
+}
+
+// A menu item from an open CONTEXT menu, never from the menu bar.
+//
+// File > Close Tab lives in the menu bar's AX tree whether or not any menu is
+// open, so an app-wide lookup for "Close Tab" is satisfied by it the instant
+// the right-click is sent. When the tab's context menu did not open, pressing
+// that item closes the KEY window's active tab — some other project's. Measured
+// on macmini_m1, 2026-11-05 13:10 KST: the CO_Product repair reported
+// close_tab_no_effect, and the Enfit tab (window and plugin channel) was gone.
+func contextMenuItem(_ appElement: AXUIElement, named title: String) -> AXUIElement? {
+    for child in axChildren(appElement) where role(child) != (kAXMenuBarRole as String) {
+        if let item = descendants(child, maxDepth: 15).first(where: {
+            role($0) == (kAXMenuItemRole as String) && axText($0) == title
+        }) {
+            return item
+        }
+    }
+    return nil
+}
+
+// Whether File > Close Tab would act on THIS window's tab for THIS project.
+//
+// File-menu commands go to Figma's key window, and nothing the launcher
+// otherwise checks proves which window that is: AXFocusedWindow follows the
+// raise while Figma keeps its own key window, and a Plugins menu only proves
+// that SOME design window is key. The window server's front-to-back order
+// needs no Screen Recording (only window names do), so the target must be
+// Figma's frontmost real window — and when its AX title is legible, the active
+// tab it names must be this project's, not a neighbour tab in the same window.
+func closeTabTargetsProject(_ app: NSRunningApplication, window: AXUIElement, project: Project) -> Bool {
+    guard let identifier = axWindowID(window),
+          let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    else { return false }
+    let front = rows.first { row in
+        let bounds = row[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        return (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == app.processIdentifier
+            && (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+            && ((bounds["Height"] as? NSNumber)?.doubleValue ?? 0) >= 200
+            && ((bounds["Width"] as? NSNumber)?.doubleValue ?? 0) >= 200
+    }
+    guard (front?[kCGWindowNumber as String] as? NSNumber)?.uint32Value == identifier else { return false }
+    let title = axString(window, kAXTitleAttribute as CFString) ?? ""
+    if title.isEmpty || title == "Figma" { return true }
+    return title.localizedCaseInsensitiveContains(project.title)
+        || title.localizedCaseInsensitiveContains(project.displayTitle)
+}
+
+func closeProjectTab(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> LinkRepairOutcome {
+    // The tab's own context menu names the tab it acts on, so it cannot close
+    // a neighbour that happens to be active — as long as the item pressed is
+    // really from that context menu (contextMenuItem). File > Close Tab is the
+    // fallback and only runs once this window is proven to be the one it hits.
+    var pressed = false
+    if let (tabWindow, tab) = projectTab(appElement, project: project), CFEqual(tabWindow, window) {
+        raiseOnly(app, appElement: appElement, window: window)
+        if rightClick(tab) {
+            _ = waitUntil(timeout: 2) { closeTabTitles.contains { contextMenuItem(appElement, named: $0) != nil } }
+            if let item = closeTabTitles.lazy.compactMap({ contextMenuItem(appElement, named: $0) }).first, press(item) {
+                pressed = true
+            } else {
+                dismissOpenMenus()
+            }
+        }
+    }
+    if !pressed {
+        guard focusWindow(app, appElement: appElement, project: project, window: window, timeout: timeout) else {
+            return .failed(step: "close_tab_unreachable", detail: "Could not make this window key to close the file's tab")
+        }
+        guard closeTabTargetsProject(app, window: window, project: project) else {
+            return .failed(step: "close_tab_unreachable", detail: "The tab's context menu did not open and this window is not provably Figma's front window showing the file, so File > Close Tab was not pressed — it would close another file's tab")
+        }
+        guard let file = menuBarItem(appElement, named: "File"), press(file) else {
+            return .failed(step: "close_tab_unreachable", detail: "Could not open the File menu to close the file's tab")
+        }
+        _ = waitUntil(timeout: 2) { closeTabTitles.contains { submenuItem(file, named: $0) != nil } }
+        guard let item = closeTabTitles.lazy.compactMap({ submenuItem(file, named: $0) }).first, press(item) else {
+            dismissOpenMenus()
+            return .failed(step: "close_tab_missing", detail: "Neither the tab's context menu nor File has Close Tab")
+        }
+    }
+    // Watch for an unsaved-work prompt for a few seconds before trusting the
+    // tab's disappearance — a prompt is exactly what keeps it there.
+    let deadline = Date().addingTimeInterval(min(timeout, 8))
+    while Date() < deadline {
+        let stillThere = projectWindow(appElement, project: project)
+        if let prompt = unsavedChangesPrompt(appElement, window: stillThere) {
+            if let cancel = prompt.cancel { _ = press(cancel) || leftClick(cancel) }
+            return .failed(
+                step: "unsaved_changes",
+                detail: "Closing the tab asked about unsaved work — pressed \(prompt.cancel == nil ? "nothing (no Cancel found; the prompt is still up)" : "Cancel"), nothing was discarded. A person must look at this tab: \(prompt.text)"
+            )
+        }
+        if stillThere == nil { return .reopen }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+    }
+    return projectWindow(appElement, project: project) == nil
+        ? .reopen
+        : .failed(step: "close_tab_no_effect", detail: "Close Tab was pressed but the file's tab is still open")
+}
+
+func reloadFromServer(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, window: AXUIElement, timeout: TimeInterval) -> LinkRepairOutcome {
+    if let banner = saveAndReloadButton(window) {
+        raiseOnly(app, appElement: appElement, window: window)
+        guard press(banner) || leftClick(banner) else {
+            return .failed(step: "save_and_reload_press", detail: "Found Figma's Save and reload banner but could not press it")
+        }
+        // The reload replaces the page; wait for the banner to go and the
+        // document to be back before anyone re-runs the plugin in it.
+        let back = waitUntil(timeout: max(timeout, 30), interval: 0.5) {
+            guard let current = projectWindow(appElement, project: project) else { return false }
+            return saveAndReloadButton(current) == nil && rendererIsUp(current)
+        }
+        return back
+            ? .reloaded("save_and_reload")
+            : .failed(step: "save_and_reload_timeout", detail: "Pressed Save and reload but the document did not come back")
+    }
+    return closeProjectTab(app, appElement: appElement, project: project, window: window, timeout: timeout)
+}
+
+// stdout for the caller, stderr so a nonzero exit still carries the reason
+// (job runners keep the error text but often replace a failed step's output),
+// and a file so a follow-up session can read what happened without re-running.
+let reportPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".talk-to-figma")
+    .appendingPathComponent("launcher-report.json")
+
+// Repair is UI automation — raising windows, opening menus, clicking items —
+// and two runs doing that at once fight: focus flips between them, and one
+// run's dismissOpenMenus() closes the menu the other just opened. That used to
+// be a rare hand-run collision. It is now the expected case, because a failing
+// MCP call tells every agent to run this action, so several machines hitting a
+// dead Figma within the same minute all reach for the launcher at once.
+//
+// flock is the right primitive here: the kernel drops it when the process
+// exits, so a crashed or killed run cannot strand the lock the way a lockfile
+// or lock directory would. --dry-run never takes it — it reads the relay and
+// touches no UI, so status checks must never queue behind a repair.
+enum RunLock {
+    case acquired(Int32)
+    case busy            // someone else is repairing right now
+    case unavailable     // could not even make the lock file
+}
+
+func acquireRunLock(waitFor timeout: TimeInterval) -> RunLock {
+    let directory = (("~/.talk-to-figma") as NSString).expandingTildeInPath
+    try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    let path = (directory as NSString).appendingPathComponent("launcher.lock")
+    let descriptor = open(path, O_CREAT | O_RDWR, 0o644)
+    // Never let a lock problem block an actual repair: degrade to running
+    // unguarded rather than refusing to fix anything.
+    guard descriptor >= 0 else { return .unavailable }
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return .acquired(descriptor) }
+        Thread.sleep(forTimeInterval: 0.5)
+    } while Date() < deadline
+    close(descriptor)
+    return .busy
+}
+
+// ---------------------------------------------------------------------------
+// --doctor: read-only diagnosis of the two things a run depends on.
+//
+// A run that reports "forced re-run skipped, no renderer accessibility tree"
+// says what failed but not why, and the fix differs completely depending on
+// which layer is down: the renderer tree, the native menu bar, the window
+// server, or the plugin channel itself. Those are four independent signals and
+// only the first one is currently reported, so a blocked run leaves nothing to
+// act on.
+//
+// This touches nothing — no window is raised, no menu opened, no plugin re-run
+// — so it is safe to run against seven live channels that other people are
+// using. The menu bar is read deliberately: it hangs off the application
+// element, NOT off the renderer, so a reachable menu bar with an unreachable
+// renderer tree means the plugin menu could still be driven and only window
+// identification is lost.
+func scriptProbe(baseURL: String, project: Project, timeout: TimeInterval = 8) -> [String: Any] {
+    var components = URLComponents(string: baseURL.hasSuffix("/") ? baseURL + "script/run" : baseURL + "/script/run")
+    components?.queryItems = [URLQueryItem(name: "project", value: project.displayTitle)]
+    guard let url = components?.url else { return ["reached": false, "detail": "bad relay URL"] }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = timeout
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["code": "return figma.root.name"])
+    var payload: Data?
+    let started = Date()
+    let semaphore = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        payload = data
+        semaphore.signal()
+    }.resume()
+    let answered = semaphore.wait(timeout: .now() + timeout + 1) == .success
+    let ms = Int(Date().timeIntervalSince(started) * 1000)
+    guard answered,
+          let data = payload,
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return ["reached": false, "ms": ms, "detail": "relay did not answer"] }
+    if root["ok"] as? Bool == true, let encoded = root["result"] as? String {
+        let name = (try? JSONSerialization.jsonObject(with: Data(encoded.utf8), options: [.fragmentsAllowed])) as? String
+        return ["reached": true, "answered": true, "ms": ms, "document": name ?? encoded]
+    }
+    // The plugin answered and the answer was an error. That is proof the tab
+    // cannot serve commands, which "no reply" never is.
+    let detail = (root["error"] as? String) ?? String(describing: root)
+    return ["reached": true, "answered": false, "ms": ms, "error": detail]
+}
+
+// The Window menu is the one place a window's FILE NAME is still legible when
+// the renderer tree is gone.
+//
+// Everything else the launcher uses to tell windows apart comes from the
+// renderer (AXTitle, tabs) or from the window server (kCGWindowName, which
+// needs Screen Recording). Both have read empty on this fleet for over a week,
+// which is why --force-reconnect can reach the Plugins menu and still not know
+// which window to reach it in. macOS builds the Window menu itself, from the
+// same titles, without either of them.
+func windowMenuTitles(_ appElement: AXUIElement) -> [String] {
+    guard let windowMenu = menuBarItem(appElement, named: "Window") else { return [] }
+    let read: () -> [String] = {
+        axChildren(windowMenu)
+            .filter { role($0) == (kAXMenuRole as String) }
+            .flatMap { axChildren($0) }
+            .map(axText)
+            .filter { !$0.isEmpty }
+    }
+    let titles = read()
+    if !titles.isEmpty { return titles }
+    // Menus populate lazily, so an unopened one reads empty. Open it, read, and
+    // put it back — a menu left open swallows every later click.
+    _ = press(windowMenu)
+    _ = waitUntil(timeout: 2) { !read().isEmpty }
+    let opened = read()
+    dismissOpenMenus()
+    return opened
+}
+
+func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, options: Options) {
+    let axWindows = windows(root)
+    let webAreas = axWindows.filter { window in descendants(window).contains { role($0) == "AXWebArea" } }
+    // An empty name list has two very different causes and the fix differs:
+    // Screen Recording not granted (rows exist, every name is nil) versus the
+    // windows not being on screen at all (no rows to begin with, e.g. another
+    // Space or a locked screen). Report both counts, and count the off-screen
+    // list too so the two can never be confused again.
+    func figmaRows(_ listOptions: CGWindowListOption) -> [[String: Any]] {
+        ((CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID) as? [[String: Any]]) ?? []).filter {
+            ($0[kCGWindowOwnerName as String] as? String) == "Figma"
+                && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
+        }
+    }
+    let rows = figmaRows([.optionOnScreenOnly, .excludeDesktopElements])
+    let allRows = figmaRows([.optionAll, .excludeDesktopElements])
+    let serverNames = rows.compactMap { $0[kCGWindowName as String] as? String }
+    let allNames = allRows.compactMap { $0[kCGWindowName as String] as? String }
+
+    let snapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+    var projects: [[String: Any]] = []
+    for project in config.projects {
+        var row: [String: Any] = ["id": project.id, "title": project.title]
+        switch pluginState(snapshot, project: project, window: nil) {
+        case .missing: row["relay"] = "missing"
+        case .stale(let version): row["relay"] = "stale \(version ?? "?")"
+        case .current(let version, let channelName):
+            row["relay"] = "current \(version ?? "?")"
+            row["channel"] = channelName ?? ""
+        }
+        row["probe"] = scriptProbe(baseURL: options.relayURL, project: project)
+        row["windowFound"] = projectWindow(root, project: project) != nil
+        projects.append(row)
+    }
+
+    let report: [String: Any] = [
+        "doctor": true,
+        "figmaPID": app.processIdentifier,
+        "accessibilityTrusted": AXIsProcessTrusted(),
+        // The renderer tree: needed to match a window to a file via AX.
+        "rendererAccessibilityReady": !webAreas.isEmpty,
+        "axWindowCount": axWindows.count,
+        "axWindowsWithWebArea": webAreas.count,
+        // The native menu bar: independent of the renderer, and the only path
+        // to Plugins > Development.
+        "menuBarTitles": menuBarTitles(root),
+        // Whether a recovery path exists at all without the renderer tree.
+        "windowMenuItems": windowMenuTitles(root),
+        // The window server: the fallback that identifies windows without AX.
+        // Empty names mean Screen Recording is not granted to this process.
+        "windowServerNames": serverNames,
+        "windowServerOnScreenRows": rows.count,
+        "windowServerAllRows": allRows.count,
+        "windowServerAllNames": allNames,
+        "relayReachable": snapshot != nil,
+        "projects": projects,
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]),
+          let text = String(data: data, encoding: .utf8) else { return }
+    print(text)
+}
+
+func emitReport(_ report: Report) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(report), let text = String(data: data, encoding: .utf8) else { return }
+    print(text)
+    if !report.ok {
+        FileHandle.standardError.write(Data(text.utf8))
+    }
+    try? FileManager.default.createDirectory(at: reportPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: reportPath)
+}
+
+do {
+    let options = try parseOptions()
+    let config = try loadConfig(path: options.configPath, selectedIDs: options.selectedIDs, allProjects: options.allProjects)
+    var results = config.projects.map {
+        ProjectResult(
+            id: $0.id, title: $0.title, url: $0.url,
+            status: options.dryRun ? "configured" : "pending", detail: "",
+            channel: nil, step: nil, pluginVersion: nil
+        )
+    }
+    if options.dryRun {
+        // A dry run is also the status report: no UI is touched, but the relay
+        // is asked what is connected and whether it is running current code.
+        let probe = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
+        for (index, project) in config.projects.enumerated() {
+            switch pluginState(probe, project: project, window: nil) {
+            case .missing:
+                results[index].detail = probe == nil ? "relay unreachable — connection state unknown" : "no live plugin"
+            case .stale(let version):
+                results[index].detail = "stale plugin (v\(version ?? "?") vs relay v\(probe?.protocolVersion ?? "?")) — needs a re-run"
+                results[index].pluginVersion = version
+            case .current(let version, let channelName):
+                results[index].pluginVersion = version
+                results[index].channel = channelName
+                if let live = documentMismatch(baseURL: options.relayURL, project: project) {
+                    results[index].detail = "channel answers from \(live) — not this file"
+                    results[index].step = "wrong_document"
+                } else {
+                    results[index].detail = "connected"
+                }
+            }
+        }
+        emitReport(Report(
+            ok: true, dryRun: true,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results,
+            relayReachable: probe != nil, relayProtocolVersion: probe?.protocolVersion, menuBar: nil
+        ))
+        exit(0)
+    }
+
+    // Read-only like --dry-run, and unlocked for the same reason: it is how a
+    // caller (or the health watch's card) sees whether a run would reload
+    // anything before asking for one. Slower — up to ~25s per down tab.
+    if options.linkCheck {
+        let probe = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
+        var rows: [[String: Any]] = []
+        var allLinked = true
+        for project in config.projects {
+            var row: [String: Any] = ["id": project.id, "title": project.title]
+            guard case .current(_, let channelName) = pluginState(probe, project: project, window: nil) else {
+                row["relay"] = probe == nil ? "unreachable" : "no current plugin"
+                row["decision"] = "plugin_first"
+                allLinked = false
+                rows.append(row)
+                continue
+            }
+            let probes = linkProbes(baseURL: options.relayURL, project: project, attempts: options.linkProbes)
+            let load = relayLoad(probe, project: project)
+            let decision = linkRepairDecision(probes, required: options.linkProbes, load: load)
+            if decision != .linked { allLinked = false }
+            row["channel"] = channelName ?? ""
+            row["load"] = load
+            row["probes"] = probes.map(\.summary)
+            row["decision"] = decision.rawValue
+            rows.append(row)
+        }
+        let report: [String: Any] = [
+            "linkCheck": true,
+            "ok": allLinked,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "relayReachable": probe != nil,
+            "projects": rows,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]),
+           let text = String(data: data, encoding: .utf8) {
+            print(text)
+        }
+        exit(0)
+    }
+
+    // Everything past here mutates the UI, so serialise it.
+    //
+    // The grace period is deliberately short. Most collisions are several
+    // agents reacting to the same blip, where the run in front finds nothing
+    // wrong and exits in a few seconds — worth waiting for, because then this
+    // run answers the caller's real question ("is Figma usable now") itself.
+    // A genuine repair takes far longer than any wait worth holding a caller
+    // for, and --dry-run is free and unlocked, so past the grace period the
+    // honest move is to say a repair is running and let the caller poll that.
+    var lockDescriptor: Int32? = nil
+    switch acquireRunLock(waitFor: 20) {
+    case .acquired(let descriptor):
+        lockDescriptor = descriptor
+    case .unavailable:
+        break   // proceed unguarded rather than refuse to repair
+    case .busy:
+        FileHandle.standardError.write(Data("another launcher run is still repairing; not starting a second one\n".utf8))
+        let busySnapshot = fetchRelaySnapshot(baseURL: options.relayURL)
+        emitReport(Report(
+            ok: false, dryRun: false,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results.map { entry in
+                var copy = entry
+                copy.status = "repair_in_progress"
+                copy.detail = "A repair is already running. Nothing is wrong — poll `run.sh --dry-run` (read-only, never blocked) until it reports connected."
+                return copy
+            },
+            relayReachable: busySnapshot != nil, relayProtocolVersion: busySnapshot?.protocolVersion, menuBar: nil
+        ))
+        exit(75)   // EX_TEMPFAIL — retry later, nothing is wrong
+    }
+    defer { if let lockDescriptor { close(lockDescriptor) } }
+
+    let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+    guard AXIsProcessTrustedWithOptions([promptKey: options.promptAccessibility] as CFDictionary) else {
+        throw LauncherError.accessibility
+    }
+    let app = try launchFigmaIfNeeded(timeout: options.timeout)
+    let root = appAX(app)
+
+    // --doctor reports and stops. It must run BEFORE enableRendererAccessibility
+    // so it observes the tree as a normal run finds it, and it deliberately does
+    // not write the report file: a diagnosis is not a run outcome.
+    if options.doctor {
+        runDoctor(app: app, root: root, config: config, options: options)
+        exit(0)
+    }
+
+    // Renderer accessibility has to be up BEFORE anything reads the tree.
+    //
+    // A window's title and its tabs BOTH come from the renderer — unasked, every
+    // Figma window answers AXTitle "Figma" and carries no tab — and
+    // projectWindow() is built out of exactly those two signals. Running the open
+    // loop before this call therefore made every project fail "open_failed" on a
+    // file that was open, connected, and serving plugin commands the whole time,
+    // and pointed repair at the file instead of at the accessibility tree.
+    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
+
+    // Relay ground truth, before any UI is touched.
+    //
+    // A project the relay reports connected, speaking the relay's own protocol
+    // version, and answering from THIS file has already reached everything a run
+    // is for: the file is open, it is in a window of its own, and its plugin is
+    // live on current code. That is proven end-to-end by the plugin itself, which
+    // is strictly better evidence than the accessibility tree — the tree only
+    // ever showed where the window was, never that the channel worked.
+    //
+    // Re-deriving it from AX adds no proof and, when the tree is unavailable,
+    // destroys the state it was checking: projectWindow() can never find the
+    // window, so openProject() re-opens the file's URL on every run and Figma
+    // accumulates a window per project per attempt.
+    var snapshot = fetchRelaySnapshotPatiently(baseURL: options.relayURL)
+    var healthy: [String: (version: String?, channel: String?)] = [:]
+    if !options.openOnly {
+        for project in config.projects {
+            guard case .current(let version, let channelName) = pluginState(snapshot, project: project, window: nil),
+                  documentMismatch(baseURL: options.relayURL, project: project) == nil else { continue }
+            healthy[project.id] = (version, channelName)
+        }
+    }
+
+    // --force-reconnect exists to re-run the plugin so Figma re-reads a deployed
+    // code.js, and it still does whenever the menu can actually be driven. With
+    // the renderer tree down there is no menu path to the plugin at all, so the
+    // honest move is to keep the verified-current connection and say the forced
+    // re-run was skipped — not to tear down seven working channels chasing a
+    // re-run that cannot happen, and not to fail a run whose goal is already met.
+    func alreadySatisfied(_ project: Project) -> Bool {
+        healthy[project.id] != nil && (!options.forceReconnect || !accessibilityReady)
+    }
+
+    // No relay and no renderer tree means the run can neither tell which projects
+    // are already fine nor find any window — so openProject() would only re-open
+    // every URL and leave Figma a duplicate window per project, the exact damage
+    // the relay-first check exists to prevent. Touch nothing and say why.
+    if snapshot == nil && !accessibilityReady && !options.openOnly {
+        emitReport(Report(
+            ok: false, dryRun: false,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            results: results.map { entry in
+                var copy = entry
+                copy.status = "relay_unreachable"
+                copy.step = "relay_unreachable"
+                copy.detail = "Relay at \(options.relayURL) did not answer /channels after 4 attempts and the renderer accessibility tree is down, so no window can be matched — nothing was opened. Check the relay (and host load), then poll `run.sh --dry-run`."
+                return copy
+            },
+            relayReachable: false, relayProtocolVersion: nil, menuBar: nil
+        ))
+        exit(1)
+    }
+
+    // A connected plugin on a document that lost Figma's servers is not
+    // connected in any sense a caller cares about: every lookup of a node the
+    // tab does not hold fails, and page listings come back short without an
+    // error. Find those tabs and reload them from the server — Save and reload
+    // when Figma offers it, otherwise close and reopen the tab — then re-attach
+    // the plugin and prove the link. Only an idle tab is touched, and only
+    // after every probe in a row came back with Figma's connection error.
+    var linkHeld = Set<String>()               // handled here; its result is final
+    var linkCanaryFailed: String? = nil
+
+    // Open (after a close), give the file its own window, run the plugin, and
+    // only call it connected once the document answers Figma's servers. The
+    // relay may still list the frozen tab's old socket for a moment, so a
+    // connect alone proves nothing here.
+    func reattachAfterReload(index: Int, project: Project, how: String, oldChannel: String?) {
+        func fail(_ step: String, _ detail: String) {
+            results[index].status = "plugin_failed"
+            results[index].step = step
+            results[index].detail = detail
+        }
+        // Let the frozen tab's plugin socket go first, or the handshake below
+        // is satisfied by the very connection the reload just killed.
+        if let oldChannel {
+            _ = waitUntil(timeout: 30, interval: 1) {
+                guard let snapshot = fetchRelaySnapshot(baseURL: options.relayURL) else { return false }
+                return relayConnection(snapshot, for: project)?.channel != oldChannel
+            }
+        }
+        guard openProject(project, app: app, appElement: root, timeout: options.timeout) else {
+            return fail("open_failed", "Reloaded the tab (\(how)) but the file did not open again before timeout")
+        }
+        guard splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout),
+              let window = projectWindow(root, project: project) else {
+            return fail("separation_failed", "Reloaded the tab (\(how)) but could not give the file its own window")
+        }
+        let outcome = activatePlugin(
+            app, appElement: root, window: window, project: project,
+            pluginTitle: config.pluginMenuTitle, relayURL: options.relayURL,
+            relayReachable: true, timeout: options.timeout
+        )
+        guard case .connected(let version, let channelName) = outcome else {
+            if case .failed(let step, let detail, _) = outcome { fail(step, "Reloaded the tab (\(how)); \(detail)") }
+            return
+        }
+        results[index].pluginVersion = version
+        results[index].channel = channelName ?? channel(in: window)
+        if let live = documentMismatch(baseURL: options.relayURL, project: project) {
+            return fail("wrong_document", "Reloaded the tab (\(how)) but the plugin answers from \(live)")
+        }
+        let link = linkRecovery(baseURL: options.relayURL, project: project)
+        guard case .up = link else {
+            return fail("link_down_after_repair", "Reloaded the tab (\(how)) and re-attached the plugin, but the document still cannot reach Figma's servers — \(link.summary). Figma itself may be offline or its session stuck; that needs a person (check its connection, or restart Figma)")
+        }
+        results[index].status = "connected"
+        results[index].step = nil
+        results[index].detail = "Document reloaded from Figma's servers (\(how)) and plugin re-attached — \(link.summary)"
+    }
+    if !options.openOnly {
+        for (index, project) in config.projects.enumerated() where healthy[project.id] != nil {
+            let probes = linkProbes(baseURL: options.relayURL, project: project, attempts: options.linkProbes)
+            let load = relayLoad(snapshot, project: project)
+            let last = probes.last?.summary ?? "no probe"
+            func hold(_ step: String, _ detail: String) {
+                linkHeld.insert(project.id)
+                results[index].status = "link_down"
+                results[index].step = step
+                results[index].detail = "\(detail) (\(last))"
+                results[index].pluginVersion = healthy[project.id]?.version
+                results[index].channel = healthy[project.id]?.channel
+            }
+            switch linkRepairDecision(probes, required: options.linkProbes, load: load) {
+            case .linked, .inconclusive:
+                continue
+            case .busy:
+                hold("busy", "Document lost Figma's servers, but \(load) request(s) are running or queued on it — not reloaded under them. Rerun once it is idle")
+                healthy[project.id] = nil
+            case .repair:
+                guard options.linkRepair else {
+                    hold("repair_disabled", "Document lost Figma's servers; --no-link-repair, so the tab was not reloaded")
+                    healthy[project.id] = nil
+                    continue
+                }
+                guard accessibilityReady, let window = projectWindow(root, project: project) else {
+                    hold(accessibilityReady ? "window_missing" : "renderer_accessibility",
+                         "Document lost Figma's servers, but its window cannot be found to reload it — Save and reload or close and reopen this file's tab by hand, then rerun")
+                    healthy[project.id] = nil
+                    continue
+                }
+                let oldChannel = healthy[project.id]?.channel ?? nil
+                healthy[project.id] = nil
+                // One tab at a time, each proven before the next. When every
+                // tab is down at once the cause may be Figma itself, and then
+                // a reopened file would come back just as cut off — or not
+                // load at all. The first failure stops the rest.
+                if let failed = linkCanaryFailed {
+                    hold("waiting_on_first_repair", "Document lost Figma's servers; not reloaded because reloading \(failed) did not bring its link back, so Figma itself is the likely cause")
+                    continue
+                }
+                linkHeld.insert(project.id)
+                let how: String
+                switch reloadFromServer(app, appElement: root, project: project, window: window, timeout: options.timeout) {
+                case .reloaded(let way): how = way
+                case .reopen: how = "close_and_reopen"
+                case .failed(let step, let detail):
+                    hold(step, detail)
+                    if step != "unsaved_changes" { linkCanaryFailed = project.title }
+                    continue
+                }
+                reattachAfterReload(index: index, project: project, how: how, oldChannel: oldChannel)
+                if results[index].status != "connected" { linkCanaryFailed = project.title }
+            }
+        }
+    }
+
+    for (index, project) in config.projects.enumerated() {
+        if linkHeld.contains(project.id) { continue }
+        if alreadySatisfied(project), let live = healthy[project.id] {
+            results[index].status = "connected"
+            results[index].pluginVersion = live.version
+            results[index].channel = live.channel
+            results[index].detail = options.forceReconnect
+                ? "Talk To Figma MCP is connected on relay v\(snapshot?.protocolVersion ?? "?") — forced re-run skipped, no renderer accessibility tree to reach Plugins > Development through"
+                : "Talk To Figma MCP is connected"
+            continue
+        }
+        if openProject(project, app: app, appElement: root, timeout: options.timeout) {
+            results[index].status = "opened"
+            results[index].detail = "Figma file is open"
+        } else {
+            results[index].status = "open_failed"
+            // Not knowing which window holds the file is a different failure from
+            // the file not opening, and only one of them is about the file.
+            if accessibilityReady {
+                results[index].detail = "Figma file did not appear before timeout"
+            } else {
+                results[index].step = "renderer_accessibility"
+                results[index].detail = "Figma's renderer accessibility tree never populated, so no window can be matched to a file — AXManualAccessibility was accepted but ignored"
+            }
+        }
+    }
+    for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
+        if !accessibilityReady {
+            results[index].status = "separation_failed"
+            results[index].step = "renderer_accessibility"
+            results[index].detail = "Figma's renderer accessibility tree never populated, so no tab is visible to the launcher"
+            continue
+        }
+        if splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
+            results[index].status = options.openOnly ? "opened" : "separated"
+            results[index].detail = "Project is in a distinct Figma window"
+        } else {
+            results[index].status = "separation_failed"
+            results[index].detail = "Could not move the design tab to a distinct window"
+        }
+    }
+    var menuBarSeen: [String]?
+    if !options.openOnly {
+        for (index, project) in config.projects.enumerated() where results[index].status == "separated" {
+            guard let window = projectWindow(root, project: project) else {
+                results[index].status = "window_missing"
+                results[index].detail = "Project window disappeared before plugin launch"
+                continue
+            }
+            // Put a crashed renderer back before judging anything else, or the
+            // run reports a plugin timeout for a window that never had a
+            // document to begin with.
+            if !rendererIsUp(window) {
+                if reloadCrashedRenderer(app, appElement: root, window: window, timeout: options.timeout) {
+                    // The reload replaces the renderer, so any channel this
+                    // project held is gone — re-read before deciding.
+                    snapshot = fetchRelaySnapshot(baseURL: options.relayURL) ?? snapshot
+                } else {
+                    results[index].status = "plugin_failed"
+                    results[index].step = "renderer_crashed"
+                    results[index].detail = "Window's renderer had crashed and Reload did not bring the document back"
+                    continue
+                }
+            }
+            // Already connected AND running the relay's own version: leave it
+            // alone (re-running would drop a healthy channel). A stale plugin is
+            // re-run without asking — that is the whole point of a deploy.
+            // Leaving a healthy channel alone is only right when the channel is
+            // in THIS file. A stale announce points at another document, and
+            // skipping the re-run there would preserve exactly the wrong state.
+            if case .current(let version, let channelName) = pluginState(snapshot, project: project, window: window),
+               !options.forceReconnect,
+               documentMismatch(baseURL: options.relayURL, project: project) == nil {
+                results[index].status = "connected"
+                results[index].detail = "Talk To Figma MCP is connected"
+                results[index].pluginVersion = version
+                results[index].channel = channelName ?? channel(in: window)
+                continue
+            }
+            let outcome = activatePlugin(
+                app,
+                appElement: root,
+                window: window,
+                project: project,
+                pluginTitle: config.pluginMenuTitle,
+                relayURL: options.relayURL,
+                relayReachable: snapshot != nil,
+                timeout: options.timeout
+            )
+            switch outcome {
+            case .connected(let version, let channelName):
+                results[index].pluginVersion = version
+                results[index].channel = channelName ?? channel(in: window)
+                // The panel says connected and the relay agrees, but both are
+                // reading an announce. Ask the plugin itself before calling it
+                // a success — a run that ends "connected" on the wrong file is
+                // the one failure nobody notices until data lands in it.
+                if let live = documentMismatch(baseURL: options.relayURL, project: project) {
+                    results[index].status = "plugin_failed"
+                    results[index].step = "wrong_document"
+                    results[index].detail = "Plugin connected but answers from \(live) — this file shares a window with it"
+                } else {
+                    results[index].status = "connected"
+                    results[index].detail = "Talk To Figma MCP is connected"
+                }
+            case .failed(let step, let detail, let menuBar):
+                results[index].status = "plugin_failed"
+                results[index].detail = detail
+                results[index].step = step
+                if let menuBar, menuBarSeen == nil { menuBarSeen = menuBar }
+            }
+            // Channels change on every plugin re-run, so re-read ground truth.
+            snapshot = fetchRelaySnapshot(baseURL: options.relayURL) ?? snapshot
+        }
+    }
+    let expected = options.openOnly ? "opened" : "connected"
+    let ok = results.allSatisfy { $0.status == expected }
+    emitReport(Report(
+        ok: ok,
+        dryRun: false,
+        timestamp: ISO8601DateFormatter().string(from: Date()),
+        results: results,
+        relayReachable: snapshot != nil,
+        relayProtocolVersion: snapshot?.protocolVersion,
+        menuBar: menuBarSeen
+    ))
+    exit(ok ? 0 : 1)
+} catch {
+    let result = ProjectResult(
+        id: "launcher", title: "launcher", url: "",
+        status: "launcher_failed", detail: String(describing: error),
+        channel: nil, step: nil, pluginVersion: nil
+    )
+    emitReport(Report(
+        ok: false, dryRun: false,
+        timestamp: ISO8601DateFormatter().string(from: Date()),
+        results: [result],
+        relayReachable: nil, relayProtocolVersion: nil, menuBar: nil
+    ))
+    exit(error is LauncherError ? 2 : 70)
+}
