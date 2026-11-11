@@ -7,8 +7,13 @@
 // cannot fix it — because nothing told link-down apart from a missing plugin.
 import assert from 'node:assert/strict';
 import {LINK_REPAIR_AFTER_MS, isLinkDownDetail, linkFailureDetail, trackLinkDown, linkRepairPlan,
-  linkRepairLine, shouldTriggerLinkRepair, nextLinkRepairAt, resolveLinkRepairCmd,
+  linkRepairLine, shouldTriggerRepair, nextRepairAt, resolveLinkRepairCmd,
   LINK_REPAIR_RETRY_MS, LINK_REPAIR_BUSY_RETRY_MS} from '../src/health_watch/report-policy.mjs';
+
+// The link-down half of the one repair decision (the plugin-missing half is in
+// health-outage-policy.test.mjs). Same assertions as before the two were merged.
+const shouldTriggerLinkRepair = (linkPlan, options) => shouldTriggerRepair({linkPlan, ...options});
+const nextLinkRepairAt = nextRepairAt;
 
 const down = `2회 연속 실패 — 1차: ${linkFailureDetail({error: 'Unable to establish connection to Figma after 10 seconds'})} · pages 936ms · link 12056ms`;
 const slow = `2회 연속 실패 — 1차: ${linkFailureDetail({error: 'no answer in 15000ms'})}`;
