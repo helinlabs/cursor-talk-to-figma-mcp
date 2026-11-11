@@ -1757,6 +1757,29 @@ do {
     var linkHeld = Set<String>()               // handled here; its result is final
     var linkCanaryFailed: String? = nil
 
+    // A window titled after this file that no other configured project resolves
+    // to. See the separation pass below for why that is enough when no tab can
+    // be walked.
+    func ownWindowByTitle(_ project: Project) -> Bool {
+        guard let window = projectWindow(root, project: project) else { return false }
+        return !config.projects.contains { other in
+            other.id != project.id
+                && projectWindow(root, project: other).map { CFEqual($0, window) } == true
+        }
+    }
+    // The file in a window of its own, by the tab when tabs are exposed and by
+    // the title when they are not. The link repair's reattach used only the
+    // tab: macmini_m1, 2026-11-11 10:59 — after Reload All Tabs the tab strip
+    // exposed no AXTab, the watcher's link repair closed and reopened
+    // T_Product, and the reattach stopped at separation_failed with the file
+    // open in its own window and no plugin in it (relay 9 → 8).
+    func separated(_ project: Project) -> Bool {
+        if accessibilityReady, projectTab(root, project: project) != nil {
+            return splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout)
+        }
+        return ownWindowByTitle(project)
+    }
+
     // Open (after a close), give the file its own window, run the plugin, and
     // only call it connected once the document answers Figma's servers. The
     // relay may still list the frozen tab's old socket for a moment, so a
@@ -1778,7 +1801,7 @@ do {
         guard openProject(project, app: app, appElement: root, timeout: options.timeout) else {
             return fail("open_failed", "Reloaded the tab (\(how)) but the file did not open again before timeout")
         }
-        guard splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout),
+        guard separated(project),
               let window = projectWindow(root, project: project) else {
             return fail("separation_failed", "Reloaded the tab (\(how)) but could not give the file its own window")
         }
@@ -1946,15 +1969,8 @@ do {
         // project resolves to is this file's own window as far as a run needs:
         // the plugin runs in the active tab, and the relay's document check
         // afterwards catches a wrong file.
-        func ownWindowByTitle() -> Bool {
-            guard let window = projectWindow(root, project: project) else { return false }
-            return !config.projects.contains { other in
-                other.id != project.id
-                    && projectWindow(root, project: other).map { CFEqual($0, window) } == true
-            }
-        }
         if !accessibilityReady || projectTab(root, project: project) == nil {
-            if ownWindowByTitle() {
+            if ownWindowByTitle(project) {
                 results[index].status = options.openOnly ? "opened" : "separated"
                 results[index].detail = "Project window matched by title (tabs not exposed to accessibility, so not inspected)"
                 continue

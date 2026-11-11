@@ -38,6 +38,13 @@ assert.match(branch, /pressReloadAllTabs\(root\)/, 'the decision presses Reload 
 assert.doesNotMatch(branch, /exit\(/, 'the dead-renderer branch must carry on to reopen and attach, not exit');
 assert.match(branch, /accessibilityReady = /, 'the renderer tree is re-read after the reload');
 assert.match(main, /recovery: recovery/, 'the report says what was done');
+// The reattach after a link repair must find the window the same way the
+// normal pass does. 2026-11-11 10:59: tabs not exposed after Reload All Tabs,
+// the reattach asked for the tab only, and T_Product was left open with no plugin.
+const reattach = main.slice(main.indexOf('func reattachAfterReload('), main.indexOf('func settleUnclosedTab('));
+assert.match(reattach, /guard separated\(project\)/, 'reattach uses the tab-or-title separation');
+assert.doesNotMatch(reattach, /splitIntoNewWindow\(/, 'reattach must not require an exposed tab');
+assert.match(main, /func separated\(_ project: Project\) -> Bool \{[\s\S]{0,400}ownWindowByTitle\(project\)/, 'title fallback when no tab is exposed');
 assert.doesNotMatch(source, /terminate\(\)|forceTerminate\(\)|killall/, 'the launcher never quits Figma');
 
 const swiftc = spawnSync('xcrun', ['--find', 'swiftc'], {encoding: 'utf8'});
