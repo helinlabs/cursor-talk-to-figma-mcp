@@ -1269,10 +1269,13 @@ function runRepair(linkTargets: string[], pluginTargets: string[]): void {
   pendingChanges.push(`:wrench: ${clock()} · 자동 복구 시작${attempt} (런처 실행) — ${why}`);
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(["/bin/zsh", "-c", LINK_REPAIR_CMD], { stdout: "pipe", stderr: "pipe" });
+    // zsh is what the launcher scripts are written for; sh only so this still
+    // runs where zsh is absent (the Linux CI runner), instead of failing to spawn.
+    const shell = existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
+    proc = Bun.spawn([shell, "-c", LINK_REPAIR_CMD], { stdout: "pipe", stderr: "pipe" });
   } catch (error) {
     linkRepairStartedAt = 0;
-    state.linkRepairResult = { at: Date.now(), code: -1 };
+    state.linkRepairResult = { at: Date.now(), ...repairOutcome(-1, "") };
     pendingChanges.push(`:warning: ${clock()} · 자동 복구를 시작하지 못함: ${String(error).slice(0, 200)}`);
     return;
   }
