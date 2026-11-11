@@ -191,19 +191,8 @@ export function linkRepairLine(plan, name = (key) => key) {
 // "someone else is on it", so look again sooner.
 export const LINK_REPAIR_RETRY_MS = 60 * 60_000;
 export const LINK_REPAIR_BUSY_RETRY_MS = 10 * 60_000;
-export function shouldTriggerLinkRepair(plan, { configured, triggeredAt, incidentSince, running = false,
-  result = null, now = Date.now(), retryMs = LINK_REPAIR_RETRY_MS, busyRetryMs = LINK_REPAIR_BUSY_RETRY_MS }) {
-  if (!configured || !plan.ready.length || running) return false;
-  if (!(triggeredAt && triggeredAt >= incidentSince)) return true;
-  const lockedOut = result && result.at >= triggeredAt && result.code === 75;
-  return now - triggeredAt >= (lockedOut ? busyRetryMs : retryMs);
-}
-
-export function nextLinkRepairAt({ triggeredAt, result, retryMs = LINK_REPAIR_RETRY_MS, busyRetryMs = LINK_REPAIR_BUSY_RETRY_MS }) {
-  if (!triggeredAt) return null;
-  const lockedOut = result && result.at >= triggeredAt && result.code === 75;
-  return triggeredAt + (lockedOut ? busyRetryMs : retryMs);
-}
+// The decision itself is shouldTriggerRepair, further down: the same launcher
+// run also serves projects whose plugin is missing, so there is one clock.
 
 // HEALTH_LINK_REPAIR_CMD wins when set — "" / off / 0 / false switch it off on
 // purpose. Unset means the device's launcher if it is installed, nothing if not.
@@ -215,4 +204,170 @@ export function resolveLinkRepairCmd(env, home, exists) {
   }
   const path = `${home}${DEFAULT_LINK_REPAIR_SUFFIX}`;
   return exists(path) ? path : '';
+}
+
+// --- plugin-missing recovery -------------------------------------------------
+// The link repair above only ever looked at documents that lost Figma's
+// servers. On 2026-11-10 19:35 KST every user process on macmini-1 took a
+// SIGTERM; launchd brought the relay and this watcher straight back, but Figma
+// was left as a main process with no renderers — nine project windows without
+// a plugin among them. Nothing was link-down (there was no plugin to ask), so
+// the repair never ran: one attempt at 18:33 for an earlier link failure, then
+// 14 hours 46 minutes of connections.figma=0 until someone ran the launcher by
+// hand. A plugin that stays missing is the launcher's job just as much.
+//
+// Ten minutes, not the two polls that confirm a drop: a Figma update, a person
+// reloading a tab, or the relay restarting all clear by themselves well inside
+// that, and the launcher drives real windows.
+export const PLUGIN_REPAIR_AFTER_MS = 10 * 60_000;
+
+// downSince: expected title -> when its plugin was confirmed missing. With the
+// relay down nothing is "ready": the launcher cannot verify a connection
+// without it, and the card already says the relay is the problem.
+export function pluginRepairPlan(downSince, now, afterMs = PLUGIN_REPAIR_AFTER_MS, relayUp = true) {
+  const ready = [], waiting = [];
+  let since = null;
+  for (const [name, at] of Object.entries(downSince || {})) {
+    since = since == null ? at : Math.min(since, at);
+    (relayUp && now - at >= afterMs ? ready : waiting).push(name);
+  }
+  return { ready, waiting, since, readyAt: since == null ? null : since + afterMs };
+}
+
+// What a finished launcher run said, reduced to what the card and the retry
+// clock need. stdout is the launcher's JSON report (run.sh prints nothing
+// else); anything unparseable still yields the exit code.
+//
+// `blocked` names a reason no retry can get past by itself, so the card can say
+// who has to do what instead of "exit 1".
+export function repairOutcome(code, stdout) {
+  let report = null;
+  const text = String(stdout ?? '');
+  const from = text.indexOf('{'), to = text.lastIndexOf('}');
+  if (from >= 0 && to > from) {
+    try { report = JSON.parse(text.slice(from, to + 1)); } catch { report = null; }
+  }
+  const results = Array.isArray(report?.results) ? report.results : [];
+  const failed = results.filter((entry) => entry?.status !== 'connected')
+    .map((entry) => ({ title: String(entry?.title ?? entry?.id ?? '?'), status: String(entry?.status ?? '?'), step: entry?.step ? String(entry.step) : null }));
+  const details = results.map((entry) => String(entry?.detail ?? '')).join(' ');
+  let blocked = null;
+  if (code === 75 || failed.some((entry) => entry.status === 'repair_in_progress')) blocked = 'repair_in_progress';
+  else if (failed.some((entry) => entry.status === 'screen_locked')) blocked = 'screen_locked';
+  else if (failed.some((entry) => entry.status === 'relay_unreachable')) blocked = 'relay_unreachable';
+  else if (failed.some((entry) => entry.status === 'launcher_failed') && /accessibility/i.test(details)) blocked = 'accessibility';
+  else if (failed.some((entry) => entry.status === 'launcher_failed')) blocked = 'launcher_error';
+  else if (code !== 0 && !results.length) blocked = 'no_report';
+  return {
+    code, blocked,
+    total: results.length,
+    connected: results.length - failed.length,
+    failed: failed.slice(0, 12),
+  };
+}
+
+const BLOCKED_TEXT = {
+  repair_in_progress: '다른 복구가 이미 진행 중이라 이번 실행은 아무것도 하지 않음 (exit 75 — 실패 아님)',
+  screen_locked: ':lock: macmini-1 화면이 잠겨 있어 복구 불가 — 콘솔(또는 화면 공유)에서 잠금을 풀어야 합니다. 잠긴 동안 런처는 창을 건드리지 않으며, 풀리면 다음 재시도에서 복구됩니다',
+  relay_unreachable: '런처가 릴레이(3055)에 닿지 못해 아무것도 열지 않음 — 릴레이·호스트 부하 확인 필요',
+  accessibility: '런처에 손쉬운 사용(Accessibility) 권한이 없어 Figma 창을 조작할 수 없음 — macmini-1 시스템 설정에서 허용 필요',
+  launcher_error: '런처가 실행 중 오류로 끝남 — 로그 ~/.talk-to-figma/link-repair.log',
+  no_report: '런처가 리포트 없이 끝남(빌드 실패·강제 종료 가능) — 로그 ~/.talk-to-figma/link-repair.log',
+};
+
+export function repairOutcomeLine(outcome) {
+  if (!outcome) return null;
+  if (outcome.blocked && BLOCKED_TEXT[outcome.blocked]) return BLOCKED_TEXT[outcome.blocked];
+  if (!outcome.failed?.length) return outcome.total ? `${outcome.connected}/${outcome.total} 연결 확인` : `exit ${outcome.code}`;
+  const shown = outcome.failed.slice(0, 4)
+    .map((entry) => `${entry.title}(${entry.step ? `${entry.status}/${entry.step}` : entry.status})`);
+  const more = outcome.failed.length > shown.length ? ` 외 ${outcome.failed.length - shown.length}` : '';
+  return `연결 ${outcome.connected}/${outcome.total} · 실패: ${shown.join(', ')}${more}`;
+}
+
+// How long to wait before running the launcher again inside one incident.
+//
+// - Another run holds the lock (75) or the screen is locked: nothing was
+//   touched and nothing can be until that clears, so look again soon — the
+//   locked launcher reads one flag and exits.
+// - A run that failed with plugins still missing: back off 10 → 20 → 40 min up
+//   to the hourly ceiling. One slow file load (connect_timeout) must not cost
+//   an hour of a total outage, and a launcher that cannot fix it must not keep
+//   driving windows every ten minutes either.
+// - Link-down only keeps the hourly cadence it had: that repair closes and
+//   reopens tabs.
+export function repairRetryDelay({ result, triggeredAt, attempts = 1, pluginReady = false,
+  retryMs = LINK_REPAIR_RETRY_MS, busyRetryMs = LINK_REPAIR_BUSY_RETRY_MS }) {
+  const finished = result && result.at >= triggeredAt;
+  // No result and (the caller checked) nothing running: the run was lost — the
+  // watcher itself was restarted under it, as on 11-10 19:35 — or has been
+  // going for half an hour. With plugins missing, ask again soon: the lock
+  // answers a second run with 75 if the first is still alive. Link-down alone
+  // keeps its hourly clock.
+  if (!finished) return pluginReady ? busyRetryMs : retryMs;
+  if (result.code === 75 || result.blocked === 'repair_in_progress' || result.blocked === 'screen_locked') return busyRetryMs;
+  if (pluginReady && result.code !== 0) {
+    return Math.min(retryMs, busyRetryMs * 2 ** Math.max(0, attempts - 1));
+  }
+  return retryMs;
+}
+
+// One launcher run serves both causes (it reopens what is missing and reloads
+// what is link-down), so there is one decision and one clock.
+//
+// First run of an incident: at once. Later: on the retry clock — except when
+// something became ready that broke AFTER the last run started. That run
+// cannot have fixed it, and making it wait out a clock set by an unrelated
+// earlier attempt is the 11-10 outage in miniature (18:33 link repair, 19:36
+// everything gone).
+export function shouldTriggerRepair({ linkPlan, pluginPlan, linkDownSince = {}, downSince = {}, configured,
+  running = false, triggeredAt = 0, incidentSince = 0, result = null, attempts = 1, now = Date.now(),
+  retryMs = LINK_REPAIR_RETRY_MS, busyRetryMs = LINK_REPAIR_BUSY_RETRY_MS }) {
+  const linkReady = linkPlan?.ready || [], pluginReady = pluginPlan?.ready || [];
+  if (!configured || running || !(linkReady.length + pluginReady.length)) return false;
+  if (!(triggeredAt && triggeredAt >= incidentSince)) return true;
+  const brokeSince = pluginReady.some((name) => (downSince[name] || 0) > triggeredAt)
+    || linkReady.some((key) => (linkDownSince[key] || 0) > triggeredAt);
+  if (brokeSince) return true;
+  return now - triggeredAt >= repairRetryDelay({ result, triggeredAt, attempts, pluginReady: pluginReady.length > 0, retryMs, busyRetryMs });
+}
+
+export function nextRepairAt({ triggeredAt, result, attempts = 1, pluginReady = false,
+  retryMs = LINK_REPAIR_RETRY_MS, busyRetryMs = LINK_REPAIR_BUSY_RETRY_MS }) {
+  if (!triggeredAt) return null;
+  return triggeredAt + repairRetryDelay({ result, triggeredAt, attempts, pluginReady, retryMs, busyRetryMs });
+}
+
+// --- telling someone again ---------------------------------------------------
+// An edit does not notify. The 19:36 total outage on 2026-11-10 landed as an
+// edit to the 18:08 card (one project's deep check) plus thread replies, so the
+// channel showed nothing new and nobody looked for 14 hours. Two things now
+// earn a NEW top-level message inside a running incident:
+//
+//   total_outage    — it got categorically worse: no required project has a
+//                     plugin (or the relay is gone), held for a few polls so a
+//                     relay restart does not page anyone.
+//   still_degraded  — it has gone unanswered: an hour since the last alert.
+//                     After the first reminder an unchanged picture repeats
+//                     only every six hours; a changed one (other projects, the
+//                     relay) is news again after an hour.
+export const REALERT_AFTER_MS = 60 * 60_000;
+export const REALERT_UNCHANGED_MS = 6 * 60 * 60_000;
+export const TOTAL_OUTAGE_CONFIRM_MS = 3 * 60_000;
+
+export const isTotalOutage = (health) => (health?.expected?.length || 0) > 0
+  && (!health.relayUp || (health.missing?.length || 0) >= health.expected.length);
+
+// What the alert was about, for "is this the same thing I already said".
+export function alertSignature(health) {
+  return JSON.stringify([Boolean(health?.relayUp), [...(health?.missing || [])].sort(), [...(health?.failingDeep || [])].sort()]);
+}
+
+export function realertDecision({ totalSince = 0, totalAlerted = false, lastAlertAt = 0, lastSignature = '', signature = '',
+  reminders = 0, now = Date.now(), afterMs = REALERT_AFTER_MS, unchangedMs = REALERT_UNCHANGED_MS,
+  confirmMs = TOTAL_OUTAGE_CONFIRM_MS }) {
+  if (totalSince && !totalAlerted && now - totalSince >= confirmMs) return 'total_outage';
+  if (!lastAlertAt || now - lastAlertAt < afterMs) return null;
+  if (reminders === 0 || signature !== lastSignature || now - lastAlertAt >= unchangedMs) return 'still_degraded';
+  return null;
 }

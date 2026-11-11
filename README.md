@@ -238,9 +238,46 @@ incident, not a continuous failure of every file.
 
 Project error summaries are capped at 180 characters; full probe detail remains
 available at `http://localhost:3057/preview`. Outgoing Slack text is capped at
-3,500 characters. A `msg_too_long` rejection retries once with 1,500 characters,
-keeping the same message timestamp. Only `message_not_found` creates a replacement
+3,900 UTF-8 **bytes** (Slack's limit is bytes, and hangul is three each). A
+`msg_too_long` rejection retries once at 2,000 bytes, keeping the same message
+timestamp. Only `message_not_found` creates a replacement
 card; authentication, permission and transient errors cannot create duplicates.
+
+### When the watcher acts by itself, and when it says it again
+
+The watcher runs the device's launcher (`~/.codex/skills/figma-product-mcp/scripts/run-broker.sh`,
+the same script as the `figma-open-projects` broker action; `HEALTH_LINK_REPAIR_CMD=off` disables it)
+for two causes, on one clock:
+
+| Cause | Sent after | Knob |
+|---|---|---|
+| A document lost Figma's servers (plugin connected) | 15 min, idle tabs only | `HEALTH_LINK_REPAIR_MS` |
+| A required project has **no plugin** | 10 min | `HEALTH_PLUGIN_REPAIR_MS` |
+
+Inside an incident it runs again while the cause lasts: hourly after a run that
+finished (`HEALTH_LINK_REPAIR_RETRY_MS`); with plugins still missing after a failed
+run, 10 → 20 → 40 → 60 min; every 10 min (`HEALTH_REPAIR_BUSY_RETRY_MS`) after a run
+that touched nothing — exit `75` (another launcher holds the lock; never a failure)
+or a locked screen. Something that broke after the last run started does not wait
+for that run's clock. The card carries the launcher's own reason when a run could
+not work — a locked console is named as such, with who has to unlock it.
+
+An edit to a Slack message notifies nobody, so inside a running incident two things
+are posted as a **new top-level message** (which then becomes the card that is
+rewritten, and the old card is cut down to a pointer):
+
+- **전면 끊김** — no required project has a plugin, or the relay is gone, held for
+  3 min (`HEALTH_TOTAL_OUTAGE_CONFIRM_MS`) so a relay restart pages nobody. Once per
+  total outage.
+- **다시 알림** — an hour since the incident's last alert (`HEALTH_REALERT_MS`). After
+  the first reminder an unchanged picture repeats only every 6 h
+  (`HEALTH_REALERT_UNCHANGED_MS`); a changed one is news again after an hour.
+
+`GET :3057/` shows both under `linkRepair` (last run, its outcome, `pluginDownSince`)
+and `alerts`. `scripts/health-outage-policy.test.mjs` replays the 2026-11-10 outage
+(14 h 46 min with every plugin gone, one edited card, no launcher run) against these
+rules, and `scripts/health-outage-recovery.test.mjs` drives the real watcher through
+it with stand-ins for the relay, Slack and the launcher.
 
 Deploy watcher changes with `./scripts/health-watchctl.sh restart`. These changes
 use the existing plugin's `timeoutMs` parameter, so neither the Figma plugin nor

@@ -28,8 +28,10 @@ import WebSocket from "ws";
 import { PROTOCOL_VERSION } from "../shared/version";
 import {
   LINK_TIMEOUT_MS, linkFailureDetail, detailSummary, cardDetail, fitSlackCard, replaceableSlackMessage, deliverSlack,
-  tickScopedSlack, LINK_REPAIR_AFTER_MS, trackLinkDown, linkRepairPlan, linkRepairLine, shouldTriggerLinkRepair,
-  nextLinkRepairAt, resolveLinkRepairCmd, LINK_REPAIR_RETRY_MS,
+  tickScopedSlack, LINK_REPAIR_AFTER_MS, trackLinkDown, linkRepairPlan, linkRepairLine,
+  resolveLinkRepairCmd, LINK_REPAIR_RETRY_MS, LINK_REPAIR_BUSY_RETRY_MS,
+  PLUGIN_REPAIR_AFTER_MS, pluginRepairPlan, repairOutcome, repairOutcomeLine, shouldTriggerRepair, nextRepairAt,
+  REALERT_AFTER_MS, REALERT_UNCHANGED_MS, TOTAL_OUTAGE_CONFIRM_MS, isTotalOutage, alertSignature, realertDecision,
 } from "./report-policy.mjs";
 
 const RELAY_HTTP = process.env.HEALTH_RELAY_HTTP || "http://127.0.0.1:3055";
@@ -104,9 +106,24 @@ const LINK_REPAIR_MS = Number(process.env.HEALTH_LINK_REPAIR_MS || LINK_REPAIR_A
 // (the card then only says what to run). The launcher holds its own lock (exit
 // 75 when a repair is already running), touches only idle link-down tabs, and
 // stops on an unsaved-changes prompt, so retrying it inside an incident is safe
-// to automate — see shouldTriggerLinkRepair for the cadence.
+// to automate — see shouldTriggerRepair for the cadence. The same run is sent
+// for a required project whose plugin stays missing (PLUGIN_REPAIR_MS).
 const LINK_REPAIR_CMD = resolveLinkRepairCmd(process.env, homedir(), existsSync);
 const LINK_REPAIR_RETRY = Number(process.env.HEALTH_LINK_REPAIR_RETRY_MS || LINK_REPAIR_RETRY_MS);
+// Sooner than that when the last run did nothing (another run's lock, a locked
+// screen), and the first step of the back-off after a run that failed with
+// plugins still missing.
+const REPAIR_BUSY_RETRY = Number(process.env.HEALTH_REPAIR_BUSY_RETRY_MS || LINK_REPAIR_BUSY_RETRY_MS);
+// How long a required project may sit with no plugin before the same launcher
+// is run for it. See pluginRepairPlan.
+const PLUGIN_REPAIR_MS = Number(process.env.HEALTH_PLUGIN_REPAIR_MS || PLUGIN_REPAIR_AFTER_MS);
+// When an incident that is already on a card earns a NEW top-level message
+// (an edit notifies nobody). See realertDecision.
+const REALERT_MS = Number(process.env.HEALTH_REALERT_MS || REALERT_AFTER_MS);
+const REALERT_UNCHANGED = Number(process.env.HEALTH_REALERT_UNCHANGED_MS || REALERT_UNCHANGED_MS);
+const TOTAL_OUTAGE_CONFIRM = Number(process.env.HEALTH_TOTAL_OUTAGE_CONFIRM_MS || TOTAL_OUTAGE_CONFIRM_MS);
+// Slack's API root, overridable so the outage test can stand in for Slack.
+const SLACK_API = (process.env.HEALTH_SLACK_API || "https://slack.com/api").replace(/\/+$/, "");
 // A run longer than this no longer blocks the next attempt. It is never killed
 // (a launcher stopped between closing a tab and reopening it is worse than a
 // slow one); a second run just meets its lock and exits 75.
@@ -185,7 +202,20 @@ type State = {
   linkDownSince: Record<string, number>;
   linkRepairTriggeredAt: number;  // last automatic repair run, 0 = never
   linkRepairAttempts: number;     // runs inside the current incident
-  linkRepairResult: { at: number; code: number } | null;
+  // The last run's exit code, plus what its report said (see repairOutcome):
+  // `blocked` is a reason no retry gets past by itself — a locked screen.
+  linkRepairResult: { at: number; code: number; blocked?: string | null; total?: number; connected?: number;
+    failed?: Array<{ title: string; status: string; step: string | null }> } | null;
+  // The last NEW top-level alert of the incident in progress, and what it was
+  // about — an edit to the card notifies nobody, so these decide when to post
+  // again instead. 0 / "" outside an incident.
+  alertAt: number;
+  alertSignature: string;
+  alertReminders: number;
+  // Since when no required project has had a plugin (or the relay has been
+  // gone), and whether that has been announced as its own alert.
+  totalOutageSince: number;
+  totalOutageAlerted: boolean;
 };
 
 function loadState(): State {
@@ -214,6 +244,11 @@ function loadState(): State {
       linkRepairTriggeredAt: Number(loaded.linkRepairTriggeredAt) || 0,
       linkRepairAttempts: Number(loaded.linkRepairAttempts) || 0,
       linkRepairResult: loaded.linkRepairResult ?? null,
+      alertAt: Number(loaded.alertAt) || 0,
+      alertSignature: typeof loaded.alertSignature === "string" ? loaded.alertSignature : "",
+      alertReminders: Number(loaded.alertReminders) || 0,
+      totalOutageSince: Number(loaded.totalOutageSince) || 0,
+      totalOutageAlerted: Boolean(loaded.totalOutageAlerted),
     };
   } catch {
     return blankState();
@@ -230,7 +265,7 @@ function durationsFromHistory(history: Array<{ project?: string; ok?: boolean; m
   return out;
 }
 function blankState(): State {
-  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {}, linkDownSince: {}, linkRepairTriggeredAt: 0, linkRepairAttempts: 0, linkRepairResult: null };
+  return { status: "unknown", messageTs: null, checks: 0, since: Date.now(), lastPostedAt: 0, slowActive: false, incidentTs: null, speedTs: null, speedParentTs: null, speedPostedAt: 0, streak: {}, downSince: {}, deepLastWasRetry: false, shallowHistory: [], deepHistory: [], deepResults: {}, deepDurations: {}, slowSince: {}, slowAlertedAt: {}, linkDownSince: {}, linkRepairTriggeredAt: 0, linkRepairAttempts: 0, linkRepairResult: null, alertAt: 0, alertSignature: "", alertReminders: 0, totalOutageSince: 0, totalOutageAlerted: false };
 }
 function saveState(state: State): void {
   try {
@@ -770,7 +805,7 @@ async function slackRequest(method: string, body: any): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SLACK_TIMEOUT_MS);
   try {
-    const response = await fetch(`https://slack.com/api/${method}`, {
+    const response = await fetch(`${SLACK_API}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${SLACK_TOKEN}` },
       body: JSON.stringify({ channel: SLACK_CHANNEL, ...body }),
@@ -1138,9 +1173,18 @@ function healthyText(state: State, health: Health): string {
   });
 }
 
-function degradedText(state: State, health: Health): string {
+// `again` marks a card posted as a new message inside a running incident, and
+// says why it is one.
+function degradedText(state: State, health: Health, again: "total_outage" | "still_degraded" | null = null): string {
   const mention = ALERT_USER ? `<@${ALERT_USER}> ` : "";
-  const lines = [`:red_circle: ${mention}*Figma 헬스체크 · 이상 감지*`];
+  // A total outage is not "something is off". The headline says so on every
+  // rewrite, not only on the message that announced it.
+  const total = isTotalOutage(health);
+  const lines = [total
+    ? `:rotating_light: ${mention}*Figma 헬스체크 · 전면 끊김* — ${health.relayUp ? `필수 ${health.expected.length}개 전부 플러그인 없음` : "릴레이 응답 없음"}`
+    : `:red_circle: ${mention}*Figma 헬스체크 · 이상 감지*`];
+  if (again === "total_outage") lines.push(`• 일부 이상에서 전면 끊김으로 악화되어 새 메시지로 다시 알립니다 (지금 Figma 요청은 전부 실패합니다)`);
+  if (again === "still_degraded") lines.push(`• 다시 알림: 이상이 ${humanSince(state.since)}째 해소되지 않았습니다 (${state.alertReminders + 1}번째 재알림)`);
   // The blast radius goes above the cause. Whoever is being pulled in wants to
   // know how much is broken before they read what broke.
   if (health.relayUp && health.expected.length) lines.push(projectStrip(health, state));
@@ -1167,18 +1211,27 @@ function degradedText(state: State, health: Health): string {
   const tail: string[] = [`• 연결 표시와 문서 조회 결과는 별도입니다. 응답 지연만으로 탭을 닫지 마세요.`];
   const repairLine = linkRepairLine(linkPlan(state, health), displayName);
   if (repairLine) tail.push(repairLine);
+  const missingPlan = pluginPlan(state, health);
+  const repairable = Boolean(repairLine) || missingPlan.ready.length > 0;
+  if (LINK_REPAIR_CMD && health.relayUp && missingPlan.waiting.length && !missingPlan.ready.length) {
+    tail.push(`• 플러그인 없음 자동 복구: ${Math.round(PLUGIN_REPAIR_MS / 60_000)}분 넘게 안 돌아오면 런처를 자동 실행합니다 (${clock(missingPlan.readyAt ?? Date.now())} 예정)`);
+  }
   if (state.linkRepairTriggeredAt && state.linkRepairTriggeredAt >= state.since) {
     const finished = state.linkRepairResult && state.linkRepairResult.at >= state.linkRepairTriggeredAt;
     const result = finished
       ? `exit ${state.linkRepairResult!.code} · 로그 ~/.talk-to-figma/link-repair.log`
       : "실행 중";
     const attempts = state.linkRepairAttempts > 1 ? ` · 이번 이상 ${state.linkRepairAttempts}회째` : "";
-    const next = finished && repairLine
-      ? ` · 계속 끊겨 있으면 ${clock(nextLinkRepairAt({ triggeredAt: state.linkRepairTriggeredAt, result: state.linkRepairResult, retryMs: LINK_REPAIR_RETRY }) ?? Date.now())} 재시도`
+    const next = finished && repairable
+      ? ` · 계속 끊겨 있으면 ${clock(nextRepairAt({ triggeredAt: state.linkRepairTriggeredAt, result: state.linkRepairResult, attempts: state.linkRepairAttempts, pluginReady: missingPlan.ready.length > 0, retryMs: LINK_REPAIR_RETRY, busyRetryMs: REPAIR_BUSY_RETRY }) ?? Date.now())} 재시도`
       : "";
     tail.push(`• 자동 복구: ${clock(state.linkRepairTriggeredAt)} 실행 (${result})${attempts}${next}`);
-  } else if (repairLine && !LINK_REPAIR_CMD) {
-    tail.push(`• 자동 복구 꺼짐 (HEALTH_LINK_REPAIR_CMD 비어 있음 또는 런처 미설치) — 위 액션을 직접 실행하세요.`);
+    // Why it did not work, when the launcher said why — a locked screen is a
+    // person's job, and "exit 1" does not tell them so.
+    const why = finished && state.linkRepairResult!.code !== 0 ? repairOutcomeLine(state.linkRepairResult) : null;
+    if (why) tail.push(`  └ ${why}`);
+  } else if (repairable && !LINK_REPAIR_CMD) {
+    tail.push(`• 자동 복구 꺼짐 (HEALTH_LINK_REPAIR_CMD 비어 있음 또는 런처 미설치) — 아래 액션을 직접 실행하세요.`);
   }
   tail.push(`• 플러그인 재연결: 브로커 액션 \`figma-open-projects\` (macmini-1). 이미 복구 중이면 exit 75 로 나옵니다.`);
   tail.push(`:link: ${consoleLink}  ·  _워처 ${BUILD} · 기동 ${clock(STARTED_AT)}_`);
@@ -1191,20 +1244,29 @@ function linkPlan(state: State, health: Health) {
   return linkRepairPlan(state.linkDownSince, load, Date.now(), LINK_REPAIR_MS);
 }
 
+// Projects whose plugin has been missing long enough to send the launcher.
+function pluginPlan(state: State, health: Health) {
+  return pluginRepairPlan(state.downSince, Date.now(), PLUGIN_REPAIR_MS, health.relayUp);
+}
+
 // Fire-and-forget: the launcher can take minutes, and the tick must not wait
 // on it (the tick watchdog would kill the watcher). Its outcome lands in the
 // incident thread, and the next deep turns re-probe the repaired projects.
 let linkRepairStartedAt = 0;   // in-memory: a run of THIS process still going
 const linkRepairRunning = () => linkRepairStartedAt > 0 && Date.now() - linkRepairStartedAt < LINK_REPAIR_STUCK_MS;
 
-function runLinkRepair(targets: string[]): void {
+function runRepair(linkTargets: string[], pluginTargets: string[]): void {
   const newIncident = !(state.linkRepairTriggeredAt && state.linkRepairTriggeredAt >= state.since);
   state.linkRepairAttempts = newIncident ? 1 : (state.linkRepairAttempts || 0) + 1;
   state.linkRepairTriggeredAt = Date.now();
   state.linkRepairResult = null;
   linkRepairStartedAt = state.linkRepairTriggeredAt;
   const attempt = state.linkRepairAttempts > 1 ? ` (${state.linkRepairAttempts}회째)` : "";
-  pendingChanges.push(`:wrench: ${clock()} · 문서 서버 연결 끊김 자동 복구 시작${attempt} — ${targets.map(displayName).join(", ")}`);
+  const why = [
+    pluginTargets.length ? `플러그인 없음 ${Math.round(PLUGIN_REPAIR_MS / 60_000)}분 이상: ${pluginTargets.map(displayName).join(", ")}` : null,
+    linkTargets.length ? `문서 서버 연결 끊김: ${linkTargets.map(displayName).join(", ")}` : null,
+  ].filter(Boolean).join(" · ");
+  pendingChanges.push(`:wrench: ${clock()} · 자동 복구 시작${attempt} (런처 실행) — ${why}`);
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(["/bin/zsh", "-c", LINK_REPAIR_CMD], { stdout: "pipe", stderr: "pipe" });
@@ -1229,10 +1291,11 @@ function runLinkRepair(targets: string[]): void {
       if (size > 512 * 1024) writeFileSync(LINK_REPAIR_LOG, entry);
       else appendFileSync(LINK_REPAIR_LOG, entry);
     } catch {}
-    state.linkRepairResult = { at: Date.now(), code };
+    const outcome = repairOutcome(code, out);
+    state.linkRepairResult = { at: Date.now(), ...outcome };
     linkRepairStartedAt = 0;
-    pendingChanges.push(`${code === 0 ? ":white_check_mark:" : ":warning:"} ${clock()} · 자동 복구 끝 (exit ${code}`
-      + `${code === 75 ? " — 다른 복구가 이미 진행 중" : ""}) · 로그 ~/.talk-to-figma/link-repair.log`);
+    pendingChanges.push(`${code === 0 ? ":white_check_mark:" : ":warning:"} ${clock()} · 자동 복구 끝 (exit ${code}) — `
+      + `${repairOutcomeLine(outcome) ?? "결과 없음"} · 로그 ~/.talk-to-figma/link-repair.log`);
     lastDeepAt = 0;   // re-probe now rather than after a full interval
     saveState(state);
   })();
@@ -1297,7 +1360,26 @@ async function report(state: State, health: Health): Promise<void> {
     // belong under the alert, not under the all-clear that replaces the card.
     if (status === "degraded") state.incidentTs = state.messageTs;
     state.lastPostedAt = Date.now();
+    // The opening card is the incident's first alert; the re-alert clocks run
+    // from it. (A card that did not reach Slack is posted again by the
+    // throttled path below — as a new message, since messageTs stayed null.)
+    state.alertAt = status === "degraded" ? Date.now() : 0;
+    state.alertSignature = status === "degraded" ? alertSignature(health) : "";
+    state.alertReminders = 0;
+    state.totalOutageAlerted = status === "degraded" && isTotalOutage(health);
     return;
+  }
+
+  // Worse, or unanswered for too long: say it again where it notifies.
+  if (status === "degraded") {
+    const again = realertDecision({
+      totalSince: state.totalOutageSince, totalAlerted: state.totalOutageAlerted,
+      // A state file from before these fields: the incident's start stands in.
+      lastAlertAt: state.alertAt || state.since, lastSignature: state.alertSignature,
+      signature: alertSignature(health), reminders: state.alertReminders,
+      afterMs: REALERT_MS, unchangedMs: REALERT_UNCHANGED, confirmMs: TOTAL_OUTAGE_CONFIRM,
+    });
+    if (again && await postAgain(state, health, again)) return;
   }
 
   const throttle = status === "healthy" ? HEALTHY_UPDATE_MS : DEGRADED_UPDATE_MS;
@@ -1322,6 +1404,33 @@ async function report(state: State, health: Health): Promise<void> {
   state.lastPostedAt = Date.now();
 }
 
+
+// A new top-level card inside a running incident. It takes over as the card
+// that is rewritten and as the thread changes are written into, so what
+// notified someone is also what is current; the card it replaces is cut down to
+// a pointer instead of being left to go stale above it.
+async function postAgain(state: State, health: Health, again: "total_outage" | "still_degraded"): Promise<boolean> {
+  const posted = await slack("chat.postMessage", { text: degradedText(state, health, again) });
+  // Not delivered: change nothing, so the next tick tries the same alert again.
+  if (!posted?.ok || !posted.ts) return false;
+  const previous = state.messageTs;
+  state.messageTs = posted.ts;
+  state.incidentTs = posted.ts;
+  state.lastPostedAt = Date.now();
+  state.alertAt = Date.now();
+  state.alertSignature = alertSignature(health);
+  if (again === "total_outage") state.totalOutageAlerted = true;
+  else state.alertReminders += 1;
+  // Whatever it is now, it was announced by this message.
+  if (isTotalOutage(health)) state.totalOutageAlerted = true;
+  saveState(state);
+  if (previous && previous !== posted.ts) {
+    await slack("chat.update", { ts: previous, text:
+      `:arrow_down: *Figma 헬스체크 · 이 이상은 계속되고 있습니다* — ${clock()} 에 새 알림으로 이어졌습니다. `
+      + `최신 상태는 채널의 가장 최근 헬스체크 카드를 보세요. (이상 시작 ${clock(state.since)})` });
+  }
+  return true;
+}
 
 // --- outliers --------------------------------------------------------------
 // The thread record is for reading on purpose; an outlier has to come and find
@@ -1540,18 +1649,31 @@ async function runTick(): Promise<void> {
     state.linkDownSince,
     Object.fromEntries(Object.entries(state.deepResults).filter(([key]) => expectedKeys.has(key))),
     Date.now());
+  // Held for a few polls before it is announced (realertDecision): a relay
+  // restart is "relay gone" for one of them.
+  if (isTotalOutage(damped)) {
+    if (!state.totalOutageSince) state.totalOutageSince = Date.now();
+  } else {
+    state.totalOutageSince = 0;
+    state.totalOutageAlerted = false;
+  }
   // Only inside an incident that is already on the card, so the run is tied to
   // that incident's clock and cannot repeat on the tick that opens it.
   if (!damped.ok && state.status === "degraded") {
     const plan = linkPlan(state, damped);
-    if (shouldTriggerLinkRepair(plan, {
+    const missingPlan = pluginPlan(state, damped);
+    if (shouldTriggerRepair({
+      linkPlan: plan, pluginPlan: missingPlan,
+      linkDownSince: state.linkDownSince, downSince: state.downSince,
       configured: Boolean(LINK_REPAIR_CMD),
       triggeredAt: state.linkRepairTriggeredAt,
       incidentSince: state.since,
       running: linkRepairRunning(),
       result: state.linkRepairResult,
+      attempts: state.linkRepairAttempts,
       retryMs: LINK_REPAIR_RETRY,
-    })) runLinkRepair(plan.ready);
+      busyRetryMs: REPAIR_BUSY_RETRY,
+    })) runRepair(plan.ready, missingPlan.ready);
   }
 
   last = damped;
@@ -1617,6 +1739,17 @@ Bun.serve({
         attempts: state.linkRepairAttempts,
         result: state.linkRepairResult,
         linkDownSince: state.linkDownSince,
+        // The same run also serves projects whose plugin stays missing.
+        pluginAfterMs: PLUGIN_REPAIR_MS,
+        pluginDownSince: state.downSince,
+        busyRetryMs: REPAIR_BUSY_RETRY,
+        outcome: repairOutcomeLine(state.linkRepairResult),
+      },
+      alerts: {
+        realertMs: REALERT_MS, unchangedMs: REALERT_UNCHANGED, totalConfirmMs: TOTAL_OUTAGE_CONFIRM,
+        lastAlertAt: state.alertAt || null, reminders: state.alertReminders,
+        totalOutageSince: state.totalOutageSince || null, totalOutageAlerted: state.totalOutageAlerted,
+        cardTs: state.messageTs,
       },
       intervals: { shallowMs: SHALLOW_MS, deepMs: DEEP_MS, healthyUpdateMs: HEALTHY_UPDATE_MS },
       speed: {

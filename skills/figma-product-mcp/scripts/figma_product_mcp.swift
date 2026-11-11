@@ -43,6 +43,9 @@ struct Report: Codable {
     var relayProtocolVersion: String?
     // Figma's menu bar titles at the moment a Plugins-menu lookup failed.
     var menuBar: [String]?
+    // What the run did to Figma as a whole before working per project (today:
+    // Reload All Tabs after every renderer had died). Absent on a normal run.
+    var recovery: String? = nil
 }
 
 enum LauncherError: Error, CustomStringConvertible {
@@ -826,6 +829,90 @@ func dismissOpenMenus() {
     up.post(tap: .cghidEventTap)
 }
 
+// ---------------------------------------------------------------------------
+// Figma with no renderers.
+//
+// macmini_m1, 2026-11-10 19:35:40: every helper under the Figma process died
+// in the same second (a SIGTERM that also restarted the relay, the MCP server
+// and the health watch). Figma's main process stayed, and only its GPU and
+// utility helpers came back — zero `--type=renderer`. All ten windows kept
+// their frame and their AXTitle and held no document: 0 web areas, no tabs, no
+// plugin anywhere on the relay. A run then waited out the renderer tree and
+// reported `separation_failed / renderer_accessibility` for all nine projects
+// (exit 1, 28s), and nothing recovered for 14 hours 46 minutes. Running the
+// plugin in such a window presses the menu item and times out: there is no
+// document to run it in.
+//
+// What brought it back was one native menu item, pressed once:
+// Help > Troubleshooting > Reload All Tabs — 11 renderers 45s later, the tree
+// populated, Figma never restarted. It is a native menu, so it is reachable
+// with no renderer tree at all.
+//
+// It reloads EVERY tab, so it is only ever pressed when that costs nothing:
+// the relay answers and lists no plugin at all, and no renderer process
+// exists. A tree that is merely not exposed (Figma 126.8.16 ignoring
+// AXManualAccessibility) has renderers and is left alone.
+// ---------------------------------------------------------------------------
+// >>> dead-renderer-policy (pure; scripts/launcher-dead-renderer-policy.test.mjs compiles this block)
+// Renderer helpers that are children of this Figma, from
+// `ps -axo pid=,ppid=,command=`. Children only: another Electron app's
+// renderers, or a second Figma's, are not this one's documents.
+func figmaRendererCount(psOutput: String, figmaPID: Int32) -> Int {
+    var count = 0
+    for line in psOutput.split(separator: "\n") {
+        let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard fields.count == 3, Int32(fields[1]) == figmaPID else { continue }
+        let command = fields[2]
+        if command.contains("Figma Helper") && command.contains("--type=renderer") { count += 1 }
+    }
+    return count
+}
+
+enum DeadRendererDecision: Equatable {
+    case reloadAllTabs
+    case leave(String)
+}
+
+func deadRendererDecision(
+    accessibilityReady: Bool, screenLocked: Bool, relayReachable: Bool,
+    livePlugins: Int, windowCount: Int, rendererCount: Int?
+) -> DeadRendererDecision {
+    if accessibilityReady { return .leave("renderer tree is up") }
+    if screenLocked { return .leave("screen is locked") }
+    if !relayReachable { return .leave("relay unreachable, so a live plugin cannot be ruled out") }
+    if livePlugins > 0 { return .leave("\(livePlugins) plugin connection(s) are live and a reload would drop them") }
+    if windowCount == 0 { return .leave("no Figma window to reload; opening the files starts their renderers") }
+    guard let rendererCount else { return .leave("renderer processes could not be counted") }
+    if rendererCount > 0 { return .leave("\(rendererCount) renderer(s) are running; the tree is just not exposed") }
+    return .reloadAllTabs
+}
+// <<< dead-renderer-policy
+
+func runningRendererCount(_ app: NSRunningApplication) -> Int? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-axo", "pid=,ppid=,command="]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do { try process.run() } catch { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return nil }
+    return figmaRendererCount(psOutput: text, figmaPID: app.processIdentifier)
+}
+
+// Pressed on the item itself, without opening the menu: nothing is left open
+// to swallow a later click if the press does not take.
+let reloadAllTabsTitles = ["Reload All Tabs", "모든 탭 새로고침", "모든 탭 다시 로드"]
+func pressReloadAllTabs(_ appElement: AXUIElement) -> Bool {
+    guard let help = menuBarItem(appElement, named: "Help") ?? menuBarItem(appElement, named: "도움말") else { return false }
+    guard let item = descendants(help, maxDepth: 6).first(where: {
+        role($0) == (kAXMenuItemRole as String) && reloadAllTabsTitles.contains(axText($0))
+    }) else { return false }
+    return press(item)
+}
+
 // Make a design window key. The success test is "Figma's menu bar now has a
 // Plugins menu", not "AXFocusedWindow points at the window": measured on
 // macmini-1, AXRaise plus setting AXMain/AXFocusedWindow makes AX report the
@@ -1368,6 +1455,10 @@ func runDoctor(app: NSRunningApplication, root: AXUIElement, config: Config, opt
         "accessibilityTrusted": AXIsProcessTrusted(),
         // A locked session keeps Figma from ever becoming active — no Plugins menu.
         "screenLocked": screenIsLocked(),
+        // 0 with windows open means every window is an empty shell: a normal
+        // run presses Help > Troubleshooting > Reload All Tabs (when the relay
+        // lists no plugin) instead of waiting for a tree that cannot come.
+        "rendererProcesses": runningRendererCount(app) ?? -1,
         // The renderer tree: needed to match a window to a file via AX.
         "rendererAccessibilityReady": !webAreas.isEmpty,
         "axWindowCount": axWindows.count,
@@ -1577,7 +1668,7 @@ do {
     // loop before this call therefore made every project fail "open_failed" on a
     // file that was open, connected, and serving plugin commands the whole time,
     // and pointed repair at the file instead of at the accessibility tree.
-    let accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
+    var accessibilityReady = enableRendererAccessibility(root, timeout: options.timeout)
 
     // Relay ground truth, before any UI is touched.
     //
@@ -1630,6 +1721,30 @@ do {
             relayReachable: false, relayProtocolVersion: nil, menuBar: nil
         ))
         exit(1)
+    }
+
+    // Every renderer gone: no document exists in any window, so nothing below
+    // can work until Figma loads them again. See dead-renderer-policy.
+    var recovery: String? = nil
+    let rendererCountBefore = accessibilityReady ? nil : runningRendererCount(app)
+    if deadRendererDecision(
+        accessibilityReady: accessibilityReady, screenLocked: screenIsLocked(), relayReachable: snapshot != nil,
+        livePlugins: snapshot?.connectionsByDocument.values.reduce(0) { $0 + $1.count } ?? 0,
+        windowCount: windows(root).count, rendererCount: rendererCountBefore
+    ) == .reloadAllTabs {
+        if pressReloadAllTabs(root) {
+            // Measured 45s for eleven renderers; a loaded host is slower.
+            let patience = max(options.timeout, 120)
+            let back = waitUntil(timeout: patience, interval: 1) { (runningRendererCount(app) ?? 0) > 0 }
+            accessibilityReady = back && enableRendererAccessibility(root, timeout: patience)
+            recovery = "Figma had no renderer process (every window was an empty shell) and the relay listed no plugin, so Help > Troubleshooting > Reload All Tabs was pressed — "
+                + (back ? "\(runningRendererCount(app) ?? 0) renderer(s) are back, renderer tree \(accessibilityReady ? "populated" : "still not exposed")"
+                        : "no renderer came back within \(Int(patience))s; Figma itself may need a restart, which this launcher never does")
+            snapshot = fetchRelaySnapshotPatiently(baseURL: options.relayURL) ?? snapshot
+        } else {
+            recovery = "Figma has no renderer process (every window is an empty shell), but Help > Troubleshooting > Reload All Tabs could not be found or pressed (menu bar: \(menuBarTitles(root).joined(separator: ", "))) — press it by hand, or restart Figma"
+        }
+        FileHandle.standardError.write(Data(((recovery ?? "") + "\n").utf8))
     }
 
     // A connected plugin on a document that lost Figma's servers is not
@@ -1816,6 +1931,12 @@ do {
             }
         }
     }
+    // The tree was judged before any file was opened. When that was a Figma
+    // with no window at all, the windows this run just opened are the first
+    // renderers there are — ask again rather than drive them blind.
+    if !accessibilityReady, results.contains(where: { $0.status == "opened" }) {
+        accessibilityReady = enableRendererAccessibility(root, timeout: min(options.timeout, 10))
+    }
     for (index, project) in config.projects.enumerated() where results[index].status == "opened" {
         // The window title is the ACTIVE tab's file name even when no tab can be
         // walked (macmini_m1, 2026-11-11: with every renderer gone the windows
@@ -1940,7 +2061,8 @@ do {
         results: results,
         relayReachable: snapshot != nil,
         relayProtocolVersion: snapshot?.protocolVersion,
-        menuBar: menuBarSeen
+        menuBar: menuBarSeen,
+        recovery: recovery
     ))
     exit(ok ? 0 : 1)
 } catch {
