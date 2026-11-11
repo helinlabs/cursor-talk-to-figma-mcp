@@ -1689,6 +1689,45 @@ do {
         results[index].step = nil
         results[index].detail = "Document reloaded from Figma's servers (\(how)) and plugin re-attached — \(link.summary)"
     }
+    // Close Tab on a cut-off tab does not always close it. macmini_m1,
+    // 2026-11-03 15:01: CO_Product had lost Figma's servers since 11:16; Close
+    // Tab was pressed, the tab stayed, and within seconds the document got back
+    // to Figma's servers in place and the plugin re-joined the relay on a new
+    // channel. The run still reported close_tab_no_effect and exited 1 while
+    // the project was healthy. So before calling it a failure, watch a little
+    // longer: a tab that closed late is reopened as usual, and a tab that
+    // reconnected in place counts once its link is proven. Returns false when
+    // neither happened, and the caller reports the original failure.
+    func settleUnclosedTab(index: Int, project: Project, oldChannel: String?) -> Bool {
+        var reconnected: RelayConnection?
+        var relayVersion: String?
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline, reconnected == nil {
+            if projectWindow(root, project: project) == nil {
+                reattachAfterReload(index: index, project: project, how: "close_and_reopen, tab closed late", oldChannel: oldChannel)
+                return true
+            }
+            if let snapshot = fetchRelaySnapshot(baseURL: options.relayURL),
+               let live = relayConnection(snapshot, for: project), live.channel != oldChannel {
+                reconnected = live
+                relayVersion = snapshot.protocolVersion
+                break
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+        }
+        guard let live = reconnected else { return false }
+        // A plugin that re-joined on old code is not the run's goal either.
+        if let relayVersion, live.pluginVersion != relayVersion { return false }
+        if documentMismatch(baseURL: options.relayURL, project: project) != nil { return false }
+        let link = linkRecovery(baseURL: options.relayURL, project: project)
+        guard case .up = link else { return false }
+        results[index].status = "connected"
+        results[index].step = nil
+        results[index].pluginVersion = live.pluginVersion
+        results[index].channel = live.channel
+        results[index].detail = "Close Tab left the tab open, but the document reconnected to Figma's servers in place and the plugin re-joined on a new channel — \(link.summary)"
+        return true
+    }
     if !options.openOnly {
         for (index, project) in config.projects.enumerated() where healthy[project.id] != nil {
             let probes = linkProbes(baseURL: options.relayURL, project: project, attempts: options.linkProbes)
@@ -1736,6 +1775,11 @@ do {
                 case .reloaded(let way): how = way
                 case .reopen: how = "close_and_reopen"
                 case .failed(let step, let detail):
+                    if step == "close_tab_no_effect",
+                       settleUnclosedTab(index: index, project: project, oldChannel: oldChannel) {
+                        if results[index].status != "connected" { linkCanaryFailed = project.title }
+                        continue
+                    }
                     hold(step, detail)
                     if step != "unsaved_changes" { linkCanaryFailed = project.title }
                     continue
