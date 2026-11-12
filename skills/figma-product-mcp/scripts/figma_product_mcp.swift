@@ -460,24 +460,59 @@ func submenuItem(_ parent: AXUIElement, named title: String) -> AXUIElement? {
         .first { role($0) == (kAXMenuItemRole as String) && axText($0) == title }
 }
 
-func splitIntoNewWindow(_ appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
+// Open a tab's own context menu, and only call it open once `isOpen` agrees.
+//
+// The tab exposes AXShowMenu, which opens exactly that tab's menu without the
+// pointer and without Figma being the frontmost app. The synthetic right-click
+// is only the fallback, and only after Figma is activated with the window
+// raised: a CGEvent lands on whatever window is under that screen point, so
+// with another app in front it opened nothing. macmini_m1, 2026-11-12 12:03
+// KST: GW_Foundation, newly added to projects.json, opened as a second tab in
+// the CO_Product window; splitIntoNewWindow raised the window without
+// activating Figma, the right-click opened no menu, and the run ended
+// separation_failed / exit 1. AXShowMenu on the same tab opened the menu with
+// "Move to Another Window > New Window", and pressing it split the file out.
+func openTabContextMenu(_ app: NSRunningApplication, appElement: AXUIElement, window: AXUIElement, tab: AXUIElement, isOpen: () -> Bool) -> Bool {
+    if AXUIElementPerformAction(tab, kAXShowMenuAction as CFString) == .success,
+       waitUntil(timeout: 2, isOpen) {
+        return true
+    }
+    if isOpen() { return true }
+    raiseOnly(app, appElement: appElement, window: window)
+    guard rightClick(tab) else { return false }
+    return waitUntil(timeout: 2, isOpen)
+}
+
+func splitIntoNewWindow(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
     guard let (originalWindow, tab) = projectTab(appElement, project: project) else { return false }
     let productTabs = descendants(originalWindow).filter { tabElement in
         isTab(tabElement) && configuredProjects.contains { projectMatch(tabElement, project: $0) }
     }
     if productTabs.count <= 1 { return true }
-    _ = AXUIElementPerformAction(originalWindow, kAXRaiseAction as CFString)
-    guard rightClick(tab) else { return false }
-    _ = waitUntil(timeout: 2) {
-        menuItem(appElement, named: "Move to New Window") != nil || menuItem(appElement, named: "Move to Another Window") != nil
+    // Context-menu items only: the menu bar is in the AX tree whether or not a
+    // menu is open, so an app-wide lookup could be satisfied without the tab's
+    // menu ever opening (see contextMenuItem).
+    let moveNew = { contextMenuItem(appElement, named: "Move to New Window") }
+    let moveAnother = { contextMenuItem(appElement, named: "Move to Another Window") }
+    guard openTabContextMenu(app, appElement: appElement, window: originalWindow, tab: tab,
+                             isOpen: { moveNew() != nil || moveAnother() != nil }) else {
+        dismissOpenMenus()
+        return false
     }
-    if let direct = menuItem(appElement, named: "Move to New Window") {
+    if let direct = moveNew() {
         guard press(direct) else { dismissOpenMenus(); return false }
-    } else if let submenu = menuItem(appElement, named: "Move to Another Window") {
-        guard press(submenu),
-              waitUntil(timeout: 2, { submenuItem(submenu, named: "New Window") != nil }),
-              let newWindow = submenuItem(submenu, named: "New Window"),
-              press(newWindow) else { dismissOpenMenus(); return false }
+    } else if let submenu = moveAnother() {
+        // The submenu's items are in the tree before it is shown, and pressing
+        // "New Window" there directly works (2026-11-12, the split above).
+        // Opening the submenu first is the fallback.
+        if let newWindow = submenuItem(submenu, named: "New Window"), press(newWindow) {
+            // pressed
+        } else {
+            guard press(submenu),
+                  waitUntil(timeout: 2, { submenuItem(submenu, named: "New Window") != nil }),
+                  let newWindow = submenuItem(submenu, named: "New Window"),
+                  press(newWindow) else { dismissOpenMenus(); return false }
+        }
     } else {
         dismissOpenMenus()
         return false
@@ -1775,7 +1810,7 @@ do {
     // open in its own window and no plugin in it (relay 9 → 8).
     func separated(_ project: Project) -> Bool {
         if accessibilityReady, projectTab(root, project: project) != nil {
-            return splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout)
+            return splitIntoNewWindow(app, appElement: root, project: project, configuredProjects: config.projects, timeout: options.timeout)
         }
         return ownWindowByTitle(project)
     }
@@ -1984,7 +2019,7 @@ do {
             }
             continue
         }
-        if splitIntoNewWindow(root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
+        if splitIntoNewWindow(app, appElement: root, project: project, configuredProjects: config.projects, timeout: options.timeout) {
             results[index].status = options.openOnly ? "opened" : "separated"
             results[index].detail = "Project is in a distinct Figma window"
         } else {
