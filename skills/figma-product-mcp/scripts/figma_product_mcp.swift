@@ -966,10 +966,28 @@ func pluginsMenuIsUp(_ appElement: AXUIElement) -> Bool {
 // run stopped, because re-running the plugin cannot help a window that has no
 // document to run it in. What is actually on screen is Figma's "Something went
 // wrong" page with a Reload button, and pressing it brings the document back.
+//
+// The "<file> – Figma" web area alone does not prove a document. macmini_m1,
+// 2026-11-20 (Figma restarted 17:15, 26 windows): six windows showed the
+// "Something went wrong..." page INSIDE a web area still titled
+// "F_Product – Figma", so this returned true, Reload was never pressed, and
+// every run failed `plugin_menu_item_missing` — the Plugins menu of such a
+// window holds only a disabled "Manage Plugins…". The crash page (its heading
+// plus its Reload button) therefore overrides the web area's title.
+func crashPageIsShowing(_ elements: [AXUIElement]) -> Bool {
+    elements.contains(where: {
+        ["AXHeading", "AXStaticText"].contains(role($0)) && axText($0).localizedCaseInsensitiveContains("Something went wrong")
+    }) && elements.contains(where: {
+        role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains("reload")
+    })
+}
+
 func rendererIsUp(_ window: AXUIElement) -> Bool {
-    descendants(window).contains { element in
+    let elements = descendants(window)
+    guard elements.contains(where: { element in
         role(element) == "AXWebArea" && axText(element).localizedCaseInsensitiveContains("\u{2013} Figma")
-    }
+    }) else { return false }
+    return !crashPageIsShowing(elements)
 }
 
 func reloadButton(_ window: AXUIElement) -> AXUIElement? {
@@ -1050,6 +1068,25 @@ func channel(in window: AXUIElement) -> String? {
     return nil
 }
 
+// Run the plugin from the editor's Actions panel (the toolbar's "Actions"
+// toggle), for a window whose native Plugins menu never grew the item. The
+// panel's entry reads "plugins-menu-item icon <plugin> Development".
+func runPluginFromActionsPanel(window: AXUIElement, pluginTitle: String) -> Bool {
+    func pluginEntry() -> AXUIElement? {
+        descendants(window, maxDepth: 60).first(where: {
+            role($0) == "AXButton" && axText($0).localizedCaseInsensitiveContains(pluginTitle)
+        })
+    }
+    if pluginEntry() == nil {
+        guard let actions = descendants(window, maxDepth: 60).first(where: {
+            role($0) == "AXCheckBox" && axText($0).trimmingCharacters(in: .whitespaces) == "Actions"
+        }) else { return false }
+        guard press(actions) || leftClick(actions) else { return false }
+    }
+    guard waitUntil(timeout: 10, { pluginEntry() != nil }), let entry = pluginEntry() else { return false }
+    return press(entry) || leftClick(entry)
+}
+
 enum ActivationOutcome {
     case connected(version: String?, channel: String?)
     case failed(step: String, detail: String, menuBar: [String]?)
@@ -1109,13 +1146,23 @@ func activatePlugin(
             if found != nil { break }
         }
     }
-    guard let plugin = found else {
+    if let plugin = found {
+        guard press(plugin) else {
+            dismissOpenMenus()
+            return .failed(step: "plugin_menu_item_press", detail: "Could not run \(pluginTitle)", menuBar: nil)
+        }
+    } else {
         dismissOpenMenus()
-        return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window (Plugins menu opened 3 times)", menuBar: nil)
-    }
-    guard press(plugin) else {
-        dismissOpenMenus()
-        return .failed(step: "plugin_menu_item_press", detail: "Could not run \(pluginTitle)", menuBar: nil)
+        // The native menu is not the only way in. macmini_m1, 2026-11-20: after
+        // a Figma restart with 26 windows, the menu bar's Plugins menu held
+        // nothing but a disabled "Manage Plugins…" in every window — loaded,
+        // editable documents included — while the editor's own Actions panel
+        // (toolbar "Actions" > "Cursor MCP Plugin  Development") listed the
+        // plugin and ran it. That panel lives in the document's web area, so
+        // it does not depend on Figma having rebuilt its native menu.
+        guard runPluginFromActionsPanel(window: window, pluginTitle: pluginTitle) else {
+            return .failed(step: "plugin_menu_item_missing", detail: "\(pluginTitle) is not under Plugins > Development in this window (Plugins menu opened 3 times) and the editor's Actions panel did not offer it either", menuBar: nil)
+        }
     }
     guard relayReachable else {
         // No relay to ask — fall back to the banner, which at least proves the
