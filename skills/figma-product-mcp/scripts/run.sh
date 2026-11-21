@@ -4,7 +4,12 @@ set -u
 script_dir="${0:A:h}"
 source_file="$script_dir/figma_product_mcp.swift"
 config_file="$script_dir/projects.json"
-cache_root="${TMPDIR:-/tmp}/figma-product-mcp-${UID}"
+# Cache the compiled launcher in the per-user temp dir, not $TMPDIR: broker
+# sessions get a fresh $TMPDIR each run, which forced a full `swiftc -O` of
+# the launcher on every broker action. Under fleet load (load avg ~50 on 8
+# cores, 2026-11-21) that compile alone ate the action's 900s timeout.
+user_tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
+cache_root="${user_tmp:-${TMPDIR:-/tmp}/}figma-product-mcp-${UID}"
 binary_file="$cache_root/figma-product-mcp"
 
 mkdir -p "$cache_root"
