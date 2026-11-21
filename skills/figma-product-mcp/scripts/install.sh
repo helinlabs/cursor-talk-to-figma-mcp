@@ -36,7 +36,8 @@ elif ! diff -q "$source_dir/scripts/projects.json" "$target_dir/scripts/projects
 fi
 
 # Drop the cached binary so the next run rebuilds from the new source.
-rm -f "${TMPDIR:-/tmp}/figma-product-mcp-${UID}/figma-product-mcp"
+user_tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"
+rm -f "${user_tmp:-${TMPDIR:-/tmp}/}figma-product-mcp-${UID}/figma-product-mcp"
 echo "installed to $target_dir"
 "$target_dir/scripts/run.sh" --dry-run >/dev/null || { echo "dry-run failed"; exit 1; }
 echo "dry-run OK"
