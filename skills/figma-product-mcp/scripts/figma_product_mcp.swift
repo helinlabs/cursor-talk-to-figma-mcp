@@ -321,7 +321,7 @@ func projectMatch(_ element: AXUIElement, project: Project) -> Bool {
 func projectWindow(_ appElement: AXUIElement, project: Project) -> AXUIElement? {
     if let viaAX = windows(appElement).first(where: { window in
         projectMatch(window, project: project)
-            || descendants(window).contains { isTab($0) && projectMatch($0, project: project) }
+            || tabStripDescendants(window).contains { isTab($0) && projectMatch($0, project: project) }
     }) {
         return viaAX
     }
@@ -381,9 +381,37 @@ func isTab(_ element: AXUIElement) -> Bool {
     role(element) == "AXTab" || role(element) == (kAXRadioButtonRole as String)
 }
 
+// Tabs live in the window's tab strip, never inside a file's document.
+//
+// Figma's tab strip is its own web area titled exactly "Figma"; each file's
+// document is a separate web area titled "<file> – Figma" (and a Recents window
+// is a web area too). A full descendants() walk of a window therefore also walks
+// the open document — canvas UI, layers, panels, the plugin iframe — which is
+// where nearly all of a window's AX nodes are. macmini_m1, 2026-11-23: after a
+// Figma restart under host load ~55, one AX read cost ~55ms, one window walk
+// took 17s, and projectTab (every window, per project, repeatedly) kept the
+// figma-open-projects action past its 900s limit with 26 windows open. Skipping
+// any web area not titled "Figma" walks only the tab strip and the shell.
+func tabStripDescendants(_ root: AXUIElement, maxDepth: Int = 22) -> [AXUIElement] {
+    var output: [AXUIElement] = []
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    var seen = Set<ElementKey>()
+    while !queue.isEmpty {
+        let (element, depth) = queue.removeFirst()
+        if !seen.insert(ElementKey(element: element)).inserted { continue }
+        output.append(element)
+        if role(element) == "AXWebArea", (axString(element, kAXTitleAttribute as CFString) ?? "") != "Figma" { continue }
+        if isTab(element) { continue }
+        if depth < maxDepth {
+            queue.append(contentsOf: axChildren(element).map { ($0, depth + 1) })
+        }
+    }
+    return output
+}
+
 func projectTab(_ appElement: AXUIElement, project: Project) -> (AXUIElement, AXUIElement)? {
     for window in windows(appElement) {
-        if let tab = descendants(window).first(where: { isTab($0) && projectMatch($0, project: project) }) {
+        if let tab = tabStripDescendants(window).first(where: { isTab($0) && projectMatch($0, project: project) }) {
             return (window, tab)
         }
     }
@@ -485,7 +513,7 @@ func openTabContextMenu(_ app: NSRunningApplication, appElement: AXUIElement, wi
 
 func splitIntoNewWindow(_ app: NSRunningApplication, appElement: AXUIElement, project: Project, configuredProjects: [Project], timeout: TimeInterval) -> Bool {
     guard let (originalWindow, tab) = projectTab(appElement, project: project) else { return false }
-    let productTabs = descendants(originalWindow).filter { tabElement in
+    let productTabs = tabStripDescendants(originalWindow).filter { tabElement in
         isTab(tabElement) && configuredProjects.contains { projectMatch(tabElement, project: $0) }
     }
     if productTabs.count <= 1 { return true }
